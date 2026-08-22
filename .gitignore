@@ -1,0 +1,16 @@
+.env
+*.token
+secrets/
+credentials/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+logs/
+*.db
+data/private/
+reports/generated/
+.pytest_cache/
+.ruff_cache/
+*.csv
+!data/README.md

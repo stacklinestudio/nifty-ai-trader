@@ -1,0 +1,1 @@
+"""Opening-market strategy components."""
