@@ -10,6 +10,8 @@ logs/
 *.db
 data/private/
 reports/generated/
+knowledge/*.sqlite
+.obsidian/
 .pytest_cache/
 .ruff_cache/
 *.csv

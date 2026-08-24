@@ -1,6 +1,6 @@
 # NIFTY AI Trader
 
-NIFTY AI Trader is a safety-first quantitative research, historical-backtesting, and live-market **paper-trading** system for NIFTY 50 options using Zerodha Kite Connect. It is a research platform, not a promise of profitability.
+NIFTY AI Trader is a safety-first quantitative research, historical-backtesting, and live-market **paper-trading** system for NIFTY 50 options using Zerodha Kite Connect. V2 extends it into a multi-agent trading intelligence system: structured research agents, event-driven orchestration, independent validation, deterministic risk veto, learning memory, and optional notification/journal exports. It is a research platform, not a promise of profitability.
 
 ## Safety
 
@@ -14,6 +14,8 @@ NIFTY AI Trader is a safety-first quantitative research, historical-backtesting,
 - `backtest/`: same opening logic, adverse slippage/costs, metrics, and walk-forward evaluation.
 - `storage/` and `monitoring/`: SQLite audit trail, structured logging, health/performance exports.
 - `dashboard.py`: a local, static results dashboard generated from an exported trades CSV.
+- `agents/`, `events/`, `ai/`, and `learning/`: V2 contracts, orchestration, audit trail, provider abstraction, and validation-gated research memory.
+- `integrations/`: optional Telegram, Discord, and Obsidian adapters that cannot affect trade safety.
 
 ## Install
 
@@ -38,6 +40,10 @@ python main.py health
 python main.py backtest --data data/private/nifty_candles.csv
 python main.py paper
 python main.py instruments
+python main.py agents
+python main.py events
+python main.py notifications
+python main.py export-obsidian
 python dashboard.py reports/generated/trades.csv
 ```
 

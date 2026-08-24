@@ -40,6 +40,11 @@ class Settings:
     kite_api_key: str = os.getenv("KITE_API_KEY", "")
     kite_api_secret: str = os.getenv("KITE_API_SECRET", "")
     kite_access_token: str = os.getenv("KITE_ACCESS_TOKEN", "")
+    ai_provider: str = os.getenv("AI_PROVIDER", "unavailable")
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
+    obsidian_vault_path: str = os.getenv("OBSIDIAN_VAULT_PATH", "")
 
     def validate(self) -> None:
         if self.trading_mode not in {"paper", "live"}:
