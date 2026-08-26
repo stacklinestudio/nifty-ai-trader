@@ -75,6 +75,18 @@ def test_orchestrator_fails_closed_without_market_data(tmp_path: Path):
         and cycle.order is None
         and cycle.validation.decision.value == "REJECT"
     )
+    # Regression guard: without a candidate, only the 7 research agents should
+    # ever run. TRADE_VALIDATED is published for the audit trail in this path
+    # too, and it must not also re-trigger a real risk/execution invocation.
+    assert set(cycle.agent_results) == {
+        "global_research",
+        "india_market",
+        "news",
+        "technical",
+        "volatility",
+        "breadth",
+        "signal_hunter",
+    }
 
 
 def test_independent_validation_and_risk_veto_stale_candidate(tmp_path: Path):

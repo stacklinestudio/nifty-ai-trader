@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -46,8 +46,31 @@ class CycleResult:
     order: dict[str, Any] | None
 
 
+@dataclass
+class _CycleState:
+    """Scratch space bus subscribers fill in as each stage's event arrives.
+
+    This — not a hand-threaded local variable — is how one stage's output
+    reaches the next stage's handler: run_cycle populates it as far as
+    research goes, then publish() synchronously runs the whole subscriber
+    chain (each handler publishes the next event before returning) before
+    control comes back to run_cycle to read the final state.
+    """
+
+    context: dict[str, Any]
+    results: dict[str, AgentResult] = field(default_factory=dict)
+    consensus: str = "UNCERTAIN"
+    conflict: bool = False
+    thesis: TradeThesis | None = None
+    validation: Validation | None = None
+    risk_approved: bool = False
+    order: dict[str, Any] | None = None
+
+
 class Orchestrator:
-    """Agents communicate through events; risk remains a deterministic final veto."""
+    """Each stage publishes an event on completion; the next stage is a bus
+    subscriber reacting to that event, not a direct call from the previous
+    stage. Risk remains a deterministic final veto."""
 
     def __init__(
         self,
@@ -81,6 +104,14 @@ class Orchestrator:
         self.validator = IndependentTradeValidator()
         self.memory = MemoryStore(settings.database_path)
         self.post_trade_agent = PostTradeAgent(self.memory)
+        self._state: _CycleState | None = None
+
+        self.bus.subscribe(EventType.MARKET_RESEARCH_COMPLETE, self._on_research_complete)
+        self.bus.subscribe(EventType.SIGNAL_CREATED, self._on_signal_created)
+        self.bus.subscribe(EventType.TRADE_PROPOSED, self._on_trade_proposed)
+        self.bus.subscribe(EventType.TRADE_VALIDATED, self._on_trade_validated)
+        self.bus.subscribe(EventType.RISK_APPROVED, self._on_risk_decision)
+        self.bus.subscribe(EventType.RISK_REJECTED, self._on_risk_decision)
 
     def _event(
         self,
@@ -115,85 +146,130 @@ class Orchestrator:
 
     def run_cycle(self, supplied_context: dict[str, Any] | None = None) -> CycleResult:
         self.settings.validate()
-        context = dict(supplied_context or {})
+        state = _CycleState(context=dict(supplied_context or {}))
+        self._state = state
         self._event(EventType.SYSTEM_STARTED, {"trading_mode": self.settings.trading_mode})
         self._event(EventType.MARKET_PREP_STARTED, {"workflow": "research"})
-        results = {agent.name: agent.run(context) for agent in self.research_agents}
-        consensus, conflict = self._consensus(results)
+
+        state.results = {agent.name: agent.run(state.context) for agent in self.research_agents}
+        state.consensus, state.conflict = self._consensus(state.results)
+        # Publishing this event synchronously runs the entire subscriber chain
+        # below (research -> signal -> options/build -> validate -> risk ->
+        # execute) before this call returns; by the next line, `state` holds
+        # the cycle's final outcome.
         self._event(
-            EventType.MARKET_RESEARCH_COMPLETE, {"consensus": consensus, "conflict": conflict}
+            EventType.MARKET_RESEARCH_COMPLETE, {"consensus": state.consensus, "conflict": state.conflict}
         )
-        candidates = results["signal_hunter"].data.get("candidates", []) if not conflict else []
+        assert state.validation is not None  # always set by _on_research_complete's chain
+        return CycleResult(
+            datetime.now(IST),
+            state.results,
+            state.consensus,
+            state.conflict,
+            state.thesis,
+            state.validation,
+            state.risk_approved,
+            state.order,
+        )
+
+    def _on_research_complete(self, event: Event) -> None:
+        state = self._state
+        candidates = (
+            state.results["signal_hunter"].data.get("candidates", []) if not state.conflict else []
+        )
         if not candidates:
-            validation = Validation(
+            state.validation = Validation(
                 Decision.REJECT, ("No candidate passed the evidence-consensus stage.",), 0
             )
             self._event(
                 EventType.TRADE_VALIDATED,
-                {"decision": validation.decision.value, "reasons": validation.reasons},
+                {"decision": state.validation.decision.value, "reasons": state.validation.reasons},
             )
             self._event(EventType.RISK_REJECTED, {"reasons": ["no candidate"]})
-            return CycleResult(
-                datetime.now(IST), results, consensus, conflict, None, validation, False, None
-            )
+            return
         candidate = candidates[0]
+        state.context["candidate"] = candidate
         self._event(
             EventType.SIGNAL_CREATED,
             {"candidate_id": candidate.candidate_id},
             candidate.confidence,
             "signal_hunter",
         )
+
+    def _on_signal_created(self, event: Event) -> None:
+        state = self._state
+        candidate = state.context["candidate"]
         options = self.options_agent.run(
-            {
-                **context,
-                "candidate": candidate,
-                "max_position_value": self.settings.max_position_value,
-            }
+            {**state.context, "max_position_value": self.settings.max_position_value}
         )
-        results[options.agent] = options
+        state.results[options.agent] = options
         ranked = options.data.get("ranked", [])
-        builder = self.trade_builder.run(
-            {**context, "candidate": candidate, "selected_option": ranked[0] if ranked else None}
-        )
-        results[builder.agent] = builder
-        thesis = builder.data.get("thesis")
+        state.context["ranked"] = ranked
+        state.context["selected_option"] = ranked[0] if ranked else None
+        builder = self.trade_builder.run(state.context)
+        state.results[builder.agent] = builder
+        state.thesis = builder.data.get("thesis")
         self._event(
             EventType.TRADE_PROPOSED,
-            {"candidate_id": candidate.candidate_id, "built": thesis is not None},
+            {"candidate_id": candidate.candidate_id, "built": state.thesis is not None},
             builder.confidence,
             builder.agent,
         )
+
+    def _on_trade_proposed(self, event: Event) -> None:
+        state = self._state
+        ranked = state.context.get("ranked", [])
         validation = self.validator.validate(
-            thesis,
+            state.thesis,
             getattr(ranked[0].quote, "spread", None) if ranked else None,
-            bool(context.get("market_data_fresh", False)),
-            conflict,
+            bool(state.context.get("market_data_fresh", False)),
+            state.conflict,
         )
+        state.validation = validation
         self._event(
             EventType.TRADE_VALIDATED,
             {"decision": validation.decision.value, "reasons": validation.reasons},
             validation.confidence,
             "validator",
         )
+
+    def _on_trade_validated(self, event: Event) -> None:
+        state = self._state
+        if state.thesis is None:
+            # TRADE_VALIDATED also fires from _on_research_complete's early
+            # no-candidate branch (for the audit trail); there's nothing for
+            # risk to evaluate yet, and RISK_REJECTED is already published
+            # directly by that branch.
+            return
         risk = self.risk_agent.run(
             {
-                "thesis": thesis,
-                "validation": validation,
-                "market_data_fresh": context.get("market_data_fresh", False),
-                "market_open": context.get("market_open", False),
+                "thesis": state.thesis,
+                "validation": state.validation,
+                "market_data_fresh": state.context.get("market_data_fresh", False),
+                "market_open": state.context.get("market_open", False),
             }
         )
-        results[risk.agent] = risk
-        approved = bool(risk.data.get("approved", False))
+        state.results[risk.agent] = risk
+        state.risk_approved = bool(risk.data.get("approved", False))
         self._event(
-            EventType.RISK_APPROVED if approved else EventType.RISK_REJECTED,
+            EventType.RISK_APPROVED if state.risk_approved else EventType.RISK_REJECTED,
             {"reasons": risk.data.get("reasons", [])},
             risk.confidence,
             risk.agent,
         )
-        execution = self.execution_agent.run({"thesis": thesis, "risk_approved": approved})
-        results[execution.agent] = execution
+
+    def _on_risk_decision(self, event: Event) -> None:
+        state = self._state
+        if state.thesis is None:
+            # The "no candidate" path publishes RISK_REJECTED directly without
+            # a thesis ever having been built; there is nothing to execute.
+            return
+        execution = self.execution_agent.run(
+            {"thesis": state.thesis, "risk_approved": state.risk_approved}
+        )
+        state.results[execution.agent] = execution
         order = execution.data.get("order")
+        state.order = order
         if order:
             self.limits.register_open()
             self._event(
@@ -205,9 +281,6 @@ class Orchestrator:
                 100,
                 execution.agent,
             )
-        return CycleResult(
-            datetime.now(IST), results, consensus, conflict, thesis, validation, approved, order
-        )
 
     def review_trade(self, outcome_facts: dict[str, Any]) -> AgentResult:
         """Runs the post-trade review once a trade has closed.
