@@ -126,33 +126,73 @@ class RiskAgent(BaseAgent):
 
 
 class TradeSupervisorAgent(BaseAgent):
+    """Supervises one open position per poll tick.
+
+    Distinguishes three separate exit signals because they carry different
+    learning meaning: EXIT_TARGET/EXIT_STOP are price-level events (the
+    trade played out as planned, win or lose), while EXIT_INVALIDATED means
+    the thesis itself broke — a regime flip or a volatility spike after
+    entry — independent of where price happens to be. The stop level this
+    checks against is whatever the caller currently has (context["current_stop"]),
+    not the original thesis.stop, since trailing-stop math (risk/trailing_stop.py)
+    may have already moved it.
+    """
+
     name = "trade_supervisor"
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
         thesis: TradeThesis | None = context.get("thesis")
         ltp = context.get("ltp")
-        if thesis is None or ltp is None:
+        current_stop = context.get("current_stop")
+        if thesis is None or ltp is None or current_stop is None:
             return result(
                 self.name,
                 0,
-                ("Position or live price unavailable; no recommendation.",),
+                ("Position, live price, or current stop unavailable; no recommendation.",),
                 thesis_state="UNKNOWN",
                 recommendation="HOLD",
             )
-        state = (
-            "STRENGTHENING"
-            if ltp >= thesis.entry
-            else "WEAKENING"
-            if ltp > thesis.stop
-            else "INVALIDATED"
-        )
-        recommendation = "EXIT" if state == "INVALIDATED" else "HOLD"
+        entry_regime = context.get("entry_regime")
+        current_regime = context.get("current_regime")
+        entry_volatility = context.get("entry_volatility_regime")
+        current_volatility = context.get("current_volatility_regime")
+        regime_flip = bool(entry_regime and current_regime and entry_regime != current_regime)
+        volatility_spike = current_volatility == "HIGH" and entry_volatility != "HIGH"
+        if regime_flip or volatility_spike:
+            reasons = (
+                *(
+                    (f"regime flipped from {entry_regime} to {current_regime}",)
+                    if regime_flip
+                    else ()
+                ),
+                *(("volatility expanded to HIGH after entry",) if volatility_spike else ()),
+            )
+            return result(
+                self.name, 80, reasons, thesis_state="INVALIDATED", recommendation="EXIT_INVALIDATED"
+            )
+        if ltp >= thesis.target:
+            return result(
+                self.name,
+                90,
+                (f"LTP {ltp} reached target {thesis.target}.",),
+                thesis_state="TARGET_HIT",
+                recommendation="EXIT_TARGET",
+            )
+        if ltp <= current_stop:
+            return result(
+                self.name,
+                90,
+                (f"LTP {ltp} reached current stop {current_stop}.",),
+                thesis_state="STOPPED",
+                recommendation="EXIT_STOP",
+            )
+        state = "STRENGTHENING" if ltp >= thesis.entry else "WEAKENING"
         return result(
             self.name,
-            70,
+            55,
             ("Original thesis and current LTP compared.",),
             thesis_state=state,
-            recommendation=recommendation,
+            recommendation="HOLD",
         )
 
 
