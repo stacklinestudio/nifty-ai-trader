@@ -41,6 +41,8 @@ class Settings:
     kite_api_secret: str = os.getenv("KITE_API_SECRET", "")
     kite_access_token: str = os.getenv("KITE_ACCESS_TOKEN", "")
     ai_provider: str = os.getenv("AI_PROVIDER", "unavailable")
+    trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
+    supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
