@@ -222,3 +222,40 @@ def test_full_cycle_supervise_exit_review_trade_path_end_to_end(tmp_path):
     assert 0 < payload["pnl"] < raw_gain
     assert payload["mfe"] > 0
     assert payload["mae"] == 0.0
+
+
+def test_supervise_once_closes_real_position_on_stop_loss(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(cycle)
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+
+    result = orchestrator.supervise_once(state, state.thesis.stop - 0.5, open_time)
+
+    assert result.should_exit and result.reason == "STOP_LOSS"
+    assert orchestrator.paper_broker.get_positions() == []
+    payload = orchestrator.memory.recent(memory_type="trade", limit=5)[0]["payload"]
+    assert payload["outcome"] == "LOSS" and payload["pnl"] < 0
+
+
+def test_supervise_once_forces_exit_at_1515_via_real_broker_regardless_of_state(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(cycle)
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+    # Comfortably between stop and target -- nothing about price alone would
+    # trigger an exit -- but it is past the forced square-off deadline.
+    result = orchestrator.supervise_once(
+        state, state.thesis.entry + 0.1, opened_at(hour=15, minute=15)
+    )
+
+    assert result.should_exit and result.reason == "FORCED_EXIT"
+    assert orchestrator.paper_broker.get_positions() == []
+    events = {event["event_type"] for event in orchestrator.database.events()}
+    assert "FORCED_EXIT" in events
