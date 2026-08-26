@@ -9,6 +9,9 @@ from typing import Any
 
 from agents.contracts import AgentResult
 from config import IST
+from monitoring.logger import configure_logger
+
+logger = configure_logger(__name__)
 
 
 class BaseAgent(ABC):
@@ -22,6 +25,7 @@ class BaseAgent(ABC):
             result = self.analyze(dict(context))
             duration = (perf_counter() - started) * 1000
             if duration > self.timeout_seconds * 1000:
+                logger.warning("agent_timeout agent=%s duration_ms=%.1f", self.name, duration)
                 return AgentResult(
                     self.name, timestamp, 0, error="agent timeout", duration_ms=duration
                 )
@@ -36,6 +40,7 @@ class BaseAgent(ABC):
                 duration,
             )
         except Exception as exc:  # noqa: BLE001 - the agent boundary must turn all failures into data.
+            logger.warning("agent_failed agent=%s error=%s: %s", self.name, type(exc).__name__, exc)
             return AgentResult(
                 self.name,
                 timestamp,

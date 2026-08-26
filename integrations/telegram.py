@@ -5,6 +5,10 @@ from collections.abc import Callable
 
 import requests
 
+from monitoring.logger import configure_logger
+
+logger = configure_logger(__name__)
+
 
 class TelegramNotifier:
     def __init__(
@@ -25,7 +29,8 @@ class TelegramNotifier:
                 )
                 if getattr(response, "ok", False):
                     return True
-            except Exception:  # noqa: BLE001 - notification failures are deliberately isolated.
-                response = None
+            except OSError as exc:
+                # Non-fatal by design: notification failures never block trading.
+                logger.warning("telegram_send_failed attempt=%d error=%s", attempt + 1, exc)
             time.sleep(0.1 * (2**attempt))
         return False
