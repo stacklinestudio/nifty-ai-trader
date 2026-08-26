@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, time, timedelta
+
 from agents.contracts import TradeCandidate, TradeThesis
 from agents.trading_agents import TradeSupervisorAgent
+from config import IST
+from execution.position_supervisor import PositionState, tick
 
 
 def thesis(entry=100.0, stop=90.0, target=115.0) -> TradeThesis:
@@ -77,3 +81,80 @@ def test_supervisor_flags_thesis_invalidated_on_volatility_spike():
         }
     )
     assert review.data["recommendation"] == "EXIT_INVALIDATED"
+
+
+def opened_at(hour=10, minute=0) -> datetime:
+    return datetime.now(IST).replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def test_tick_holds_within_bounds_and_tracks_mae_mfe():
+    open_time = opened_at()
+    state = PositionState.opening(thesis(), open_time)
+    result = tick(state, 95.0, open_time, time(15, 15), 60, TradeSupervisorAgent())
+    assert not result.should_exit
+    assert state.mae == 5.0 and state.mfe == 0.0
+    result = tick(
+        state, 108.0, open_time + timedelta(seconds=5), time(15, 15), 60, TradeSupervisorAgent()
+    )
+    assert not result.should_exit
+    assert state.mfe == 8.0 and state.mae == 5.0
+
+
+def test_tick_exits_on_target_hit():
+    open_time = opened_at()
+    state = PositionState.opening(thesis(), open_time)
+    result = tick(state, 115.0, open_time, time(15, 15), 60, TradeSupervisorAgent())
+    assert result.should_exit and result.reason == "TAKE_PROFIT" and result.exit_price == 115.0
+
+
+def test_tick_exits_on_trailed_stop_not_original_stop():
+    open_time = opened_at()
+    state = PositionState.opening(thesis(entry=100, stop=90, target=200), open_time)
+    # Run the price up so the trailing stop moves well above the original 90.
+    tick(state, 160.0, open_time, time(15, 15), 60, TradeSupervisorAgent())
+    trailed_stop = state.current_stop
+    assert trailed_stop > 90
+    # A pullback that is still above the *original* stop but at/below the
+    # *trailed* stop must trigger STOP_LOSS.
+    pullback_price = trailed_stop - 1
+    assert pullback_price > 90
+    result = tick(
+        state,
+        pullback_price,
+        open_time + timedelta(seconds=5),
+        time(15, 15),
+        60,
+        TradeSupervisorAgent(),
+    )
+    assert result.should_exit and result.reason == "STOP_LOSS"
+
+
+def test_tick_forces_exit_at_1515_regardless_of_pnl_or_strengthening():
+    open_time = opened_at(hour=10)
+    state = PositionState.opening(thesis(entry=100, stop=90, target=1000), open_time)
+    # Deep in profit and clearly STRENGTHENING (no target set within reach).
+    tick(state, 150.0, open_time, time(15, 15), 60, TradeSupervisorAgent())
+    now = opened_at(hour=15, minute=15)
+    result = tick(state, 155.0, now, time(15, 15), 60, TradeSupervisorAgent())
+    assert result.should_exit and result.reason == "FORCED_EXIT"
+
+
+def test_tick_holds_and_notifies_on_stale_data_instead_of_guessing():
+    open_time = opened_at()
+    state = PositionState.opening(thesis(), open_time)
+    # No fresh quote for well beyond the staleness threshold.
+    later = open_time + timedelta(seconds=120)
+    result = tick(state, None, later, time(15, 15), 60, TradeSupervisorAgent())
+    assert not result.should_exit
+    assert result.notify_stale is True
+
+
+def test_tick_forces_exit_at_deadline_even_with_stale_data():
+    open_time = opened_at(hour=10)
+    state = PositionState.opening(thesis(), open_time)
+    now = opened_at(hour=15, minute=15)
+    result = tick(state, None, now, time(15, 15), 60, TradeSupervisorAgent())
+    assert result.should_exit and result.reason == "FORCED_EXIT"
+    # Exits at the last known valid price (entry, since no quote ever arrived)
+    # rather than fabricating a current price.
+    assert result.exit_price == state.thesis.entry
