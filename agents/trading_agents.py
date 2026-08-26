@@ -9,6 +9,9 @@ from agents.base import BaseAgent
 from agents.contracts import AgentResult, Decision, TradeCandidate, TradeThesis, Validation
 from config import IST, Settings
 from data.option_chain import OptionQuote
+from learning.experiment_manager import Experiment, create_experiment
+from learning.memory import MemoryStore
+from learning.trade_memory import record_trade
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from strategy.option_selector import OptionSelector
@@ -183,15 +186,45 @@ class ExecutionAgent(BaseAgent):
 
 
 class PostTradeAgent(BaseAgent):
+    """Reviews a closed trade's own facts and records a candidate hypothesis.
+
+    This never modifies live risk/strategy parameters — it only appends to
+    MemoryStore and creates a CANDIDATE Experiment. Promotion still requires
+    learning.promotion_engine.decide() to see historical, walk-forward, and
+    out-of-sample evidence plus explicit human approval.
+    """
+
     name = "post_trade"
 
+    def __init__(self, memory: MemoryStore) -> None:
+        self.memory = memory
+
     def analyze(self, context: dict[str, Any]) -> AgentResult:
+        outcome = context.get("outcome", "NO_TRADE")
+        pnl = context.get("pnl")
+        if outcome == "NO_TRADE" or pnl is None:
+            return result(
+                self.name,
+                0,
+                ("Post-trade review is fact-grounded and deferred until trade closure.",),
+                review={"outcome": outcome, "learning_hypothesis": "None without closed trade facts"},
+            )
+        setup_type = context.get("setup_type", "unspecified setup")
+        exit_reason = context.get("exit_reason", "unspecified exit")
+        hypothesis = f"{setup_type} exiting via {exit_reason} produced {outcome} (pnl={pnl})."
+        record_trade(
+            self.memory,
+            {"outcome": outcome, "pnl": pnl, "setup_type": setup_type, "exit_reason": exit_reason},
+            datetime.now(IST),
+        )
+        create_experiment(
+            self.memory,
+            Experiment(hypothesis, {"setup_type": setup_type}, "v2"),
+            datetime.now(IST),
+        )
         return result(
             self.name,
-            0,
-            ("Post-trade review is fact-grounded and deferred until trade closure.",),
-            review={
-                "outcome": context.get("outcome", "NO_TRADE"),
-                "learning_hypothesis": "None without closed trade facts",
-            },
+            60,
+            ("Closed-trade facts recorded; hypothesis is a candidate only, not a promotion.",),
+            review={"outcome": outcome, "pnl": pnl, "learning_hypothesis": hypothesis},
         )

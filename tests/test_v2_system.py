@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agents.contracts import AgentResult
 from agents.orchestrator import Orchestrator
+from agents.trading_agents import PostTradeAgent
 from ai.router import AIRouter
 from config import IST, Settings
 from data.instruments import OptionInstrument
@@ -123,3 +124,33 @@ def test_obsidian_export_is_optional_and_writes_markdown(tmp_path: Path):
     assert ObsidianExporter().export("Daily Research", "none", {}) is None
     path = ObsidianExporter(str(tmp_path)).export("Daily Research", "2025-01-01", {"mode": "paper"})
     assert path and path.exists() and "paper" in path.read_text()
+
+
+def test_post_trade_agent_defers_without_closed_facts(tmp_path: Path):
+    memory = MemoryStore(tmp_path / "learning.db")
+    review = PostTradeAgent(memory).run({})
+    assert review.data["review"]["learning_hypothesis"] == "None without closed trade facts"
+    assert memory.recent() == []
+
+
+def test_post_trade_agent_records_hypothesis_from_closed_trade_facts(tmp_path: Path):
+    memory = MemoryStore(tmp_path / "learning.db")
+    review = PostTradeAgent(memory).run(
+        {"outcome": "LOSS", "pnl": -150, "setup_type": "OPENING_STRUCTURE", "exit_reason": "STOP_LOSS"}
+    )
+    assert "LOSS" in review.data["review"]["learning_hypothesis"]
+    kinds = {entry["memory_type"] for entry in memory.recent(limit=10)}
+    assert kinds == {"trade", "experiment"}
+
+
+def test_orchestrator_review_trade_wires_learning_without_promoting(tmp_path: Path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    review = orchestrator.review_trade(
+        {"outcome": "WIN", "pnl": 120, "setup_type": "OPENING_STRUCTURE", "exit_reason": "TAKE_PROFIT"}
+    )
+    assert review.data["review"]["outcome"] == "WIN"
+    events = {event["event_type"] for event in orchestrator.database.events()}
+    assert {"TRADE_COMPLETED", "LEARNING_CREATED"} <= events
+    recent = orchestrator.memory.recent(memory_type="experiment", limit=5)
+    assert recent and recent[0]["payload"]["status"] == "CANDIDATE"

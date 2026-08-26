@@ -17,11 +17,18 @@ from agents.research_agents import (
     VolatilityAgent,
 )
 from agents.trade_validator import IndependentTradeValidator
-from agents.trading_agents import ExecutionAgent, OptionsAgent, RiskAgent, TradeBuilderAgent
+from agents.trading_agents import (
+    ExecutionAgent,
+    OptionsAgent,
+    PostTradeAgent,
+    RiskAgent,
+    TradeBuilderAgent,
+)
 from config import IST, Settings
 from events.bus import EventBus
 from events.contracts import Event, EventType
 from execution.paper_broker import PaperBroker
+from learning.memory import MemoryStore
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from storage.database import Database
@@ -72,6 +79,8 @@ class Orchestrator:
         self.risk_agent = RiskAgent(settings, self.limits)
         self.execution_agent = ExecutionAgent(self.paper_broker, settings)
         self.validator = IndependentTradeValidator()
+        self.memory = MemoryStore(settings.database_path)
+        self.post_trade_agent = PostTradeAgent(self.memory)
 
     def _event(
         self,
@@ -199,3 +208,27 @@ class Orchestrator:
         return CycleResult(
             datetime.now(IST), results, consensus, conflict, thesis, validation, approved, order
         )
+
+    def review_trade(self, outcome_facts: dict[str, Any]) -> AgentResult:
+        """Runs the post-trade review once a trade has closed.
+
+        Recording facts and proposing a hypothesis happens inside
+        PostTradeAgent; this method's only job is to make that reachable and
+        auditable. It never touches live risk/strategy parameters — promotion
+        of a hypothesis still requires learning.promotion_engine.decide() to
+        see historical, walk-forward, and out-of-sample evidence plus human
+        approval.
+        """
+        review = self.post_trade_agent.run(outcome_facts)
+        self._event(
+            EventType.TRADE_COMPLETED,
+            {"outcome": outcome_facts.get("outcome", "NO_TRADE")},
+            review.confidence,
+            review.agent,
+        )
+        hypothesis = review.data.get("review", {}).get("learning_hypothesis")
+        if hypothesis and hypothesis != "None without closed trade facts":
+            self._event(
+                EventType.LEARNING_CREATED, {"hypothesis": hypothesis}, review.confidence, review.agent
+            )
+        return review
