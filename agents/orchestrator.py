@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time as time_module
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -23,15 +25,28 @@ from agents.trading_agents import (
     PostTradeAgent,
     RiskAgent,
     TradeBuilderAgent,
+    TradeSupervisorAgent,
 )
 from config import IST, Settings
 from events.bus import EventBus
 from events.contracts import Event, EventType
 from execution.paper_broker import PaperBroker
+from execution.position_supervisor import PositionState, TickResult
+from execution.position_supervisor import tick as supervise_tick
 from learning.memory import MemoryStore
+from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from storage.database import Database
+
+logger = configure_logger(__name__)
+
+_EXIT_REASON_TO_EVENT = {
+    "TAKE_PROFIT": EventType.TAKE_PROFIT,
+    "STOP_LOSS": EventType.STOP_LOSS,
+    "THESIS_INVALIDATED": EventType.THESIS_INVALIDATED,
+    "FORCED_EXIT": EventType.FORCED_EXIT,
+}
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,7 @@ class Orchestrator:
         self.validator = IndependentTradeValidator()
         self.memory = MemoryStore(settings.database_path)
         self.post_trade_agent = PostTradeAgent(self.memory)
+        self.trade_supervisor_agent = TradeSupervisorAgent()
         self._state: _CycleState | None = None
 
         self.bus.subscribe(EventType.MARKET_RESEARCH_COMPLETE, self._on_research_complete)
@@ -305,3 +321,128 @@ class Orchestrator:
                 EventType.LEARNING_CREATED, {"hypothesis": hypothesis}, review.confidence, review.agent
             )
         return review
+
+    def open_position(
+        self, cycle: CycleResult, now: datetime | None = None
+    ) -> PositionState | None:
+        """Builds trackable state for a just-filled entry order. Returns None
+        when the cycle produced no fill — there is nothing to supervise."""
+        if not cycle.order or cycle.thesis is None:
+            return None
+        india_market = cycle.agent_results.get("india_market")
+        volatility = cycle.agent_results.get("volatility")
+        return PositionState.opening(
+            cycle.thesis,
+            now or datetime.now(IST),
+            india_market.data.get("market_regime") if india_market else None,
+            volatility.data.get("volatility_regime") if volatility else None,
+        )
+
+    def supervise_once(
+        self,
+        state: PositionState,
+        ltp: float | None,
+        now: datetime,
+        current_regime: str | None = None,
+        current_volatility_regime: str | None = None,
+    ) -> TickResult:
+        """One deterministic tick: updates the trailing stop and MAE/MFE,
+        decides HOLD/EXIT via position_supervisor.tick, and on EXIT actually
+        closes the position — a real paper SELL, the matching audit event,
+        and review_trade with real outcome facts. Side-effecting by design;
+        run_supervised (or a test) supplies ltp/now for each call.
+        """
+        regime_context = {
+            "entry_regime": state.entry_regime,
+            "current_regime": current_regime,
+            "entry_volatility_regime": state.entry_volatility_regime,
+            "current_volatility_regime": current_volatility_regime,
+        }
+        result = supervise_tick(
+            state,
+            ltp,
+            now,
+            self.settings.forced_exit_time,
+            self.settings.stale_data_seconds,
+            self.trade_supervisor_agent,
+            regime_context,
+            self.settings.trail_percent,
+        )
+        if result.notify_stale:
+            logger.warning("stale_price_during_open_position symbol=%s", state.thesis.symbol)
+            self._event(
+                EventType.SYSTEM_ERROR,
+                {"reason": "stale_price_during_open_position", "symbol": state.thesis.symbol},
+            )
+        if result.should_exit:
+            self._close_position(state, result, now)
+        return result
+
+    def _close_position(self, state: PositionState, result: TickResult, now: datetime) -> None:
+        order = self.paper_broker.place_order(
+            state.thesis.symbol, "SELL", state.thesis.quantity, result.exit_price, now, result.reason
+        )
+        pnl = (order["fill_price"] - state.thesis.entry) * state.thesis.quantity - order[
+            "estimated_costs"
+        ]
+        self.limits.register_close(pnl)
+        hold_seconds = (now - state.opened_at).total_seconds()
+        self._event(
+            _EXIT_REASON_TO_EVENT[result.reason],
+            {
+                "order_id": order["order_id"],
+                "entry": state.thesis.entry,
+                "exit": order["fill_price"],
+                "pnl": pnl,
+                "mae": state.mae,
+                "mfe": state.mfe,
+                "hold_seconds": hold_seconds,
+            },
+            100,
+            "execution",
+        )
+        self.review_trade(
+            {
+                "outcome": "WIN" if pnl > 0 else "LOSS",
+                "pnl": pnl,
+                "mae": state.mae,
+                "mfe": state.mfe,
+                "setup_type": state.thesis.candidate.setup_type,
+                "exit_reason": result.reason,
+                "hold_seconds": hold_seconds,
+                "entry_regime": state.entry_regime,
+            }
+        )
+
+    def run_supervised(
+        self,
+        state: PositionState,
+        quote_source: Callable[[], float | None],
+        poll_seconds: float | None = None,
+        clock: Callable[[], datetime] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        regime_source: Callable[[], tuple[str | None, str | None]] | None = None,
+    ) -> TickResult:
+        """Real-time polling loop for live/paper use: blocks until the
+        position closes (target, stop, invalidation, or the 15:15 forced
+        exit). All decision logic lives in supervise_once/tick — this
+        function only wires real time and IO to it. Deliberately the one
+        piece of this feature not covered by a real-time test; tests drive
+        supervise_once/tick directly with synthetic clocks instead.
+        """
+        poll_seconds = (
+            poll_seconds if poll_seconds is not None else self.settings.supervision_poll_seconds
+        )
+        clock = clock or (lambda: datetime.now(IST))
+        sleeper = sleeper or time_module.sleep
+        while True:
+            now = clock()
+            ltp = quote_source()
+            current_regime, current_volatility_regime = regime_source() if regime_source else (
+                None,
+                None,
+            )
+            result = self.supervise_once(state, ltp, now, current_regime, current_volatility_regime)
+            if result.should_exit:
+                return result
+            sleeper(poll_seconds)

@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 
 from agents.contracts import TradeCandidate, TradeThesis
+from agents.orchestrator import Orchestrator
 from agents.trading_agents import TradeSupervisorAgent
-from config import IST
+from config import IST, Settings
+from data.instruments import OptionInstrument
+from data.option_chain import OptionQuote
 from execution.position_supervisor import PositionState, tick
 
 
@@ -83,6 +86,26 @@ def test_supervisor_flags_thesis_invalidated_on_volatility_spike():
     assert review.data["recommendation"] == "EXIT_INVALIDATED"
 
 
+def filled_cycle_context() -> dict:
+    instrument = OptionInstrument(
+        "NIFTY24CE", 22000, datetime.now(IST).date() + timedelta(days=3), "CE", 25
+    )
+    quote = OptionQuote(instrument, 10, datetime.now(IST), 9.75, 10.25, 1000)
+    return {
+        "candidate_direction": "CALL",
+        "candidate_confidence": 88,
+        "entry_zone": (10.0, 10.5),
+        "stop_zone": (8.0, 8.5),
+        "target_zone": (13.0, 14.0),
+        "option_quotes": [quote],
+        "spot": 22000,
+        "option_atr": 1,
+        "market_data_fresh": True,
+        "market_open": True,
+        "features": {"ema_fast": 2, "ema_slow": 1, "close": 2, "vwap": 1, "atr": 10},
+    }
+
+
 def opened_at(hour=10, minute=0) -> datetime:
     return datetime.now(IST).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
@@ -158,3 +181,44 @@ def test_tick_forces_exit_at_deadline_even_with_stale_data():
     # Exits at the last known valid price (entry, since no quote ever arrived)
     # rather than fabricating a current price.
     assert result.exit_price == state.thesis.entry
+
+
+def test_full_cycle_supervise_exit_review_trade_path_end_to_end(tmp_path):
+    """run_cycle fills an entry -> open_position -> supervise_once hits
+    target -> a real paper SELL closes the position -> review_trade records
+    real P&L/MAE/MFE into learning memory, not just that the call happened.
+    """
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    assert cycle.order and cycle.order["status"] == "FILLED"
+
+    state = orchestrator.open_position(cycle)
+    assert state is not None and state.thesis.entry == cycle.thesis.entry
+
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+    # Run the price up through the target so the tick both records MFE along
+    # the way and then triggers an actual exit.
+    orchestrator.supervise_once(state, state.thesis.entry + 0.5, open_time)
+    result = orchestrator.supervise_once(
+        state, state.thesis.target, open_time + timedelta(seconds=5)
+    )
+    assert result.should_exit and result.reason == "TAKE_PROFIT"
+
+    # The paper broker actually closed the position, not just recorded intent.
+    assert orchestrator.paper_broker.get_positions() == []
+
+    trades = orchestrator.memory.recent(memory_type="trade", limit=5)
+    assert trades, "expected a closed-trade record in learning memory"
+    payload = trades[0]["payload"]
+    assert payload["outcome"] == "WIN"
+    assert payload["exit_reason"] == "TAKE_PROFIT"
+    # Real P&L reflects the paper broker's exit slippage and costs, so it is
+    # positive but strictly less than the naive (exit - entry) * qty gain --
+    # this is what proves it came from a real fill, not a fabricated number.
+    raw_gain = (result.exit_price - state.thesis.entry) * state.thesis.quantity
+    assert 0 < payload["pnl"] < raw_gain
+    assert payload["mfe"] > 0
+    assert payload["mae"] == 0.0

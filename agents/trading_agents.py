@@ -251,20 +251,33 @@ class PostTradeAgent(BaseAgent):
             )
         setup_type = context.get("setup_type", "unspecified setup")
         exit_reason = context.get("exit_reason", "unspecified exit")
+        mae = context.get("mae", 0.0)
+        mfe = context.get("mfe", 0.0)
+        entry_regime = context.get("entry_regime")
+        hold_seconds = context.get("hold_seconds")
         hypothesis = f"{setup_type} exiting via {exit_reason} produced {outcome} (pnl={pnl})."
         record_trade(
             self.memory,
-            {"outcome": outcome, "pnl": pnl, "setup_type": setup_type, "exit_reason": exit_reason},
+            {
+                "outcome": outcome,
+                "pnl": pnl,
+                "setup_type": setup_type,
+                "exit_reason": exit_reason,
+                "mae": mae,
+                "mfe": mfe,
+                "entry_regime": entry_regime,
+                "hold_seconds": hold_seconds,
+            },
             datetime.now(IST),
         )
         create_experiment(
             self.memory,
-            Experiment(hypothesis, {"setup_type": setup_type}, "v2"),
+            Experiment(hypothesis, {"setup_type": setup_type, "entry_regime": entry_regime}, "v2"),
             datetime.now(IST),
         )
         return result(
             self.name,
             60,
             ("Closed-trade facts recorded; hypothesis is a candidate only, not a promotion.",),
-            review={"outcome": outcome, "pnl": pnl, "learning_hypothesis": hypothesis},
+            review={"outcome": outcome, "pnl": pnl, "mae": mae, "mfe": mfe, "learning_hypothesis": hypothesis},
         )

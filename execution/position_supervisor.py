@@ -39,10 +39,21 @@ class PositionState:
     last_quote_at: datetime
     mae: float = 0.0
     mfe: float = 0.0
+    entry_regime: str | None = None
+    entry_volatility_regime: str | None = None
 
     @classmethod
-    def opening(cls, thesis: TradeThesis, opened_at: datetime) -> PositionState:
-        return cls(thesis, opened_at, thesis.stop, thesis.entry, opened_at)
+    def opening(
+        cls,
+        thesis: TradeThesis,
+        opened_at: datetime,
+        entry_regime: str | None = None,
+        entry_volatility_regime: str | None = None,
+    ) -> PositionState:
+        return cls(
+            thesis, opened_at, thesis.stop, thesis.entry, opened_at, 0.0, 0.0,
+            entry_regime, entry_volatility_regime,
+        )
 
     def observe(self, ltp: float, now: datetime, trail_pct: float) -> None:
         gain = ltp - self.thesis.entry
