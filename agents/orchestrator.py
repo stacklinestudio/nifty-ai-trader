@@ -349,7 +349,26 @@ class Orchestrator:
             now or datetime.now(IST),
             india_market.data.get("market_regime") if india_market else None,
             volatility.data.get("volatility_regime") if volatility else None,
+            cycle.consensus,
+            self._agent_directions(cycle.agent_results),
         )
+
+    @staticmethod
+    def _agent_directions(results: dict[str, AgentResult]) -> dict[str, str]:
+        """Which research agents agreed/disagreed on direction at entry —
+        recorded for the learning loop (Part C), not used to gate anything
+        here; consensus/conflict already did that during run_cycle."""
+        directions = {}
+        for name in ("global_research", "india_market", "technical"):
+            agent_result = results.get(name)
+            if agent_result:
+                directions[name] = (
+                    agent_result.data.get("direction")
+                    or agent_result.data.get("market_direction")
+                    or agent_result.data.get("global_direction")
+                    or "UNKNOWN"
+                )
+        return directions
 
     def supervise_once(
         self,
@@ -424,6 +443,11 @@ class Orchestrator:
                 "exit_reason": result.reason,
                 "hold_seconds": hold_seconds,
                 "entry_regime": state.entry_regime,
+                "entry_volatility_regime": state.entry_volatility_regime,
+                "entry_consensus": state.entry_consensus,
+                "agent_agreement": state.entry_agent_directions,
+                "confidence": state.thesis.confidence,
+                "stop_was_trailed": state.current_stop != state.thesis.stop,
             }
         )
 
