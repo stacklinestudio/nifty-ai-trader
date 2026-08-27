@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -15,14 +16,20 @@ from backtest.report import write_backtest_report
 from backtest.simulator import Simulator
 from backtest.walk_forward import walk_forward
 from config import IST, Settings
+from data.calendar import NseCalendar
 from data.historical import validate_candles
+from data.market_data import KiteMarketData, validate_quote
+from execution.scheduler import resume_open_positions, run_trading_day
 from integrations.discord import DiscordNotifier
 from integrations.obsidian import ObsidianExporter
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.health import check_health, system_health
+from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from storage.database import Database
+
+logger = configure_logger(__name__)
 
 
 def engine(settings: Settings) -> BacktestEngine:
@@ -38,6 +45,78 @@ def load(path: str) -> pd.DataFrame:
     if frame.index.tz is None:
         frame.index = frame.index.tz_localize("Asia/Kolkata")
     return validate_candles(frame)
+
+
+def build_live_quote_source(settings: Settings, symbol: str):
+    """Returns a real Kite-backed quote source when credentials exist,
+    otherwise a source that always reports unavailable -- never fabricated.
+    """
+    if not (settings.kite_api_key and settings.kite_access_token):
+        return lambda: None
+    try:
+        from kiteconnect import KiteConnect
+    except ImportError:
+        logger.warning("kiteconnect_not_installed; quote source falling back to unavailable")
+        return lambda: None
+    kite = KiteConnect(api_key=settings.kite_api_key)
+    kite.set_access_token(settings.kite_access_token)
+    market_data = KiteMarketData(kite)
+
+    def live_quote() -> float | None:
+        try:
+            quote = market_data.get_quote(symbol)
+            validate_quote(quote, datetime.datetime.now(IST), settings.stale_data_seconds)
+            return quote.ltp
+        except Exception as exc:  # noqa: BLE001 - turns any transport/staleness failure into
+            # "no data" for run_supervised's own retry/force-exit handling; never crashes here.
+            logger.warning("quote_fetch_failed symbol=%s error=%s", symbol, exc)
+            return None
+
+    return live_quote
+
+
+def run_scheduled_day(settings: Settings) -> dict:
+    """Entry point for unattended daily operation (Brief 3, Part A1).
+
+    Recommended deployment: a fresh process each trading morning via
+    cron/systemd (see execution/scheduler.py's docstring for why), not one
+    process staying resident for days -- this function runs exactly one
+    trading day and returns.
+
+    Known gap: there is no live entry-context assembly pipeline in this
+    codebase yet (option chain + spot + technical features + global
+    market + news, combined into the dict run_cycle expects) -- that is a
+    separate, larger piece of work from the scheduler/crash-recovery gap
+    this brief asked to close. Without it, a real trading day correctly
+    produces "no_entry" (fails closed, matching the rest of this codebase's
+    philosophy) rather than fabricating a signal. The quote source used for
+    supervising any already-open or resumed position IS wired to a real
+    Kite session when credentials are configured.
+    """
+    database = Database(settings.database_path)
+    database.initialize()
+    orchestrator = Orchestrator(settings, database)
+    calendar = NseCalendar()
+    quote_source = build_live_quote_source(settings, "NIFTY")
+
+    def clock() -> datetime.datetime:
+        return datetime.datetime.now(IST)
+
+    resumed = resume_open_positions(orchestrator, quote_source, clock, time.sleep)
+    day = run_trading_day(
+        orchestrator,
+        calendar,
+        context_provider=dict,
+        quote_source=quote_source,
+        clock=clock,
+        sleeper=time.sleep,
+    )
+    return {
+        "resumed_positions": len(resumed),
+        "day_ran": day.ran,
+        "day_reason": day.reason,
+        "order": day.cycle.order if day.cycle else None,
+    }
 
 
 def paper_dry_run(settings: Settings) -> dict:
@@ -68,6 +147,7 @@ def main() -> int:
         "events",
         "notifications",
         "export-obsidian",
+        "run",
     ):
         sub.add_parser(name)
     args = parser.parse_args()
@@ -121,6 +201,9 @@ def main() -> int:
             {"mode": "paper", "note": "No fabricated market data."},
         )
         print(path or "Obsidian vault not configured or unavailable.")
+        return 0
+    if args.command == "run":
+        print(json.dumps(run_scheduled_day(settings), indent=2, default=str))
         return 0
     print(
         "Download instruments through an authenticated official Kite SDK session; no credentials were found."
