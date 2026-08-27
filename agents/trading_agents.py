@@ -9,6 +9,7 @@ from agents.base import BaseAgent
 from agents.contracts import AgentResult, Decision, TradeCandidate, TradeThesis, Validation
 from config import IST, Settings
 from data.option_chain import OptionQuote
+from intelligence.oi_buildup import detect_buildup
 from learning.experiment_manager import Experiment, create_experiment
 from learning.memory import MemoryStore
 from learning.trade_memory import record_trade
@@ -23,13 +24,29 @@ def result(name: str, confidence: float, evidence: tuple[str, ...], **data: Any)
 
 
 class OptionsAgent(BaseAgent):
+    """Ranks/selects the tradeable option contract, and separately reports
+    OI buildup/unwinding by strike (intelligence/oi_buildup.py) as
+    informational evidence -- the closest honest public-data equivalent to
+    "watching where large participants are positioning." This never gates
+    selection or overrides the adversarial validator/risk veto on its own;
+    it is recorded for audit and for the learning loop to later evaluate
+    whether it actually correlated with anything."""
+
     name = "options"
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
         candidate: TradeCandidate | None = context.get("candidate")
         options: list[OptionQuote] = context.get("option_quotes", [])
+        buildup = detect_buildup(options, context.get("previous_option_quotes", []))
         if not candidate or not options:
-            return result(self.name, 0, ("Candidate option quotes unavailable.",), ranked=[])
+            return result(
+                self.name,
+                0,
+                ("Candidate option quotes unavailable.",),
+                ranked=[],
+                oi_buildup_bias=buildup.bias,
+                oi_buildup_reasons=buildup.reasons,
+            )
         selected = OptionSelector().select(
             options,
             candidate.direction,
@@ -38,13 +55,20 @@ class OptionsAgent(BaseAgent):
         )
         if selected is None:
             return result(
-                self.name, 0, ("No liquid, affordable option contract met constraints.",), ranked=[]
+                self.name,
+                0,
+                ("No liquid, affordable option contract met constraints.",),
+                ranked=[],
+                oi_buildup_bias=buildup.bias,
+                oi_buildup_reasons=buildup.reasons,
             )
         return result(
             self.name,
             min(100, max(0, selected.score + 90)),
-            ("Liquidity, spread, expiry, and affordability ranked.",),
+            ("Liquidity, spread, expiry, and affordability ranked.", *buildup.reasons),
             ranked=[selected],
+            oi_buildup_bias=buildup.bias,
+            oi_buildup_reasons=buildup.reasons,
         )
 
 
