@@ -26,16 +26,23 @@ class Settings:
     # any option above ~33 premium -- unusable for real NIFTY premiums
     # (commonly 50-300+). 600/7500 supports one lot at ~100 premium.
     max_risk_per_trade: float = float(os.getenv("MAX_RISK_PER_TRADE", "600"))
-    # NOTE: max_daily_loss (400) is now LESS than a single trade's own risk
-    # budget (600). This is harmless today only because max_trades_per_day=1
-    # means DailyLimits.can_open() never blocks a second trade anyway -- it
-    # is not a real daily ceiling under the new per-trade risk number. If
-    # max_trades_per_day is ever raised, max_daily_loss must be revisited
-    # first (explicitly, per the same rule as the numbers above), or the
-    # first trade's own loss could already exceed what "daily loss limit"
-    # implies.
-    max_daily_loss: float = float(os.getenv("MAX_DAILY_LOSS", "400"))
-    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "1"))
+    # Raised from 400 alongside max_trades_per_day (below), 2026-08-27, user
+    # decision (Brief 3, Part B): at 3 trades/day and 600 risk/trade, worst
+    # case if all 3 lose is 1800 (18% of 10k capital). 1200 is a real,
+    # meaningful backstop -- not just "3 x max_risk_per_trade" with no
+    # cushion -- because it trips after 2 full losses (realized_pnl <=
+    # -1200), blocking the 3rd attempt before it's tried, rather than only
+    # ever mattering after all trades are already exhausted.
+    max_daily_loss: float = float(os.getenv("MAX_DAILY_LOSS", "1200"))
+    # Raised from 1, 2026-08-27, user decision (Brief 3, Part B). Presented
+    # tradeoff: multiple trades/day are same-underlying, same-session
+    # correlated risk, not diversified bets. Paired with (a) fixed-base
+    # sizing -- every trade sizes off this same Settings object, never a
+    # running/current balance, see risk/risk_manager.py's docstring -- and
+    # (b) a same-direction-re-entry-after-a-stop-out re-validation gate
+    # (agents/trade_validator.py) so a broken thesis can't just re-fire
+    # immediately with the same setup in the same regime.
+    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
     max_position_value: float = float(os.getenv("MAX_POSITION_VALUE", "7500"))
     signal_threshold: float = float(os.getenv("SIGNAL_THRESHOLD", "75"))
     forced_exit_time: time = field(
@@ -68,10 +75,16 @@ class Settings:
             raise ValueError("Live mode requires LIVE_TRADING_ENABLED=true")
         if self.capital <= 0 or self.max_risk_per_trade <= 0:
             raise ValueError("capital and risk limits must be positive")
-        if self.max_trades_per_day != 1:
-            raise ValueError(
-                "This strategy is intentionally restricted to exactly one daily trade maximum"
-            )
+        # Was a hard "must be exactly 1" guard (original spec, Section 15).
+        # Raised, 2026-08-27, user decision (Brief 3, Part B) to 3, paired
+        # with max_daily_loss=1200, fixed-base sizing, and the re-entry
+        # re-validation gate -- see config field comments above. The bound
+        # (not a fixed "must be exactly 3") keeps this a real guard against
+        # an unconsidered jump (e.g. an env var typo setting this to 50)
+        # rather than reopening it to any value; 4 was the highest option
+        # actually presented and considered in that decision.
+        if not 1 <= self.max_trades_per_day <= 4:
+            raise ValueError("max_trades_per_day must be between 1 and 4")
 
     @property
     def live_execution_allowed(self) -> bool:
