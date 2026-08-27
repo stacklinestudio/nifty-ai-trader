@@ -505,3 +505,89 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+---
+
+# Brief 3 — Scheduler, Crash Recovery, Profit-Lock Sizing, Multi-Instrument (2026-08-27)
+
+Starting point: `feature/multi-agent-intelligence` at `f434a8b`, 75 tests
+passing, ruff clean — independently re-verified before starting, matching
+the brief's own claim. Confirmed gap the brief opened with: `run_supervised`
+was built and tested but never called from `main.py` or anywhere in
+production code, and had no exception handling around its data-fetch calls.
+
+## Part A — Scheduler + Crash Recovery — DONE
+
+- **A1 Daily scheduler entrypoint** — DONE. `execution/scheduler.py::run_trading_day`
+  is the injectable, testable control flow: skip if `NseCalendar.is_trading_day`
+  says no, wait for market open, run one entry cycle, supervise any fill to
+  its own close. `python main.py run` (commit `9062538`) wires this for
+  real, with a genuine Kite-backed quote source when credentials exist
+  (`build_live_quote_source`) that fails closed (returns `None`, never
+  fabricates a price) otherwise. **Deployment recommendation, per the
+  brief's own ask**: a fresh process per trading morning via cron/systemd,
+  documented in `scheduler.py`'s module docstring — crash recovery (A3)
+  already handles "a position was open when the process died," so there's
+  no correctness reason to stay resident for days, and every extra day of
+  uptime is another day an unrelated bug could affect a live position.
+  **Known, explicitly documented gap**: there is no live entry-context
+  assembly pipeline (option chain + spot + technical features + global
+  market + news, combined into what `run_cycle` expects) anywhere in this
+  codebase. That's separate, larger work from what this brief asked to
+  close. Without it, `run` correctly produces `"no_entry"` on a real
+  trading day rather than fabricating a signal — commit `9062538`'s message
+  states this plainly rather than implying full live-data readiness.
+- **A2 Exception handling in the polling loop** — DONE (commit `23cdb34`).
+  `run_supervised` now wraps each tick in try/except, logs failures
+  (`logger.error` + a `SYSTEM_ERROR` audit event), retries with the
+  configured poll interval, and force-exits at the last known valid price
+  (reason `FORCED_EXIT_DATA_FAILURE`) after `Settings.max_consecutive_tick_failures`
+  (default 5) consecutive failures — never an unhandled crash, never an
+  unbounded silent retry with an open position unmonitored.
+- **A3 Crash recovery on restart** — DONE (commits `8c40276`, `0d46271`,
+  `43c614f`). `execution/position_persistence.py` round-trips a full
+  `PositionState` (thesis, current trailed stop, MAE/MFE, entry regime/
+  consensus/agent-agreement tags) through a dict; `storage/database.py`'s
+  new `open_positions` table persists it the moment a fill happens and
+  clears it the moment a position actually closes; `Orchestrator.recover_open_positions`
+  reconstructs every row on startup. A row that fails to reconstruct is
+  **not** silently dropped or assumed fine — it's left in the table and
+  escalated via a CRITICAL-severity Telegram/Discord notification plus a
+  `SYSTEM_ERROR` event, exactly per the brief's explicit requirement that a
+  human check the actual state by hand in that case.
+- **A4 Tests** — DONE, all four scenarios listed in the brief:
+  - Scheduler skips non-trading days: `test_scheduler_skips_weekend`,
+    `test_scheduler_skips_configured_holiday`.
+  - A simulated exception in `quote_source()` is retried, logged, and
+    eventually force-exits: `test_run_supervised_retries_transient_quote_failures_without_crashing`,
+    `test_run_supervised_force_exits_after_persistent_quote_failures`.
+  - Restart with an open, unclosed position resumes supervision:
+    `test_restart_with_open_position_resumes_supervision_not_a_fresh_cycle`,
+    `test_resume_open_positions_resumes_before_any_new_entry`.
+  - Restart with no open position behaves exactly as today:
+    `test_restart_with_no_open_position_recovers_nothing`,
+    `test_resume_open_positions_does_nothing_when_none_exist`.
+  - Plus a case the brief didn't explicitly list but that the design raised:
+    a corrupted/unreconstructable row is escalated, not resumed or deleted
+    (`test_corrupted_open_position_row_is_escalated_not_silently_resumed`).
+
+```
+$ pytest -q   # commit 9062538 (Part A complete)
+.................................................................................
+[100%]
+89 passed
+$ ruff check .
+All checks passed!
+```
+
+## Parts B, C, D — not yet started this session
+
+Part B requires presenting real recomputed `max_trades`/`max_daily_loss`
+numbers and getting explicit sign-off before touching `Settings`, per the
+brief's own rule and this project's established pattern — that
+presentation happens in this session's next message, not silently folded
+into a commit. Part D is explicitly sequenced by the brief to come after
+Parts A and B are "proven stable on NIFTY alone for real trading days,"
+which cannot literally happen inside a single session (no real trading day
+elapses during this conversation) — flagged for an explicit decision on how
+to interpret that gate rather than silently deciding either way.
