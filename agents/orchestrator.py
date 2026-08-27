@@ -192,6 +192,8 @@ class Orchestrator:
             "market_regime": state.results["india_market"].data.get("market_regime"),
             "volatility_regime": state.results["volatility"].data.get("volatility_regime"),
             "breadth_participation": state.results["breadth"].data.get("participation"),
+            "news_direction": state.results["news"].data.get("direction"),
+            "news_confidence": state.results["news"].confidence,
         }
         # Persisted onto state.context (not just the local signal_context) so
         # _on_trade_proposed's re-entry check can see the regime this

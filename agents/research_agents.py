@@ -8,6 +8,7 @@ from typing import Any
 from agents.base import BaseAgent
 from agents.contracts import AgentResult, TradeCandidate
 from config import IST
+from data.news import aggregate_sentiment
 from intelligence.market_regime import Regime, classify
 from strategy.regime_selector import weight_for
 
@@ -77,6 +78,15 @@ class IndiaMarketAgent(BaseAgent):
 
 
 class NewsAgent(BaseAgent):
+    """Classifies verified news by real aggregate sentiment
+    (data.news.aggregate_sentiment) instead of a placeholder. Confidence is
+    capped at 40 -- well below what other research agents can reach -- so
+    SignalHunterAgent's news-alignment nudge (strategy/regime_selector.py's
+    sibling concept, applied in SignalHunterAgent.analyze) can only ever be
+    a small adjustment, never enough by itself to flip an otherwise-failing
+    candidate to approved. Matches Section 7's "must not trade on a single
+    headline" principle."""
+
     name = "news"
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
@@ -89,17 +99,27 @@ class NewsAgent(BaseAgent):
                 classification="UNKNOWN",
                 market_impact="UNKNOWN",
                 freshness="UNAVAILABLE",
+                direction="UNKNOWN",
+                sentiment_score=0.0,
             )
-        impact = sum(
-            getattr(item, "confidence", 0) * getattr(item, "relevance", 0) for item in items
-        ) / len(items)
+        sentiment_score = aggregate_sentiment(items)
+        direction = (
+            "BULLISH" if sentiment_score > 0.1 else "BEARISH" if sentiment_score < -0.1 else "NEUTRAL"
+        )
+        confidence = min(40.0, abs(sentiment_score) * 100)
+        evidence_note = (
+            f"{len(items)} verified news item(s); aggregate sentiment "
+            f"{sentiment_score:.2f} ({direction})."
+        )
         return _result(
             self.name,
-            min(70, impact * 100),
-            (f"{len(items)} verified news item(s) considered.",),
-            classification="MIXED",
+            confidence,
+            (evidence_note,),
+            classification=direction,
             market_impact="CONTEXT_ONLY",
             freshness="PROVIDED",
+            direction=direction,
+            sentiment_score=sentiment_score,
         )
 
 
@@ -202,6 +222,28 @@ class SignalHunterAgent(BaseAgent):
                 "Invalidation widened: high-volatility whipsaw risk for this setup type",
             )
         evidence = tuple(context.get("candidate_evidence", ["deterministic setup"])) + weight.reasons
+
+        # News-alignment nudge: NewsAgent's own confidence is capped at 40
+        # (see its docstring), and this nudge is itself capped at +/-5% of
+        # confidence -- deliberately too small to flip an otherwise-failing
+        # candidate to approved on a single headline (Section 7 principle),
+        # while still letting aligned/contradicting news shade confidence.
+        news_direction = context.get("news_direction", "UNKNOWN")
+        news_confidence = float(context.get("news_confidence", 0) or 0)
+        if news_direction in {"BULLISH", "BEARISH"} and news_confidence > 0:
+            aligned = (news_direction == "BULLISH" and direction == "CALL") or (
+                news_direction == "BEARISH" and direction == "PUT"
+            )
+            nudge = min(news_confidence, 40.0) / 40.0 * 0.05
+            weighted_confidence = min(
+                100.0,
+                max(0.0, weighted_confidence * (1 + nudge if aligned else 1 - nudge)),
+            )
+            news_note = (
+                f"news sentiment {'supports' if aligned else 'contradicts'} direction "
+                f"(news confidence {news_confidence:.0f}, capped nudge)."
+            )
+            evidence = evidence + (news_note,)
         candidate = TradeCandidate(
             direction,
             setup_type,
