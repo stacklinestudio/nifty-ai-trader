@@ -112,7 +112,8 @@ class Orchestrator:
         ]
         self.options_agent = OptionsAgent()
         self.trade_builder = TradeBuilderAgent(
-            RiskManager(settings.max_risk_per_trade, settings.max_position_value)
+            RiskManager(settings.max_risk_per_trade, settings.max_position_value),
+            settings.signal_threshold,
         )
         self.risk_agent = RiskAgent(settings, self.limits)
         self.execution_agent = ExecutionAgent(self.paper_broker, settings)

@@ -12,6 +12,7 @@ from data.option_chain import OptionQuote
 from learning.experiment_manager import Experiment, create_experiment
 from learning.memory import MemoryStore
 from learning.trade_memory import record_trade
+from risk.confidence_scaling import scale_quantity
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from strategy.option_selector import OptionSelector
@@ -48,10 +49,20 @@ class OptionsAgent(BaseAgent):
 
 
 class TradeBuilderAgent(BaseAgent):
+    """Builds the thesis's entry/stop/target/size from the risk-approved
+    plan, then scales the quantity within that same approved envelope by
+    confidence (risk/confidence_scaling.py) -- this changes how much of the
+    already-approved size to take, never the ceiling itself, and never
+    bypasses RiskAgent's veto downstream."""
+
     name = "trade_builder"
 
-    def __init__(self, risk: RiskManager) -> None:
+    def __init__(
+        self, risk: RiskManager, low_confidence: float = 75.0, high_confidence: float = 95.0
+    ) -> None:
         self.risk = risk
+        self.low_confidence = low_confidence
+        self.high_confidence = high_confidence
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
         candidate: TradeCandidate | None = context.get("candidate")
@@ -73,16 +84,28 @@ class TradeBuilderAgent(BaseAgent):
             return result(
                 self.name, 0, ("Risk manager could not form a safe position plan.",), thesis=None
             )
+        scaled_quantity = scale_quantity(
+            plan.quantity,
+            candidate.confidence,
+            quote.instrument.lot_size,
+            self.low_confidence,
+            self.high_confidence,
+        )
+        scaled_risk = (plan.entry - plan.stop) * scaled_quantity
+        sizing_note = (
+            f"Risk-based entry/stop/target computed; sized to {scaled_quantity} of "
+            f"{plan.quantity} max affordable at confidence {candidate.confidence:.0f}."
+        )
         thesis = TradeThesis(
             candidate,
             quote.instrument.symbol,
             plan.entry,
             plan.stop,
             plan.target,
-            plan.quantity,
-            plan.estimated_risk,
+            scaled_quantity,
+            scaled_risk,
             min(candidate.confidence, 95),
-            candidate.evidence + ("Risk-based entry, stop, target, and size computed.",),
+            candidate.evidence + (sizing_note,),
             candidate.invalidations,
         )
         return result(self.name, thesis.confidence, thesis.evidence, thesis=thesis)
