@@ -1,9 +1,11 @@
 # V2 Build Report — Multi-Agent Intelligence
 
-Audit date: 2026-08-24, updated 2026-08-26 after three follow-up fixes. Every
-claim below is backed by a command actually run in this session or a file
-actually read — see evidence lines. Branch: `feature/multi-agent-intelligence`,
-latest commit `6b8cd23` (pushed to origin).
+Audit date: 2026-08-24, updated 2026-08-26 after three follow-up fixes, and
+2026-08-27 after Brief 2 (exit engine, trailing stop, regime-aware learning —
+see the section near the bottom of this file). Every claim below is backed
+by a command actually run in this session or a file actually read — see
+evidence lines. Branch: `feature/multi-agent-intelligence`, latest commit
+`1d64942` (pushed to origin).
 
 ## Update (2026-08-26): the two PARTIALs are now fixed
 
@@ -304,6 +306,15 @@ is explicit that risk parameters must not be silently altered. Needs an
 explicit user decision (accept frequent no-trade days at ₹200/₹5,000, or
 raise the ceilings deliberately).
 
+**Resolved in `1d64942` (2026-08-27, Brief 2).** Presented the real tradeoff
+(exact numbers computed from the actual `RiskManager`/`position_sizer` code)
+and the user chose to raise the caps. `MAX_RISK_PER_TRADE`/`MAX_POSITION_VALUE`
+are now 600/7500, supporting one lot at ~₹100 premium.
+`tests/test_risk.py` now uses a realistic ₹100 premium and the real lot size
+(75) instead of the ₹20/lot-25 pairing that masked this issue. See the Brief
+2 section below for the full writeup, including the flagged (not changed)
+`max_daily_loss`/`max_trades_per_day` interaction this creates.
+
 ### Blind-except pattern in notification/agent-boundary code — FIXED
 See criteria 7/8/16 above. `integrations/telegram.py` and
 `integrations/discord.py` now catch `OSError` (not bare `Exception`) and log
@@ -313,3 +324,184 @@ anything) but now logs before returning. Not gated by ruff going forward,
 since `BLE001`/`S110` aren't enabled in `pyproject.toml` — this was a manual
 fix, not an automated one, so a future regression here wouldn't be caught
 by CI alone.
+
+---
+
+# Brief 2 — Exit Engine, Trailing Stop, Regime-Aware Learning (2026-08-27)
+
+Starting point: `feature/multi-agent-intelligence` at `040706e`, 32 tests
+passing, ruff clean, entry pipeline event-driven and verified (all from the
+prior audit above). Brief 2's confirmed gap: nothing anywhere in this
+codebase ever closed a paper position. Every part below is backed by a
+`pytest -q`/`ruff check .` run made *after that specific commit*, not a
+final aggregate run — see each commit's message for its own evidence.
+
+## Part A — Exit / Supervision Engine — DONE
+
+- **A1 Position monitoring loop** — DONE. `execution/position_supervisor.py::tick`
+  is the pure per-tick decision (trailing stop update, MAE/MFE tracking,
+  forced-exit check, staleness check, `TradeSupervisorAgent` call).
+  `Orchestrator.supervise_once` performs the real side effects on EXIT (paper
+  SELL, event, `review_trade`), and `Orchestrator.run_supervised` is the real
+  polling loop for live/paper use (commits `9fcb1bc`, `9a4f0af`).
+- **A2 Trailing stop** — DONE. `risk/trailing_stop.py::update_stop`:
+  breakeven at 1R, partial lock at 1.5R, then trail by a percent of premium
+  (`Settings.trail_percent`, default 15% — documented reasoning in the module
+  docstring: option-premium ATR isn't reliably available at this layer).
+  Deterministic, plain Python, never agent-judged (commit `f5586ec`).
+- **A3 Forced 15:15 IST square-off** — DONE. Checked first in `tick`, before
+  staleness or the supervisor call, so it cannot be deferred by a
+  "STRENGTHENING" read or missing data; exits at the last known valid price
+  when no fresh quote exists (commit `9fcb1bc`).
+- **A4 Tests** — DONE, all listed explicitly in the brief:
+  - Trailing stop only ratchets favorably: `tests/test_trailing_stop.py::test_stop_never_loosens_on_adverse_price_tick`.
+  - Target hit → `TAKE_PROFIT` + real SELL, broker positions go to zero:
+    `tests/test_position_supervision.py::test_full_cycle_supervise_exit_review_trade_path_end_to_end`.
+  - Stop hit (trailed, not original) → `STOP_LOSS` + real SELL:
+    `test_tick_exits_on_trailed_stop_not_original_stop` (tick level) and
+    `test_supervise_once_closes_real_position_on_stop_loss` (real broker,
+    commit `f600eee`).
+  - 15:15 forces exit regardless of P&L/state, via the real broker:
+    `test_tick_forces_exit_at_1515_regardless_of_pnl_or_strengthening` and
+    `test_supervise_once_forces_exit_at_1515_via_real_broker_regardless_of_state`.
+  - Full `run_cycle → supervise → exit → review_trade` path, asserting real
+    (not fabricated) P&L/MAE/MFE reach `learning.memory`:
+    `test_full_cycle_supervise_exit_review_trade_path_end_to_end` — asserts
+    `0 < pnl < raw_gain` (proving the recorded P&L came from the paper
+    broker's actual slippage-adjusted fill, not the naive target price) and
+    `mfe > 0`.
+  - Stale/missing LTP does not silently continue:
+    `test_tick_holds_and_notifies_on_stale_data_instead_of_guessing` and
+    `test_tick_forces_exit_at_deadline_even_with_stale_data`. **Documented
+    choice**: hold-and-notify (via a `SYSTEM_ERROR` audit event and a
+    `logger.warning`) while before the forced-exit deadline; force-exit at
+    the last known valid price once the deadline passes, regardless of
+    staleness.
+  ```
+  $ pytest -q   # after commit f600eee (Part A complete)
+  ..................................................          [100%]
+  52 passed
+  $ ruff check .
+  All checks passed!
+  $ python main.py agents
+  {"paper_only": true, "consensus": "UNCERTAIN", "risk_approved": false, "order": null, "agent_count": 7}
+  ```
+  Not built: a CLI command to actually launch `run_supervised` against a real
+  Kite quote feed. `open_position`/`supervise_once`/`run_supervised` exist
+  and are tested with synthetic clocks/quote sources; wiring a live
+  `KiteMarketData`-backed `quote_source` into `main.py` was not requested by
+  this brief's acceptance criteria and would need a real Kite session to
+  verify against, which this environment doesn't have.
+
+## Part B — Regime-aware strategy selection — DONE
+
+`strategy/regime_selector.py::weight_for` maps
+(setup_type, market_regime, volatility_regime, breadth_participation) to a
+confidence multiplier — never a hard filter, per the brief's explicit
+requirement: `SignalHunterAgent` still returns the candidate at every regime
+combination, just at a different weighted confidence. Every adjustment is
+logged in both `AgentResult.data` (`regime_weight_multiplier`,
+`regime_weight_reasons`) and the candidate's own evidence tuple.
+`Orchestrator.run_cycle` now runs `signal_hunter` after its research
+siblings (not alongside them) so it sees their real regime/volatility/
+breadth output instead of requiring the caller to duplicate those findings.
+
+```
+$ pytest tests/test_regime_selector.py -q   # commit c7f430b
+........                                                     [100%]
+8 passed
+```
+
+## Part C — Learning from each trade — DONE
+
+Closed trades recorded via `review_trade()` now carry entry regime, entry
+volatility regime, entry consensus, which research agents agreed/disagreed
+on direction (`agent_agreement`), final thesis confidence, whether the stop
+was ever trailed, plus the outcome/pnl/mae/mfe/exit_reason from the prior
+brief. `learning/pattern_memory.py` (previously a one-line `MemoryStore`
+alias) now computes real win rate and expectancy per (setup_type, regime)
+pair from actual recorded trades, and flags `low_confidence` whenever
+`sample_size < MIN_SAMPLES_FOR_CONFIDENCE` (20) — including a perfect
+3-trade win streak, per the brief's explicit "do not let 3 trades produce a
+strategy promotion."
+
+The explicit test the brief asked for —
+`tests/test_learning_pipeline.py::test_a_losing_pattern_alone_cannot_bypass_promotion_engine`
+— records 50 losing trades of one setup/regime pairing, computes accurate
+(terrible) stats from them, files a real `CANDIDATE` experiment from that
+hypothesis, and then asserts `promotion_engine.decide()` still rejects
+promotion outright, since raw trade stats supply none of its four required
+gates (historical/walk-forward/OOS/human approval). A companion test
+(`test_settings_cannot_be_mutated_at_all_regardless_of_learning_outcome`)
+confirms `Settings` is a frozen dataclass — there is no live object for any
+trade outcome to write into even if `promotion_engine` were bypassed
+entirely.
+
+```
+$ pytest tests/test_learning_pipeline.py -q   # commit 682d71d
+......                                                        [100%]
+6 passed
+```
+
+## Part D — Confidence-scaled position sizing — DONE
+
+`risk/confidence_scaling.py::scale_quantity` scales quantity linearly
+between one lot (at/below `low_confidence`, defaults to
+`Settings.signal_threshold`) and the full already-approved max (at/above
+`high_confidence`, 95) — it never scales past the max `position_size()`/
+`RiskManager` computed under `MAX_RISK_PER_TRADE`/`MAX_POSITION_VALUE`, and
+never down to zero as long as one lot was ever affordable.
+`TradeBuilderAgent` calls this after `RiskManager.plan_long_option` and
+recomputes `estimated_risk` from the scaled quantity — `RiskAgent`'s veto
+still runs against whatever this produces, unchanged.
+
+```
+$ pytest tests/test_confidence_scaling.py -q   # commit ee5d281
+.........                                                     [100%]
+9 passed
+```
+Confirmed by a dedicated test loop across confidence 10–100 that
+`estimated_risk` never exceeds the cap regardless of confidence.
+
+## Part E — Open decisions — user decided, not silently resolved
+
+All three presented to the user with real computed numbers (via `python -c`
+against the actual code) before anything was implemented:
+
+1. **Position sizing** (carried over from the original audit, Part D's real
+   dependency). Presented: current 200/5000 caps produce `NO_TRADE` for any
+   option above ~₹33 premium; supporting ~₹100 premium needs ~600/7500.
+   **User decided: raise to 600/7500.** Implemented in commit `1d64942` (see
+   above). `max_daily_loss` (400) is now less than one trade's own risk
+   budget (600) — flagged as a code comment in `config.py`, not changed,
+   since it wasn't part of what was decided and is only harmless today
+   because `max_trades_per_day` stayed at 1 (see below).
+2. **Multiple trades per day.** Presented: at the (now-decided) 600/trade
+   risk, 2/3/4 trades/day would be 12%/18%/24% of ₹10,000 capital, and
+   `max_daily_loss` only brakes after losses accumulate, not pre-emptively.
+   **User decided: keep `max_trades_per_day` at 1.** No code change made —
+   it was already 1.
+3. **"Hero-zero" far-OTM lottery mode.** Presented: fundamentally different
+   risk/reward profile the current validator/risk agent aren't designed to
+   evaluate; either a separate carved-out-budget mode or don't build.
+   **User decided: don't build it.** No code written for this.
+
+## Brief 2 summary
+
+| Part | Status |
+|---|---|
+| A — Exit/supervision engine | DONE |
+| B — Regime-aware weighting | DONE |
+| C — Learning pipeline depth | DONE |
+| D — Confidence-scaled sizing | DONE |
+| E — Open decisions | Presented, user decided on all three, position-sizing decision implemented |
+
+Full suite after all of Brief 2 (commit `1d64942`):
+```
+$ pytest -q
+........................................................................
+...                                                            [100%]
+75 passed
+$ ruff check .
+All checks passed!
+```
