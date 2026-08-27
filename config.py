@@ -55,6 +55,7 @@ class Settings:
     ai_provider: str = os.getenv("AI_PROVIDER", "unavailable")
     trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
     supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
+    max_consecutive_tick_failures: int = int(os.getenv("MAX_CONSECUTIVE_TICK_FAILURES", "5"))
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")

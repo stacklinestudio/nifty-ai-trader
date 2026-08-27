@@ -259,3 +259,71 @@ def test_supervise_once_forces_exit_at_1515_via_real_broker_regardless_of_state(
     assert orchestrator.paper_broker.get_positions() == []
     events = {event["event_type"] for event in orchestrator.database.events()}
     assert "FORCED_EXIT" in events
+
+
+def test_run_supervised_retries_transient_quote_failures_without_crashing(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(cycle)
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+
+    clock_calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def clock():
+        clock_calls["n"] += 1
+        return open_time + timedelta(seconds=clock_calls["n"])
+
+    def quote_source():
+        # Fails twice, then succeeds by returning the target price.
+        if clock_calls["n"] <= 2:
+            raise ConnectionError("simulated feed drop")
+        return state.thesis.target
+
+    result = orchestrator.run_supervised(
+        state,
+        quote_source,
+        poll_seconds=0,
+        clock=clock,
+        sleeper=sleeps.append,
+        max_consecutive_failures=5,
+    )
+
+    assert result.should_exit and result.reason == "TAKE_PROFIT"
+    # Two failures were retried (slept through), not raised.
+    assert len(sleeps) >= 2
+
+
+def test_run_supervised_force_exits_after_persistent_quote_failures(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(cycle)
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+
+    def clock():
+        return open_time
+
+    def always_fails():
+        raise TimeoutError("simulated permanent feed outage")
+
+    result = orchestrator.run_supervised(
+        state,
+        always_fails,
+        poll_seconds=0,
+        clock=clock,
+        sleeper=lambda _seconds: None,
+        max_consecutive_failures=3,
+    )
+
+    assert result.should_exit and result.reason == "FORCED_EXIT_DATA_FAILURE"
+    # A real close happened, not just a returned decision -- the position
+    # is not left open and unmonitored.
+    assert orchestrator.paper_broker.get_positions() == []
+    events = {event["event_type"] for event in orchestrator.database.events()}
+    assert "SYSTEM_ERROR" in events

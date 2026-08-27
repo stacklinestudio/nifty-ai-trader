@@ -421,9 +421,10 @@ class Orchestrator:
         self.limits.register_close(pnl)
         hold_seconds = (now - state.opened_at).total_seconds()
         self._event(
-            _EXIT_REASON_TO_EVENT[result.reason],
+            _EXIT_REASON_TO_EVENT.get(result.reason, EventType.FORCED_EXIT),
             {
                 "order_id": order["order_id"],
+                "reason": result.reason,
                 "entry": state.thesis.entry,
                 "exit": order["fill_price"],
                 "pnl": pnl,
@@ -460,27 +461,71 @@ class Orchestrator:
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
         regime_source: Callable[[], tuple[str | None, str | None]] | None = None,
+        max_consecutive_failures: int | None = None,
     ) -> TickResult:
         """Real-time polling loop for live/paper use: blocks until the
-        position closes (target, stop, invalidation, or the 15:15 forced
-        exit). All decision logic lives in supervise_once/tick — this
-        function only wires real time and IO to it. Deliberately the one
-        piece of this feature not covered by a real-time test; tests drive
-        supervise_once/tick directly with synthetic clocks instead.
+        position closes (target, stop, invalidation, the 15:15 forced exit,
+        or repeated data-fetch failure). All HOLD/EXIT decision logic lives
+        in supervise_once/tick — this function wires real time and IO to it,
+        plus the bounded-retry failure handling below, since an unhandled
+        exception here would silently stop monitoring a real open position.
+        Deliberately the one piece of this feature not covered by a
+        real-time test; tests drive supervise_once/tick directly with
+        synthetic clocks instead, and test this method's retry/give-up
+        behavior with an injected failing quote_source.
         """
         poll_seconds = (
             poll_seconds if poll_seconds is not None else self.settings.supervision_poll_seconds
         )
+        max_consecutive_failures = (
+            max_consecutive_failures
+            if max_consecutive_failures is not None
+            else self.settings.max_consecutive_tick_failures
+        )
         clock = clock or (lambda: datetime.now(IST))
         sleeper = sleeper or time_module.sleep
+        consecutive_failures = 0
         while True:
-            now = clock()
-            ltp = quote_source()
-            current_regime, current_volatility_regime = regime_source() if regime_source else (
-                None,
-                None,
-            )
-            result = self.supervise_once(state, ltp, now, current_regime, current_volatility_regime)
+            try:
+                now = clock()
+                ltp = quote_source()
+                current_regime, current_volatility_regime = (
+                    regime_source() if regime_source else (None, None)
+                )
+                result = self.supervise_once(
+                    state, ltp, now, current_regime, current_volatility_regime
+                )
+                consecutive_failures = 0
+            except Exception as exc:  # noqa: BLE001 - outermost guard for a live position monitor.
+                consecutive_failures += 1
+                logger.error(
+                    "supervision_tick_failed attempt=%d/%d error=%s: %s",
+                    consecutive_failures,
+                    max_consecutive_failures,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._event(
+                    EventType.SYSTEM_ERROR,
+                    {
+                        "reason": "supervision_tick_failed",
+                        "attempt": consecutive_failures,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(
+                        "supervision_giving_up_forcing_exit consecutive_failures=%d symbol=%s",
+                        consecutive_failures,
+                        state.thesis.symbol,
+                    )
+                    forced = TickResult(
+                        True, "FORCED_EXIT_DATA_FAILURE", state.last_valid_ltp
+                    )
+                    self._close_position(state, forced, state.last_quote_at)
+                    return forced
+                sleeper(poll_seconds)
+                continue
             if result.should_exit:
                 return result
             sleeper(poll_seconds)
