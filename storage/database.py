@@ -23,6 +23,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS daily_metrics (date TEXT PRIMARY KEY, payload TEXT);
                 CREATE TABLE IF NOT EXISTS strategy_runs (id INTEGER PRIMARY KEY, timestamp TEXT, run_type TEXT, payload TEXT);
                 CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT NOT NULL, event_type TEXT NOT NULL, input_summary TEXT NOT NULL, output_summary TEXT NOT NULL, confidence REAL, source TEXT, strategy_version TEXT);
+                CREATE TABLE IF NOT EXISTS open_positions (order_id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, state_json TEXT NOT NULL);
             """)
 
     def save_signal(self, signal: SignalRecord) -> None:
@@ -91,3 +92,24 @@ class Database:
             "strategy_version",
         ]
         return [dict(zip(keys, row)) for row in rows]
+
+    def save_open_position(self, order_id: str, opened_at: str, state_payload: dict) -> None:
+        """One row per currently-open position. Deleted on close via
+        close_open_position -- this table's contents are exactly "what a
+        restarted process must resume or escalate on," never a history."""
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO open_positions(order_id,opened_at,state_json) VALUES(?,?,?)",
+                (order_id, opened_at, json.dumps(state_payload, default=str)),
+            )
+
+    def open_positions(self) -> list[dict]:
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT order_id, opened_at, state_json FROM open_positions ORDER BY opened_at"
+            ).fetchall()
+        return [{"order_id": r[0], "opened_at": r[1], "state": json.loads(r[2])} for r in rows]
+
+    def close_open_position(self, order_id: str) -> None:
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DELETE FROM open_positions WHERE order_id = ?", (order_id,))

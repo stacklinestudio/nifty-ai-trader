@@ -6,6 +6,7 @@ from agents.contracts import TradeCandidate, TradeThesis
 from config import IST
 from execution.position_persistence import position_state_from_dict, position_state_to_dict
 from execution.position_supervisor import PositionState
+from storage.database import Database
 
 
 def sample_state() -> PositionState:
@@ -48,3 +49,20 @@ def test_position_state_round_trips_through_dict():
     assert restored.entry_regime == "TREND_UP"
     assert restored.entry_agent_directions == {"india_market": "BULLISH"}
     assert restored.entry_order_id == "PAPER-abc123"
+
+
+def test_database_open_positions_round_trip(tmp_path):
+    database = Database(tmp_path / "audit.db")
+    database.initialize()
+    state = sample_state()
+    payload = position_state_to_dict(state)
+
+    database.save_open_position(state.entry_order_id, state.opened_at.isoformat(), payload)
+    stored = database.open_positions()
+    assert len(stored) == 1
+    assert stored[0]["order_id"] == "PAPER-abc123"
+    restored = position_state_from_dict(stored[0]["state"])
+    assert restored.thesis.entry == state.thesis.entry
+
+    database.close_open_position(state.entry_order_id)
+    assert database.open_positions() == []
