@@ -15,6 +15,16 @@ class TradePlan:
 
 
 class RiskManager:
+    """max_risk/max_position_value are fixed at construction from
+    Settings.max_risk_per_trade/max_position_value and never change during
+    the day -- sizing has no path to the day's realized P&L (DailyLimits is
+    a separate object RiskAgent consults independently) or to any notion of
+    "current balance." Every trade of the day is sized off the same fixed
+    base, deliberately, so a profitable trade earlier in the day cannot
+    compound into a larger size for a later one -- pinned by
+    tests/test_multi_trade_sizing.py::test_second_trade_sizing_is_unaffected_by_first_trades_profit.
+    """
+
     def __init__(
         self,
         max_risk: float,
