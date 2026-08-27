@@ -12,6 +12,7 @@ class IndependentTradeValidator:
         spread: float | None,
         data_fresh: bool,
         conflicting_evidence: bool,
+        blocked_reentry: bool = False,
     ) -> Validation:
         reasons: list[str] = []
         if thesis is None:
@@ -27,6 +28,17 @@ class IndependentTradeValidator:
             reasons.append("market data is stale")
         if conflicting_evidence:
             reasons.append("conflicting agent evidence")
+        if blocked_reentry:
+            # Brief 3, Part B item 4 (user decision): a same-direction,
+            # same-setup-type re-entry after today's stop-out, in the same
+            # regime it was stopped out in, must not just re-fire on the
+            # strength of an otherwise-passing validation -- it needs a
+            # different setup type or a regime change to prove the thesis
+            # isn't the same broken one repeating.
+            reasons.append(
+                "same-direction re-entry after today's stop-out without a "
+                "regime change or different setup type"
+            )
         return Validation(
             Decision.REJECT if reasons else Decision.APPROVE,
             tuple(reasons or ["No disqualifying deterministic evidence found."]),

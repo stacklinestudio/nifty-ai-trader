@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from agents.contracts import TradeCandidate
+from agents.contracts import TradeCandidate, TradeThesis
 from agents.orchestrator import Orchestrator
+from agents.trade_validator import IndependentTradeValidator
 from agents.trading_agents import TradeBuilderAgent
 from config import IST, Settings
 from data.instruments import OptionInstrument
@@ -119,3 +120,53 @@ def test_already_open_position_still_supervised_normally_after_profit_target_hit
 
     assert result.should_exit and result.reason == "TAKE_PROFIT"
     assert orchestrator.paper_broker.get_positions() == []
+
+
+def test_reentry_blocked_after_same_direction_setup_and_regime_stop_out(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    market_time = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+
+    first_cycle = orchestrator.run_cycle(filled_cycle_context())
+    assert first_cycle.order is not None
+    state = orchestrator.open_position(first_cycle, now=market_time)
+    stop_result = orchestrator.supervise_once(state, state.thesis.stop - 0.5, market_time)
+    assert stop_result.reason == "STOP_LOSS"
+
+    second_cycle = orchestrator.run_cycle(filled_cycle_context())
+
+    assert second_cycle.thesis is not None  # a thesis was still built normally...
+    assert second_cycle.validation.decision.value == "REJECT"
+    assert any(
+        "same-direction re-entry" in reason for reason in second_cycle.validation.reasons
+    )
+    assert not second_cycle.risk_approved
+
+
+def test_reentry_allowed_after_stop_out_with_a_different_setup_type(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    market_time = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+
+    first_cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(first_cycle, now=market_time)
+    orchestrator.supervise_once(state, state.thesis.stop - 0.5, market_time)
+
+    different_setup_context = {**filled_cycle_context(), "setup_type": "VWAP_REJECTION"}
+    second_cycle = orchestrator.run_cycle(different_setup_context)
+
+    assert not any(
+        "same-direction re-entry" in reason for reason in second_cycle.validation.reasons
+    )
+
+
+def test_validator_rejects_on_blocked_reentry_even_if_otherwise_valid():
+    thesis = TradeThesis(
+        candidate(), "NIFTY24CE", 100.0, 92.0, 115.0, 75, 600.0, 88.0, ("evidence",), ()
+    )
+    approved = IndependentTradeValidator().validate(thesis, 0.5, True, False, blocked_reentry=False)
+    blocked = IndependentTradeValidator().validate(thesis, 0.5, True, False, blocked_reentry=True)
+
+    assert approved.decision.value == "APPROVE"
+    assert blocked.decision.value == "REJECT"
+    assert any("same-direction re-entry" in reason for reason in blocked.reasons)

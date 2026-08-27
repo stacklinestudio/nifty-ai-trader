@@ -127,6 +127,13 @@ class Orchestrator:
         self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
         self.discord = DiscordNotifier(settings.discord_webhook_url)
         self._state: _CycleState | None = None
+        # (direction, setup_type, entry_regime) of every stop-out closed
+        # today, for the re-entry re-validation gate below. Cleared only by
+        # constructing a new Orchestrator (i.e. a new day, per the
+        # recommended cron/systemd-relaunch deployment) -- there is no
+        # separate "new day" reset call, since a process is expected to be
+        # scoped to one trading day.
+        self._stopped_out_today: list[tuple[str, str, str | None]] = []
 
         self.bus.subscribe(EventType.MARKET_RESEARCH_COMPLETE, self._on_research_complete)
         self.bus.subscribe(EventType.SIGNAL_CREATED, self._on_signal_created)
@@ -186,6 +193,10 @@ class Orchestrator:
             "volatility_regime": state.results["volatility"].data.get("volatility_regime"),
             "breadth_participation": state.results["breadth"].data.get("participation"),
         }
+        # Persisted onto state.context (not just the local signal_context) so
+        # _on_trade_proposed's re-entry check can see the regime this
+        # candidate was found in.
+        state.context["market_regime"] = signal_context["market_regime"]
         state.results[signal_hunter.name] = signal_hunter.run(signal_context)
         state.consensus, state.conflict = self._consensus(state.results)
         # Publishing this event synchronously runs the entire subscriber chain
@@ -259,6 +270,7 @@ class Orchestrator:
             getattr(ranked[0].quote, "spread", None) if ranked else None,
             bool(state.context.get("market_data_fresh", False)),
             state.conflict,
+            self._blocked_reentry(state.thesis, state.context.get("market_regime")),
         )
         state.validation = validation
         self._event(
@@ -411,6 +423,22 @@ class Orchestrator:
                 )
         return directions
 
+    def _blocked_reentry(self, thesis: TradeThesis | None, current_regime: str | None) -> bool:
+        """True when this candidate repeats a same-day stop-out: same
+        direction, same setup type, same regime it was stopped out in. A
+        different setup type or a regime change is enough to prove this
+        isn't just the same broken thesis re-firing (Brief 3, Part B item 4,
+        user decision)."""
+        if thesis is None:
+            return False
+        candidate = thesis.candidate
+        return any(
+            direction == candidate.direction
+            and setup_type == candidate.setup_type
+            and entry_regime == current_regime
+            for direction, setup_type, entry_regime in self._stopped_out_today
+        )
+
     def supervise_once(
         self,
         state: PositionState,
@@ -461,6 +489,11 @@ class Orchestrator:
         self.limits.register_close(pnl)
         if state.entry_order_id:
             self.database.close_open_position(state.entry_order_id)
+        if result.reason == "STOP_LOSS":
+            candidate = state.thesis.candidate
+            self._stopped_out_today.append(
+                (candidate.direction, candidate.setup_type, state.entry_regime)
+            )
         hold_seconds = (now - state.opened_at).total_seconds()
         self._event(
             _EXIT_REASON_TO_EVENT.get(result.reason, EventType.FORCED_EXIT),
