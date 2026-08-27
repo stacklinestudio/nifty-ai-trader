@@ -31,8 +31,11 @@ from config import IST, Settings
 from events.bus import EventBus
 from events.contracts import Event, EventType
 from execution.paper_broker import PaperBroker
+from execution.position_persistence import position_state_from_dict, position_state_to_dict
 from execution.position_supervisor import PositionState, TickResult
 from execution.position_supervisor import tick as supervise_tick
+from integrations.discord import DiscordNotifier
+from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
@@ -121,6 +124,8 @@ class Orchestrator:
         self.memory = MemoryStore(settings.database_path)
         self.post_trade_agent = PostTradeAgent(self.memory)
         self.trade_supervisor_agent = TradeSupervisorAgent()
+        self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+        self.discord = DiscordNotifier(settings.discord_webhook_url)
         self._state: _CycleState | None = None
 
         self.bus.subscribe(EventType.MARKET_RESEARCH_COMPLETE, self._on_research_complete)
@@ -339,20 +344,55 @@ class Orchestrator:
     def open_position(
         self, cycle: CycleResult, now: datetime | None = None
     ) -> PositionState | None:
-        """Builds trackable state for a just-filled entry order. Returns None
-        when the cycle produced no fill — there is nothing to supervise."""
+        """Builds trackable state for a just-filled entry order and persists
+        it immediately (storage.database's open_positions table) so a
+        process restart can find and resume it — see recover_open_positions.
+        Returns None when the cycle produced no fill — there is nothing to
+        supervise or persist."""
         if not cycle.order or cycle.thesis is None:
             return None
         india_market = cycle.agent_results.get("india_market")
         volatility = cycle.agent_results.get("volatility")
-        return PositionState.opening(
+        state = PositionState.opening(
             cycle.thesis,
             now or datetime.now(IST),
             india_market.data.get("market_regime") if india_market else None,
             volatility.data.get("volatility_regime") if volatility else None,
             cycle.consensus,
             self._agent_directions(cycle.agent_results),
+            cycle.order["order_id"],
         )
+        self.database.save_open_position(
+            state.entry_order_id, state.opened_at.isoformat(), position_state_to_dict(state)
+        )
+        return state
+
+    def recover_open_positions(self) -> list[PositionState]:
+        """Reconstructs any position left open by a prior process (crash,
+        restart, kill) from storage.database's open_positions table. A row
+        that fails to reconstruct is NOT silently dropped or assumed fine —
+        it is escalated via a CRITICAL notification and left in the table
+        for a human to check the actual paper/broker state by hand.
+        """
+        recovered: list[PositionState] = []
+        for row in self.database.open_positions():
+            try:
+                recovered.append(position_state_from_dict(row["state"]))
+            except (KeyError, ValueError, TypeError) as exc:
+                message = (
+                    f"Could not reconstruct open position order_id={row['order_id']} "
+                    f"opened_at={row['opened_at']}: {type(exc).__name__}: {exc}. "
+                    "This position is NOT being resumed automatically -- check the "
+                    "actual paper broker/database state by hand."
+                )
+                logger.error("open_position_recovery_failed %s", message)
+                self.telegram.send_message("CRITICAL", message)
+                self.discord.send_message("CRITICAL", message)
+                self._event(
+                    EventType.SYSTEM_ERROR,
+                    {"reason": "open_position_recovery_failed", "order_id": row["order_id"]},
+                )
+        return recovered
 
     @staticmethod
     def _agent_directions(results: dict[str, AgentResult]) -> dict[str, str]:
@@ -419,6 +459,8 @@ class Orchestrator:
             "estimated_costs"
         ]
         self.limits.register_close(pnl)
+        if state.entry_order_id:
+            self.database.close_open_position(state.entry_order_id)
         hold_seconds = (now - state.opened_at).total_seconds()
         self._event(
             _EXIT_REASON_TO_EVENT.get(result.reason, EventType.FORCED_EXIT),

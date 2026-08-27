@@ -327,3 +327,74 @@ def test_run_supervised_force_exits_after_persistent_quote_failures(tmp_path):
     assert orchestrator.paper_broker.get_positions() == []
     events = {event["event_type"] for event in orchestrator.database.events()}
     assert "SYSTEM_ERROR" in events
+
+
+def test_open_position_persists_and_close_position_clears_it(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    state = orchestrator.open_position(cycle)
+
+    assert [row["order_id"] for row in orchestrator.database.open_positions()] == [
+        state.entry_order_id
+    ]
+
+    orchestrator.supervise_once(state, state.thesis.target, opened_at(hour=10))
+
+    assert orchestrator.database.open_positions() == []
+
+
+def test_restart_with_open_position_resumes_supervision_not_a_fresh_cycle(tmp_path):
+    db_path = tmp_path / "paper.db"
+    settings = Settings(database_path=db_path)
+    first_run = Orchestrator(settings)
+    cycle = first_run.run_cycle(filled_cycle_context())
+    original_state = first_run.open_position(cycle)
+    assert original_state is not None
+
+    # Simulate a process restart: a brand new Orchestrator against the same
+    # database file, with no in-memory knowledge of the position above.
+    restarted = Orchestrator(Settings(database_path=db_path))
+    recovered = restarted.recover_open_positions()
+
+    assert len(recovered) == 1
+    assert recovered[0].thesis.entry == original_state.thesis.entry
+    assert recovered[0].thesis.quantity == original_state.thesis.quantity
+    assert recovered[0].entry_order_id == original_state.entry_order_id
+
+    # Resuming supervision on the recovered state closes it for real, exactly
+    # like an uninterrupted run would have.
+    result = restarted.supervise_once(
+        recovered[0], recovered[0].thesis.target, opened_at(hour=10)
+    )
+    assert result.should_exit and result.reason == "TAKE_PROFIT"
+    assert restarted.database.open_positions() == []
+
+
+def test_restart_with_no_open_position_recovers_nothing(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    assert orchestrator.recover_open_positions() == []
+
+
+def test_corrupted_open_position_row_is_escalated_not_silently_resumed(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    notified: list[tuple[str, str]] = []
+    orchestrator.telegram.send_message = lambda severity, message: notified.append(
+        (severity, message)
+    ) or True
+    orchestrator.discord.send_message = lambda severity, message: True
+
+    orchestrator.database.save_open_position(
+        "PAPER-corrupt", opened_at(hour=10).isoformat(), {"thesis": {"missing": "fields"}}
+    )
+
+    recovered = orchestrator.recover_open_positions()
+
+    assert recovered == []  # not silently resumed
+    assert notified and notified[0][0] == "CRITICAL"
+    # Left in the table for a human to check by hand, not deleted.
+    assert [row["order_id"] for row in orchestrator.database.open_positions()] == [
+        "PAPER-corrupt"
+    ]
