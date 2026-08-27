@@ -591,3 +591,136 @@ Parts A and B are "proven stable on NIFTY alone for real trading days,"
 which cannot literally happen inside a single session (no real trading day
 elapses during this conversation) — flagged for an explicit decision on how
 to interpret that gate rather than silently deciding either way.
+
+## Part B — Multi-trade-per-day, Fixed-Base Sizing, Profit Lock — DONE
+
+1. **Fixed-base sizing** — DONE, but not via new code. Traced the actual
+   call chain (`RiskManager` ← `TradeBuilderAgent` ← `Orchestrator.__init__`)
+   before writing anything and found `max_risk`/`max_position_value` are
+   fixed at construction from `Settings` and never take `realized_pnl` or
+   any "current balance" concept as input anywhere in this codebase — the
+   "must not use profit amount for trading" requirement already held by
+   construction. Pinned with
+   `tests/test_multi_trade_sizing.py::test_second_trade_sizing_is_unaffected_by_first_trades_profit`
+   and documented explicitly in `RiskManager`'s docstring (commit `e7bcfb7`)
+   so a future change that broke this would be a visible contradiction, not
+   a silent regression.
+2. **Daily profit target** — DONE (commit `e7bcfb7`). `DailyLimits.daily_profit_target`
+   (default `None`, inert until set) blocks new entries once
+   `realized_pnl >= daily_profit_target`; an already-open position is
+   unaffected since `run_supervised`/`supervise_once` never consult
+   `DailyLimits.can_open()` at all — proven by
+   `test_already_open_position_still_supervised_normally_after_profit_target_hit`.
+3. **max_trades/max_daily_loss recomputed together** — DONE (commit
+   `1bc8936`), presented with real worst-case numbers before changing
+   anything:
+
+   | Option | Worst case (all lose) | Backstop trips after |
+   |---|---|---|
+   | 2 trades, loss cap 1200 | 1200 (12% of ₹10k) | never (no 3rd trade to gate) |
+   | 3 trades, loss cap 1200 | 1800 (18%) | 2 full losses |
+   | 3 trades, loss cap 1000 | 1800 (18%) | 1 full loss |
+
+   **User decided: 3 trades, loss cap 1200.** Also found and fixed a
+   hardcoded `Settings.validate()` guard that raised unless
+   `max_trades_per_day == 1` exactly (the original spec's Section 15
+   constraint) — replaced with a bounded range (1–4) rather than reopened
+   entirely, so it stays a real guard against an unconsidered value.
+4. **Same-direction re-entry safeguard** — DONE (commit `252ff71`),
+   presented (allow freely / time cooldown / re-validation) before
+   implementing. **User decided: require re-validation.**
+   `IndependentTradeValidator.validate()` gained `blocked_reentry`:
+   rejects a candidate outright when it matches the direction, setup
+   type, and entry regime of a stop-out already closed today — a
+   different setup type or a regime change is what proves the thesis
+   isn't just re-firing broken. Does not affect
+   TAKE_PROFIT/THESIS_INVALIDATED/FORCED_EXIT closes, only STOP_LOSS,
+   matching the brief's literal scope.
+
+```
+$ pytest -q   # commit 1bc8936 (after the max_trades/loss-cap fix)
+........................................................................
+......................                                              [100%]
+94 passed
+$ ruff check .
+All checks passed!
+```
+
+Tests required by the brief, all present: sizing for trade #2 after
+trade #1's profit is unaffected (pinning test above); `can_open()` returns
+`False` once the profit target is hit with trades remaining and no loss
+(`test_daily_profit_target_blocks_new_entries_with_trades_remaining_and_no_loss`);
+an already-open position at the moment the target is hit still gets
+normally supervised (test above).
+
+## Part C — Market-Wide Signal: News, FII/DII Flow, OI Buildup — DONE
+
+Scoped precisely per the brief's own framing — no live feed of individual
+large institutional orders exists at retail tier, and nothing here
+pretends otherwise:
+
+1. **FII/DII net flow** — DONE (commit `be25d75`). `data/fii_dii.py::to_context_value`
+   normalizes NSE's daily (T+1, after-market) net flow into a
+   `data.global_market.ContextValue` — one more input `GlobalResearchAgent`
+   already averages, not a new agent. The normalization is the substance
+   of this piece: raw FII+DII flow runs to thousands of crores while
+   `GlobalResearchAgent`'s scale is tens (its own confidence formula is
+   `min(80, abs(score))`) — clamped to ±20 regardless of flow size, proven
+   by `test_a_single_huge_fii_day_cannot_swamp_other_disagreeing_evidence`
+   (three bearish sources + one enormous FII inflow day still average out
+   to BEARISH).
+2. **Options OI buildup by strike** — DONE (commit `b076329`).
+   `intelligence/oi_buildup.py::detect_buildup` compares OI *change* (not
+   level) across two option-chain snapshots, aggregated by option type
+   across all strikes — the standard, legitimate, public-data proxy for
+   institutional positioning. `OptionsAgent` reports it as informational
+   evidence (`oi_buildup_bias`, `oi_buildup_reasons`) without it affecting
+   which option gets selected, proven by
+   `test_options_agent_reports_buildup_without_it_changing_selection`.
+3. **NewsAgent real wiring** — DONE (commit `28a72dc`). Confirmed the
+   brief's suspicion directly: `classification` was hardcoded `"MIXED"`
+   regardless of actual news content, and `NewsAgent` was never in
+   `_consensus()`'s vote — "collecting headlines nobody reads" was
+   literally true. Now calls the already-existing, already-unused
+   `data.news.aggregate_sentiment` for a real direction, confidence capped
+   at 40. Deliberately did **not** add it to `_consensus()`'s literal 3-way
+   vote (see commit message: folding a 4th voter into a `>= 2` threshold
+   would weaken, not strengthen, "must not trade on a single headline").
+   Instead `SignalHunterAgent` applies a separate ±5%-capped confidence
+   nudge when news aligns/contradicts the candidate's direction, proven
+   unable to flip a weak candidate strong by
+   `test_signal_hunter_news_nudge_is_bounded_and_cannot_flip_low_confidence_to_high`.
+4. **No single signal overrides validator/risk veto** — DONE by
+   construction across all three: FII/DII is bounded before averaging,
+   OI buildup is informational only, news is a ±5%-capped nudge. None of
+   the three can gate a trade decision on their own.
+
+```
+$ pytest -q   # commit 28a72dc (Part C complete)
+.........................................................................
+.........................................                              [100%]
+113 passed
+$ ruff check .
+All checks passed!
+```
+
+## Part D — Multi-Instrument Expansion — DEFERRED (user decision)
+
+Presented the sequencing conflict directly: the brief requires Parts A/B
+"proven stable on NIFTY alone for real trading days" before Part D, which
+cannot literally happen inside one session. **User decided: defer Part D
+entirely.** No code written for it this session — the 7 files that
+hardcode "NIFTY" (`main.py`, `agents/research_agents.py`, `config.py`,
+`integrations/obsidian.py`, `integrations/discord.py`, `dashboard.py`,
+`data/instruments.py`) are unchanged.
+
+## Brief 3 summary
+
+| Part | Status |
+|---|---|
+| A — Scheduler + crash recovery | DONE |
+| B — Multi-trade sizing + profit lock | DONE |
+| C — Market-wide signal (FII/DII, OI, news) | DONE |
+| D — Multi-instrument | Deferred (user decision) |
+
+Final state this session: commit `28a72dc`, 113 tests passing, ruff clean.
