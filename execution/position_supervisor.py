@@ -43,6 +43,7 @@ class PositionState:
     entry_volatility_regime: str | None = None
     entry_consensus: str | None = None
     entry_agent_directions: dict[str, str] | None = None
+    entry_order_id: str | None = None
 
     @classmethod
     def opening(
@@ -53,10 +54,12 @@ class PositionState:
         entry_volatility_regime: str | None = None,
         entry_consensus: str | None = None,
         entry_agent_directions: dict[str, str] | None = None,
+        entry_order_id: str | None = None,
     ) -> PositionState:
         return cls(
             thesis, opened_at, thesis.stop, thesis.entry, opened_at, 0.0, 0.0,
             entry_regime, entry_volatility_regime, entry_consensus, entry_agent_directions,
+            entry_order_id,
         )
 
     def observe(self, ltp: float, now: datetime, trail_pct: float) -> None:
