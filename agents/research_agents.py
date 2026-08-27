@@ -9,6 +9,7 @@ from agents.base import BaseAgent
 from agents.contracts import AgentResult, TradeCandidate
 from config import IST
 from intelligence.market_regime import Regime, classify
+from strategy.regime_selector import weight_for
 
 
 def _result(agent: str, confidence: float, evidence: tuple[str, ...], **data: Any) -> AgentResult:
@@ -166,6 +167,13 @@ class BreadthAgent(BaseAgent):
 
 
 class SignalHunterAgent(BaseAgent):
+    """Builds the deterministic candidate the upstream market state implies,
+    then applies a regime-aware confidence weight (strategy/regime_selector.py)
+    -- a scaling of that same candidate's confidence, never a hard filter, and
+    always logged with which regime/breadth evidence drove it and by how much,
+    so the learning loop can later evaluate whether regime-matching actually
+    correlated with better outcomes."""
+
     name = "signal_hunter"
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
@@ -180,15 +188,36 @@ class SignalHunterAgent(BaseAgent):
                 ("No deterministic candidate supplied by market state.",),
                 candidates=[],
             )
+        setup_type = context.get("setup_type", "OPENING_STRUCTURE")
+        weight = weight_for(
+            setup_type,
+            context.get("market_regime", "UNCERTAIN"),
+            context.get("volatility_regime", "NORMAL"),
+            context.get("breadth_participation"),
+        )
+        weighted_confidence = min(100.0, max(0.0, confidence * weight.multiplier))
+        invalidations = ("Loss of entry zone",)
+        if weight.widen_invalidation:
+            invalidations = invalidations + (
+                "Invalidation widened: high-volatility whipsaw risk for this setup type",
+            )
+        evidence = tuple(context.get("candidate_evidence", ["deterministic setup"])) + weight.reasons
         candidate = TradeCandidate(
             direction,
-            context.get("setup_type", "OPENING_STRUCTURE"),
+            setup_type,
             "NIFTY",
-            confidence,
-            tuple(context.get("candidate_evidence", ["deterministic setup"])),
-            ("Loss of entry zone",),
+            weighted_confidence,
+            evidence,
+            invalidations,
             tuple(context.get("entry_zone", (0.0, 0.0))),
             tuple(context.get("stop_zone", (0.0, 0.0))),
             tuple(context.get("target_zone", (0.0, 0.0))),
         )
-        return _result(self.name, confidence, candidate.evidence, candidates=[candidate])
+        return _result(
+            self.name,
+            weighted_confidence,
+            candidate.evidence,
+            candidates=[candidate],
+            regime_weight_multiplier=weight.multiplier,
+            regime_weight_reasons=weight.reasons,
+        )

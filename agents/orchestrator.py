@@ -167,7 +167,20 @@ class Orchestrator:
         self._event(EventType.SYSTEM_STARTED, {"trading_mode": self.settings.trading_mode})
         self._event(EventType.MARKET_PREP_STARTED, {"workflow": "research"})
 
-        state.results = {agent.name: agent.run(state.context) for agent in self.research_agents}
+        # signal_hunter runs after its siblings, not alongside them, so its
+        # regime-aware confidence weighting (strategy/regime_selector.py) can
+        # see their real output instead of requiring the caller to duplicate
+        # india_market/volatility/breadth's own findings by hand.
+        context_agents = [a for a in self.research_agents if a.name != "signal_hunter"]
+        signal_hunter = next(a for a in self.research_agents if a.name == "signal_hunter")
+        state.results = {agent.name: agent.run(state.context) for agent in context_agents}
+        signal_context = {
+            **state.context,
+            "market_regime": state.results["india_market"].data.get("market_regime"),
+            "volatility_regime": state.results["volatility"].data.get("volatility_regime"),
+            "breadth_participation": state.results["breadth"].data.get("participation"),
+        }
+        state.results[signal_hunter.name] = signal_hunter.run(signal_context)
         state.consensus, state.conflict = self._consensus(state.results)
         # Publishing this event synchronously runs the entire subscriber chain
         # below (research -> signal -> options/build -> validate -> risk ->
