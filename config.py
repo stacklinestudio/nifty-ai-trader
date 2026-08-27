@@ -21,10 +21,22 @@ class Settings:
     live_trading_enabled: bool = _bool("LIVE_TRADING_ENABLED")
     kill_switch: bool = _bool("KILL_SWITCH")
     capital: float = float(os.getenv("CAPITAL", "10000"))
-    max_risk_per_trade: float = float(os.getenv("MAX_RISK_PER_TRADE", "200"))
+    # Raised from 200/5000 (2026-08-27, user decision): at lot size 75 and the
+    # risk manager's 8%-of-premium stop floor, 200/5000 produced NO_TRADE for
+    # any option above ~33 premium -- unusable for real NIFTY premiums
+    # (commonly 50-300+). 600/7500 supports one lot at ~100 premium.
+    max_risk_per_trade: float = float(os.getenv("MAX_RISK_PER_TRADE", "600"))
+    # NOTE: max_daily_loss (400) is now LESS than a single trade's own risk
+    # budget (600). This is harmless today only because max_trades_per_day=1
+    # means DailyLimits.can_open() never blocks a second trade anyway -- it
+    # is not a real daily ceiling under the new per-trade risk number. If
+    # max_trades_per_day is ever raised, max_daily_loss must be revisited
+    # first (explicitly, per the same rule as the numbers above), or the
+    # first trade's own loss could already exceed what "daily loss limit"
+    # implies.
     max_daily_loss: float = float(os.getenv("MAX_DAILY_LOSS", "400"))
     max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "1"))
-    max_position_value: float = float(os.getenv("MAX_POSITION_VALUE", "5000"))
+    max_position_value: float = float(os.getenv("MAX_POSITION_VALUE", "7500"))
     signal_threshold: float = float(os.getenv("SIGNAL_THRESHOLD", "75"))
     forced_exit_time: time = field(
         default_factory=lambda: time.fromisoformat(os.getenv("FORCED_EXIT_TIME", "15:15"))
