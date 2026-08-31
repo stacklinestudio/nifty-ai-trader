@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from config import IST
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -29,10 +31,19 @@ class KiteMarketData:
     def get_quote(self, symbol: str) -> Quote:
         payload = self.kite.quote([symbol])[symbol]
         timestamp = payload.get("timestamp") or payload.get("last_trade_time")
-        if timestamp is None:
-            raise ValueError("Kite quote did not include a timestamp")
+        if not isinstance(timestamp, datetime):
+            # ValueError (not TypeError) to match the timezone check right
+            # below and validate_quote's convention -- both are "this Kite
+            # quote payload is malformed," the same failure category.
+            raise ValueError("Kite quote did not include a valid timestamp")  # noqa: TRY004
         if timestamp.tzinfo is None:
-            raise ValueError("Kite quote timestamp must be timezone aware")
+            # Confirmed against a real Kite response (2026-08-31): Kite
+            # Connect returns naive datetimes for this field that are
+            # implicitly IST -- the API never returns any other timezone
+            # here, so attaching IST is recovering known information, not
+            # guessing. A genuinely malformed value (not a datetime at all)
+            # is still rejected above before reaching this point.
+            timestamp = timestamp.replace(tzinfo=IST)
         depth = payload.get("depth", {})
         buys, sells = depth.get("buy", []), depth.get("sell", [])
         return Quote(
