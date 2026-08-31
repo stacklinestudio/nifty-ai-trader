@@ -861,3 +861,72 @@ All checks passed!
 ## Note: the "full checklist below" referenced in this request was not
 actually included in the message — flagged back to the user rather than
 guessed at or fabricated. Nothing further was started until it's provided.
+
+---
+
+# Overnight Pre-Market-Open Checklist (2026-09-01, outside market hours)
+
+Six read-only/auth checks, explicitly not the live entry/scheduler loop and
+no paper orders, per the user's instruction. Real Kite account, real
+Telegram/Discord credentials — first time any of this touched real data.
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Kite `generate_session` login flow | **DONE** — real access token obtained, verified live via `profile()` (`broker=ZERODHA`). Cached token from `.env.local` was expired, as expected; user completed the interactive browser login twice (first token consumed by a `profile()` check before the full sequence was combined into one run) and pasted the resulting token in themselves — never written to disk by this session. |
+| 2 | Real API call parses into `data/instruments.py`/`data/market_data.py` | **PARTIAL, found a real bug.** 1594 NIFTY option instruments parsed correctly (real lot size **65**, not the 75 used as a reference figure in earlier sizing discussions — no code change needed, `position_sizer`/`RiskManager` already read lot size live per-instrument, never hardcoded). Real NIFTY 50 quote fetch **failed**: `KiteMarketData.get_quote()` rejected Kite's actual naive (no-tzinfo) timestamp. Fixed in commit `9bf3812` — see below. |
+| 3 | `NseCalendar` against real wall-clock time | **DONE.** Real IST `2026-09-01T00:51:22`: `is_trading_day`=True, `is_market_open`=False. Correct. |
+| 4 | Real Telegram + all 6 Discord webhooks | **DONE, 4/7 channels confirmed configured and sending.** Telegram: sent. Discord: 3 of 6 category webhooks configured at the time (`market_research`, `signals`, `trades`) — all sent successfully; `risk`/`system`/`daily_report` weren't configured yet (not a failure). User has since said all 6 are now stored in `.env.local`. Actual delivery confirmation (opening the apps) is on the user, not verifiable from this session. |
+| 5 | Real historical candles → `backtest/engine.py` | **DONE.** 2250 real 1-minute NIFTY candles fetched (Aug 24–31, 2026), parsed cleanly through `validate_candles`, ran through `BacktestEngine`: 0 trades found. Reported as a real, honest result, not evidence of a bug — a real, short window with no qualifying ORB setups is plausible on its own. |
+| 6 | Lock/PID guard for concurrent `python main.py run` | **DONE**, see `929a0b9` above — added `execution/process_lock.py`, wired into the `run` command, 8 tests including a real CLI-level concurrency check. |
+
+## KiteMarketData timezone bug — DONE (commit `9bf3812`)
+
+Real quote fetch in step 2 above failed with
+`ValueError: Kite quote timestamp must be timezone aware` against the real
+API response `datetime.datetime(2026, 8, 31, 17, 35, 5)` (naive). Kite
+Connect's `quote()` timestamp field is implicitly IST with no other
+timezone ever returned — `get_quote()` now attaches `config.IST` via
+`.replace(tzinfo=IST)` instead of rejecting it, while a genuinely
+non-datetime value (not just "any naive value") still raises via an
+`isinstance` check.
+
+`tests/test_market_data.py::test_real_captured_naive_timestamp_no_longer_raises`
+pins the **exact** real captured value (`datetime(2026, 8, 31, 17, 35, 5)`,
+literal, not synthetic) as the primary regression fixture, per the user's
+explicit requirement.
+
+```
+$ pytest tests/test_market_data.py -q
+.......                                                               [100%]
+7 passed
+$ pytest -q   # full suite, commit 9bf3812
+............................................................................
+..                                                                    [100%]
+142 passed
+$ ruff check .
+All checks passed!
+```
+
+**Grep for the same bug class elsewhere** (per the explicit ask — this is
+the first time any of this codebase has touched real Kite data, so it's
+the moment to check every Kite-response datetime handling site, not after
+something else breaks mid-trading-day):
+- `data/historical.py::KiteHistoricalData.candles` — **checked, not
+  affected.** Verified two ways: the real historical fetch (step 5 above)
+  produced a date range of `09:15:00+05:30` to `15:29:00+05:30`, exactly
+  matching real NSE market hours — a timezone-shift bug would have
+  produced a visibly wrong range, not a coincidentally-correct one.
+  Separately, `kite.historical_data()`'s raw response carries ISO8601
+  timestamps with an embedded offset (unlike `quote()`'s raw `datetime`
+  object), so `pd.to_datetime(..., utc=True).dt.tz_convert(...)` round-trips
+  correctly here specifically because the input is already tz-aware.
+- `data/instruments.py::parse_kite_instruments` — **checked, not
+  applicable.** `expiry` converts to a plain `date` via `.date()`, which
+  has no timezone concept to get wrong. Confirmed live: real
+  `expiry=2026-09-01` matches NIFTY's actual weekly Tuesday expiry.
+- `execution/kite_executor.py` — **checked, not applicable.** Passes
+  kwargs/response through untouched; no datetime parsing at all.
+- Broader grep for `timestamp`/`last_trade_time`/`last_price` field
+  access across the whole codebase confirms `KiteMarketData.get_quote`
+  was the only site parsing these specific raw Kite quote fields — no
+  duplicate instance of this bug found elsewhere.
