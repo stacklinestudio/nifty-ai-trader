@@ -34,7 +34,7 @@ from execution.paper_broker import PaperBroker
 from execution.position_persistence import position_state_from_dict, position_state_to_dict
 from execution.position_supervisor import PositionState, TickResult
 from execution.position_supervisor import tick as supervise_tick
-from integrations.discord import DiscordNotifier
+from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.logger import configure_logger
@@ -125,7 +125,10 @@ class Orchestrator:
         self.post_trade_agent = PostTradeAgent(self.memory)
         self.trade_supervisor_agent = TradeSupervisorAgent()
         self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
-        self.discord = DiscordNotifier(settings.discord_webhook_url)
+        self.discord = DiscordNotifier(
+            settings.discord_webhook_url,
+            webhooks_by_category=webhooks_by_category_from_settings(settings),
+        )
         self._state: _CycleState | None = None
         # (direction, setup_type, entry_regime) of every stop-out closed
         # today, for the re-entry re-validation gate below. Cleared only by
@@ -149,9 +152,12 @@ class Orchestrator:
         confidence: float | None = None,
         agent: str = "orchestrator",
     ) -> None:
-        self.bus.publish(
-            Event(kind, agent, datetime.now(IST), output_summary=output, confidence=confidence)
-        )
+        event = Event(kind, agent, datetime.now(IST), output_summary=output, confidence=confidence)
+        self.bus.publish(event)
+        try:
+            self.discord.send_event(event)
+        except Exception as exc:  # noqa: BLE001 - a notification bug must never break the trading loop.
+            logger.warning("discord_event_dispatch_failed event_type=%s error=%s", kind, exc)
 
     @staticmethod
     def _consensus(results: dict[str, AgentResult]) -> tuple[str, bool]:

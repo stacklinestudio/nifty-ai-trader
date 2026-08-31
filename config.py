@@ -66,6 +66,14 @@ class Settings:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
+    # Per-category Discord channels; each optional, falling back to
+    # DISCORD_WEBHOOK_URL when unset (see integrations/discord.py).
+    discord_webhook_market_research: str = os.getenv("DISCORD_WEBHOOK_MARKET_RESEARCH", "")
+    discord_webhook_signals: str = os.getenv("DISCORD_WEBHOOK_SIGNALS", "")
+    discord_webhook_trades: str = os.getenv("DISCORD_WEBHOOK_TRADES", "")
+    discord_webhook_risk: str = os.getenv("DISCORD_WEBHOOK_RISK", "")
+    discord_webhook_system: str = os.getenv("DISCORD_WEBHOOK_SYSTEM", "")
+    discord_webhook_daily_report: str = os.getenv("DISCORD_WEBHOOK_DAILY_REPORT", "")
     obsidian_vault_path: str = os.getenv("OBSIDIAN_VAULT_PATH", "")
 
     def validate(self) -> None:

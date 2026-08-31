@@ -20,7 +20,7 @@ from data.calendar import NseCalendar
 from data.historical import validate_candles
 from data.market_data import KiteMarketData, validate_quote
 from execution.scheduler import resume_open_positions, run_trading_day
-from integrations.discord import DiscordNotifier
+from integrations.discord import CATEGORIES, DiscordNotifier, webhooks_by_category_from_settings
 from integrations.obsidian import ObsidianExporter
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
@@ -182,7 +182,10 @@ def main() -> int:
         return 0
     if args.command == "notifications":
         telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
-        discord = DiscordNotifier(settings.discord_webhook_url)
+        discord = DiscordNotifier(
+            settings.discord_webhook_url,
+            webhooks_by_category=webhooks_by_category_from_settings(settings),
+        )
         print(
             json.dumps(
                 {
@@ -190,6 +193,12 @@ def main() -> int:
                         "INFO", "V2 notification test; no trade."
                     ),
                     "discord_sent": discord.send_message("INFO", "V2 notification test; no trade."),
+                    "discord_by_category": {
+                        category: discord.send_message(
+                            "INFO", f"V2 notification test ({category} channel); no trade.", category
+                        )
+                        for category in CATEGORIES
+                    },
                 }
             )
         )
