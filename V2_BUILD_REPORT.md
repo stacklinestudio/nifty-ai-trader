@@ -724,3 +724,81 @@ hardcode "NIFTY" (`main.py`, `agents/research_agents.py`, `config.py`,
 | D — Multi-instrument | Deferred (user decision) |
 
 Final state this session: commit `28a72dc`, 113 tests passing, ruff clean.
+
+---
+
+# Discord Category Routing (2026-08-28)
+
+Starting point: `feature/multi-agent-intelligence` at `8d353aa`, 113 tests
+passing, ruff clean — re-verified before starting.
+
+## Discord routed to 6 category channels — DONE
+
+- **`DiscordNotifier` accepts per-category webhooks, backward compatible** —
+  DONE. `webhooks_by_category: dict[str, str] | None` alongside the existing
+  `webhook_url`, which stays the fallback for any unconfigured category; a
+  category with neither configured is silently skipped (`False`, never
+  raises). Existing single-webhook callers/tests unaffected —
+  `test_backward_compatible_single_webhook_constructor_still_works`.
+- **Routing table** — DONE. `CATEGORY_BY_EVENT_TYPE` in
+  `integrations/discord.py` maps every current `EventType` to one of
+  `market_research`/`signals`/`trades`/`risk`/`system`/`daily_report`, per
+  the requested mapping. Documented in `docs/NOTIFICATIONS.md`, including
+  which requested sub-scenarios (connection loss/restore, daily summary,
+  promotion decisions) don't have their own `EventType` yet and currently
+  surface via `SYSTEM_ERROR`/`LEARNING_CREATED` instead — the correct
+  category regardless, just without finer sub-typing.
+- **Config** — DONE. 6 new optional `Settings` fields
+  (`discord_webhook_market_research` … `discord_webhook_daily_report`),
+  all defaulting to `""`, added to `.env.example`.
+- **A real gap found and closed while wiring this in**: nothing previously
+  sent *any* event to Discord during a live cycle — `Orchestrator.discord`
+  only existed for the crash-recovery CRITICAL escalation, and the event
+  bus only ever persisted events to the SQLite audit table.
+  `Orchestrator._event` now also calls `discord.send_event(event)` for
+  every published event, in its own try/except so a notification bug can
+  never break the trading loop (same pattern as `run_supervised`'s tick
+  failures). Without this, the category routing would have been correctly
+  built but never actually exercised by a real trading cycle — the same
+  class of dead-code gap found and fixed several times earlier in this
+  build (`PostTradeAgent`, `run_supervised`, the event bus itself).
+- **Tests** — DONE, all four scenarios requested:
+  - Each event category resolves to the correct webhook:
+    `test_each_category_resolves_to_its_own_configured_webhook` (8
+    representative event types across all 6 categories).
+  - Unconfigured category falls back correctly:
+    `test_unconfigured_category_falls_back_to_default_webhook` and
+    `test_unconfigured_category_with_no_default_is_silently_skipped_not_an_error`.
+  - A failure on one channel doesn't block the others:
+    `test_failure_on_one_channel_does_not_block_notifications_to_others`
+    (a simulated `OSError` on the risk channel, then a successful send to
+    trades immediately after).
+  - Plus `webhooks_by_category_from_settings` reading all 6 fields
+    correctly.
+- **`docs/NOTIFICATIONS.md`** — DONE, updated with the category table,
+  fallback/skip behavior, and the incidental caveat about the
+  connection-loss/daily-summary/promotion-decision scenarios.
+- **Bonus, not requested but low-risk and directly useful**: extended
+  `python main.py notifications` to test-send to all 6 category channels
+  at once (`discord_by_category` in its output), since the user had just
+  configured all 6 real webhooks and would want an easy way to verify each.
+- **Incidental fix**: `.env.local` (where the user put the real webhook
+  secrets locally) was not covered by `.gitignore`'s exact `.env` line —
+  added `.env.*` with a `!.env.example` exception.
+
+```
+$ pytest -q   # commit 4b1d044
+............................................................................
+...........                                                          [100%]
+119 passed
+$ ruff check .
+All checks passed!
+$ python main.py agents
+{"paper_only": true, "consensus": "UNCERTAIN", "risk_approved": false, "order": null, "agent_count": 7}
+$ python main.py notifications
+{"telegram_sent": false, "discord_sent": false, "discord_by_category": {"market_research": false, "signals": false, "trades": false, "risk": false, "system": false, "daily_report": false}}
+```
+(All `false` above is correct, not a bug — no Discord/Telegram
+credentials are set in this environment's actual process environment;
+the user's real webhooks live in local `.env`/`.env.local` files not
+loaded into this session's shell.)
