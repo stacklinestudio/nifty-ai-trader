@@ -28,6 +28,7 @@ from config import IST, Settings
 from data.calendar import NseCalendar
 from data.historical import validate_candles
 from data.market_data import KiteMarketData, validate_quote
+from execution.process_lock import AlreadyRunningError, ProcessLock
 from execution.scheduler import resume_open_positions, run_trading_day
 from integrations.discord import CATEGORIES, DiscordNotifier, webhooks_by_category_from_settings
 from integrations.obsidian import ObsidianExporter
@@ -221,8 +222,17 @@ def main() -> int:
         print(path or "Obsidian vault not configured or unavailable.")
         return 0
     if args.command == "run":
-        print(json.dumps(run_scheduled_day(settings), indent=2, default=str))
-        return 0
+        lock = ProcessLock(Path(f"{settings.database_path}.lock"))
+        try:
+            lock.acquire()
+        except AlreadyRunningError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 1
+        try:
+            print(json.dumps(run_scheduled_day(settings), indent=2, default=str))
+            return 0
+        finally:
+            lock.release()
     print(
         "Download instruments through an authenticated official Kite SDK session; no credentials were found."
     )
