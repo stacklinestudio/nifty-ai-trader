@@ -802,3 +802,62 @@ $ python main.py notifications
 credentials are set in this environment's actual process environment;
 the user's real webhooks live in local `.env`/`.env.local` files not
 loaded into this session's shell.)
+
+---
+
+# .env.local Loading via python-dotenv (2026-08-28)
+
+The `false`s above turned out to have a real cause, not just an empty
+shell environment: **nothing in this codebase ever loaded a `.env` file**
+— `config.py` reads purely via `os.getenv()` against real OS environment
+variables. The user's real credentials in `.env.local` were never reaching
+`Settings` at all.
+
+## Fixed — DONE
+
+`main.py` now calls `load_dotenv(".env.local")` then `load_dotenv(".env")`
+as the first executable statements after `from __future__ import
+annotations` — before any other import, including `from config import
+...`. This ordering is load-bearing: `Settings`' fields default via
+`os.getenv(...)` evaluated when the `config` module is **first imported**,
+not when `Settings()` is instantiated, so placing the calls merely "before
+`Settings()`" would have silently not worked. Pinned by
+`test_main_loads_dotenv_before_importing_config`, which reads `main.py`'s
+actual source and asserts the ordering.
+
+Verified against the user's real `.env.local` (values never printed, only
+boolean presence checked):
+```
+$ python -c "import main; from config import Settings; s = Settings(); print('trading_mode:', s.trading_mode); print('kite_api_key set:', bool(s.kite_api_key))"
+trading_mode: paper
+kite_api_key set: True
+$ python main.py health
+HealthReport(safe_for_new_trades=True, reasons=[])
+ComponentHealth(name='kite', status='HEALTHY', detail='access token not configured')
+ComponentHealth(name='telegram', status='HEALTHY', detail='not configured')
+ComponentHealth(name='discord', status='HEALTHY', detail='3/6 category channels configured')
+...
+```
+(`kite`/`telegram` previously showed `DEGRADED`; `trading_mode: paper`
+confirms paper mode is still the default with real config flowing in.)
+
+**Found along the way, fixed in the same commit**: `monitoring/health.py`'s
+discord check only looked at the legacy `discord_webhook_url` field, so
+the user's actual setup (3 of the 6 per-category webhooks configured, no
+legacy URL) was incorrectly reported `DEGRADED "not configured"`. Fixed to
+check all 7 fields and report which category count is live; no test file
+existed for `monitoring/health.py` at all before this, so
+`tests/test_health.py` is new.
+
+```
+$ pytest -q   # commit 8e40f16
+............................................................................
+...............................                                      [100%]
+127 passed
+$ ruff check .
+All checks passed!
+```
+
+## Note: the "full checklist below" referenced in this request was not
+actually included in the message — flagged back to the user rather than
+guessed at or fabricated. Nothing further was started until it's provided.
