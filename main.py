@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+# Must run before `from config import ...` below: Settings' fields default
+# via os.getenv(...) evaluated when the config module is first imported,
+# not when Settings() is instantiated -- loading here, before any other
+# local import, is the only placement that actually works.
+load_dotenv(".env.local")  # real local credentials take precedence...
+load_dotenv(".env")  # ...falling back to the non-secret template/defaults
+
 import argparse
 import datetime
 import json

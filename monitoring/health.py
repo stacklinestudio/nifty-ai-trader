@@ -33,6 +33,30 @@ def check_health(
     return HealthReport(not reasons, reasons)
 
 
+def _discord_component_health(settings: Settings) -> ComponentHealth:
+    """HEALTHY if the legacy single webhook or any of the 6 per-category
+    webhooks (integrations/discord.py) is configured -- checking only
+    discord_webhook_url here would incorrectly report DEGRADED for a setup
+    using only per-category channels."""
+    category_webhooks = (
+        settings.discord_webhook_market_research,
+        settings.discord_webhook_signals,
+        settings.discord_webhook_trades,
+        settings.discord_webhook_risk,
+        settings.discord_webhook_system,
+        settings.discord_webhook_daily_report,
+    )
+    configured_count = sum(1 for url in category_webhooks if url)
+    if settings.discord_webhook_url or configured_count:
+        detail = (
+            "default webhook only"
+            if settings.discord_webhook_url and not configured_count
+            else f"{configured_count}/6 category channels configured"
+        )
+        return ComponentHealth("discord", "HEALTHY", detail)
+    return ComponentHealth("discord", "DEGRADED", "not configured")
+
+
 def system_health(
     settings: Settings,
     database_available: bool,
@@ -62,9 +86,7 @@ def system_health(
             "HEALTHY" if settings.telegram_bot_token and settings.telegram_chat_id else "DEGRADED",
             "not configured",
         ),
-        ComponentHealth(
-            "discord", "HEALTHY" if settings.discord_webhook_url else "DEGRADED", "not configured"
-        ),
+        _discord_component_health(settings),
         ComponentHealth(
             "obsidian", "HEALTHY" if settings.obsidian_vault_path else "DEGRADED", "not configured"
         ),
