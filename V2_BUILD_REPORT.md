@@ -930,3 +930,109 @@ something else breaks mid-trading-day):
   access across the whole codebase confirms `KiteMarketData.get_quote`
   was the only site parsing these specific raw Kite quote fields — no
   duplicate instance of this bug found elsewhere.
+
+---
+
+# Live Entry-Context Assembly Pipeline (2026-09-01, market open)
+
+Found via `main.py`'s own docstring: `run_scheduled_day` called
+`run_trading_day` with `context_provider=dict` — every real trading day
+produced `"no_entry"` by construction, regardless of real market
+conditions. `execution/live_context.py::build_live_context` replaces that.
+
+## Built — DONE
+
+1. **Real context assembly** — DONE. Real NIFTY 50 spot quote
+   (`KiteMarketData.get_quote`), real recent minute candles
+   (`KiteHistoricalData.candles`), real technical features
+   (`intelligence/technicals.py::feature_frame`, previously dead code —
+   computed but never used), real option chain
+   (`download_kite_nifty_options` + a new `fetch_option_quotes`, filtered
+   to nearest expiry within ±500 points of spot). Global market data and
+   news stay `[]` — no live provider exists for either yet (same honest
+   gap noted in the Brief 3 Part C section above), so `GlobalResearchAgent`/
+   `NewsAgent` correctly report `UNKNOWN` rather than fabricating.
+2. **Reused, not rebuilt** — DONE. `KiteMarketData.get_quote`,
+   `download_kite_nifty_options`, `KiteHistoricalData.candles` are called
+   directly, unmodified (beyond the timestamp fix already committed).
+   `parse_kite_timestamp` extracted from `data/market_data.py` so the
+   naive-timestamp fix isn't duplicated for option quotes (commit
+   `c3e1b6f`). Direction reuses `intelligence/market_regime.py::classify`
+   (the same regime `IndiaMarketAgent` derives its own read from) and
+   `intelligence/signal_engine.py::SignalEngine` (an already-tested
+   formula from `tests/test_strategy.py`, not invented for this pass).
+3. **Fail-closed, not new safety logic** — DONE. A missing/stale spot
+   quote leaves `market_data_fresh` `False`; not enough of today's session
+   for an opening range simply never sets `candidate_direction`. Both
+   checks already existed in `RiskAgent`/`IndependentTradeValidator`/
+   `SignalHunterAgent` from earlier work — this only decides whether to
+   feed them real inputs or leave them honestly absent.
+4. **Test with real captured shapes** — DONE.
+
+```
+$ pytest tests/test_live_context.py tests/test_market_data.py tests/test_process_lock.py tests/test_dotenv_loading.py -q -v
+tests\test_live_context.py .......                                       [ 26%]
+tests\test_market_data.py .......                                        [ 53%]
+tests\test_process_lock.py ........                                      [ 84%]
+tests\test_dotenv_loading.py ....                                        [100%]
+26 passed
+$ pytest -q   # full suite, commit 9d50965
+............................................................................
+....................................................................
+.....                                                                 [100%]
+149 passed
+$ ruff check .
+All checks passed!
+```
+
+## 5. Honest answer: is the missing piece fully connected, or are there still gaps?
+
+**Partially connected, with one structural gap serious enough that real
+trading days will still rarely produce a candidate even now.** Not an
+assumption from "it compiles" — found by writing the test that was
+supposed to prove a candidate forms, watching it fail, and tracing why
+rather than adjusting the test to pass:
+
+1. **The confidence ceiling (the big one).** `SignalEngine.evaluate()` is
+   fed only 2 of its 7 inputs from real data (`technical`, `opening`) —
+   `volume`/`option`/`global_score`/`news` are explicitly `0` (documented
+   in `KNOWN_GAPS`, not fabricated). That structurally caps achievable
+   confidence at **~54–59**, which can **never** cross the default
+   `signal_threshold` (**75**) — proven with a textbook real upward
+   breakout (real `regime=TREND_UP`, real ORB confirmation, both agreeing)
+   that still correctly produces no candidate at the real default
+   threshold (`test_build_live_context_at_default_threshold_correctly_produces_no_candidate_even_on_a_clear_breakout`).
+   A second test with the exact same real inputs and only
+   `signal_threshold` lowered (an existing config knob, not invented for
+   the test) confirms the wiring itself is correct
+   (`test_build_live_context_produces_the_right_candidate_once_threshold_is_reachable`).
+   **This means: as shipped, the live pipeline will structurally almost
+   never produce a trade candidate**, regardless of how clean the real
+   setup is, until either more of `KNOWN_GAPS` gets a real data source or
+   `signal_threshold` is deliberately reconsidered — a decision for you,
+   not something silently changed here.
+2. **Supervision quote source uses the wrong symbol.** `run_scheduled_day`
+   calls `build_live_quote_source(settings, "NIFTY", kite)` for
+   supervising an open/resumed position — but a real position's instrument
+   is an option contract (e.g. `NFO:NIFTY2690124200CE`), not the index.
+   Found while wiring `build_live_context` in, pre-existing from Brief 3,
+   never exercised against real data until this pass. Flagged in both
+   functions' docstrings; not fixed here since it needs
+   `execution/scheduler.py`'s `quote_source` to become per-position rather
+   than fixed at day start — a separate change from entry-context
+   assembly.
+3. **Option quote schema unconfirmed.** `fetch_option_quotes`'s `oi`
+   (open interest) field mapping matches documented Kite Connect
+   behavior but wasn't verified against a real live option quote this
+   session — the token was expired by the time this was built, and
+   re-verifying wasn't requested. Only the index quote and instrument
+   list were captured live.
+4. **Global market data and news remain unwired** — same gap noted in the
+   Brief 3 Part C section above; no live provider exists for either.
+
+**Not gaps**: the spot quote, candle fetch, technical feature computation,
+option chain fetch/filter/parse, and the fail-closed behavior are all real,
+tested, and (for the pieces reused from before) already proven against
+live data. The gap is specifically in how much of the *signal-confidence*
+formula has real inputs — not in whether real data reaches the pipeline at
+all.
