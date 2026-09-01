@@ -77,19 +77,19 @@ def build_kite_session(settings: Settings) -> object | None:
 
 
 def build_live_quote_source(settings: Settings, symbol: str, kite: object | None = None):
-    """Returns a real Kite-backed quote source when a session is available
-    (built fresh if `kite` isn't supplied), otherwise a source that always
-    reports unavailable -- never fabricated.
+    """Returns a real Kite-backed quote source for the given, fully
+    exchange-prefixed symbol (e.g. "NSE:NIFTY 50" or "NFO:NIFTY2690124200CE")
+    when a session is available (built fresh if `kite` isn't supplied),
+    otherwise a source that always reports unavailable -- never fabricated.
 
-    KNOWN GAP, not fixed by this call: run_scheduled_day always builds this
-    for the literal symbol "NIFTY" (the index), including for supervising
-    an already-open or resumed position -- but a real open position's
-    instrument is an OPTION contract (e.g. "NFO:NIFTY2690124200CE"), not
-    the index. Supervision would be checking the wrong symbol's price.
-    Flagged in run_scheduled_day's docstring and the accompanying report;
-    not fixed in this pass since it needs execution/scheduler.py's
-    quote_source to become per-position rather than fixed at day start,
-    a separate change from the entry-context assembly this pass built.
+    Callers supervising an open position must build this per-position, from
+    that position's own instrument symbol -- see
+    execution/scheduler.py::resume_open_positions/run_trading_day's
+    quote_source_factory parameter and run_scheduled_day below. A single
+    quote source fixed to one symbol (this function used to always be
+    called with the literal index symbol "NIFTY" for supervision,
+    regardless of what was actually held) was a real bug, not just a
+    theoretical risk -- fixed by making the factory per-instrument.
     """
     kite = kite if kite is not None else build_kite_session(settings)
     if kite is None:
@@ -118,9 +118,14 @@ def run_scheduled_day(settings: Settings) -> dict:
     trading day and returns.
 
     The live entry-context assembly pipeline (execution/live_context.py)
-    is now wired in here -- context_provider builds real spot/candles/
+    is wired in here -- context_provider builds real spot/candles/
     technicals/option-chain context instead of an empty dict, when a Kite
-    session is available. Known, still-open gaps (see
+    session is available. Position supervision (both a freshly-filled
+    position and any resumed from a prior crash) uses a per-instrument
+    quote source built from that specific position's own option symbol
+    (quote_source_factory below), not a single quote source fixed to the
+    index -- see execution/scheduler.py's docstring for why a fixed one
+    was a real bug. Known, still-open gaps (see
     execution/live_context.py::KNOWN_GAPS and the accompanying report for
     the full honest list):
     - SignalEngine's confidence formula is fed only 2 of 7 real sub-signals
@@ -128,9 +133,6 @@ def run_scheduled_day(settings: Settings) -> dict:
       signal_threshold -- candidates will rarely form until more of
       KNOWN_GAPS is wired to real data, or signal_threshold is
       deliberately reconsidered (not silently changed here).
-    - build_live_quote_source is still called with the literal symbol
-      "NIFTY" for supervising any open/resumed position, not that
-      position's actual option instrument -- see its own docstring.
     - fetch_option_quotes' `oi` field mapping is unconfirmed against a
       real live option quote (only the index quote and instrument list
       were captured live).
@@ -142,7 +144,9 @@ def run_scheduled_day(settings: Settings) -> dict:
     orchestrator = Orchestrator(settings, database)
     calendar = NseCalendar()
     kite = build_kite_session(settings)
-    quote_source = build_live_quote_source(settings, "NIFTY", kite)
+
+    def quote_source_factory(symbol: str):
+        return build_live_quote_source(settings, f"NFO:{symbol}", kite)
 
     def clock() -> datetime.datetime:
         return datetime.datetime.now(IST)
@@ -152,12 +156,12 @@ def run_scheduled_day(settings: Settings) -> dict:
             return {}
         return build_live_context(settings, kite, calendar, clock())
 
-    resumed = resume_open_positions(orchestrator, quote_source, clock, time.sleep)
+    resumed = resume_open_positions(orchestrator, quote_source_factory, clock, time.sleep)
     day = run_trading_day(
         orchestrator,
         calendar,
         context_provider=context_provider,
-        quote_source=quote_source,
+        quote_source_factory=quote_source_factory,
         clock=clock,
         sleeper=time.sleep,
     )

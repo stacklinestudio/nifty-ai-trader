@@ -35,6 +35,10 @@ def market_open_time() -> datetime:
     return datetime(2026, 8, 24, 10, 0, tzinfo=IST)
 
 
+def unavailable_quote_source_factory(symbol: str):
+    return lambda: None
+
+
 def test_scheduler_skips_weekend():
     calendar = NseCalendar()
     saturday = date(2026, 8, 29)
@@ -42,7 +46,7 @@ def test_scheduler_skips_weekend():
         orchestrator=None,
         calendar=calendar,
         context_provider=dict,
-        quote_source=lambda: None,
+        quote_source_factory=unavailable_quote_source_factory,
         clock=lambda: datetime(2026, 8, 29, 10, tzinfo=IST),
         sleeper=lambda _s: None,
         today=saturday,
@@ -57,7 +61,7 @@ def test_scheduler_skips_configured_holiday():
         orchestrator=None,
         calendar=calendar,
         context_provider=dict,
-        quote_source=lambda: None,
+        quote_source_factory=unavailable_quote_source_factory,
         clock=lambda: datetime(2026, 8, 26, 10, tzinfo=IST),
         sleeper=lambda _s: None,
         today=holiday,
@@ -73,7 +77,7 @@ def test_scheduler_no_entry_on_trading_day_with_no_market_data(tmp_path):
         orchestrator,
         calendar,
         context_provider=dict,
-        quote_source=lambda: None,
+        quote_source_factory=unavailable_quote_source_factory,
         clock=market_open_time,
         sleeper=lambda _s: None,
     )
@@ -86,19 +90,25 @@ def test_scheduler_fills_and_supervises_to_a_real_close(tmp_path):
     orchestrator = Orchestrator(settings)
     calendar = NseCalendar()
     ticks = {"n": 0}
+    factory_calls: list[str] = []
 
     def clock():
         ticks["n"] += 1
         return market_open_time() + timedelta(seconds=ticks["n"])
 
-    def quote_source():
-        return 20.0  # comfortably past any realistic target for this fixture
+    def quote_source_factory(symbol: str):
+        factory_calls.append(symbol)
+
+        def quote_source():
+            return 20.0  # comfortably past any realistic target for this fixture
+
+        return quote_source
 
     result = run_trading_day(
         orchestrator,
         calendar,
         context_provider=filled_cycle_context,
-        quote_source=quote_source,
+        quote_source_factory=quote_source_factory,
         clock=clock,
         sleeper=lambda _s: None,
     )
@@ -107,6 +117,11 @@ def test_scheduler_fills_and_supervises_to_a_real_close(tmp_path):
     assert result.cycle.order is not None
     assert result.supervision is not None and result.supervision.should_exit
     assert orchestrator.paper_broker.get_positions() == []
+    # The factory must be called with the actual held instrument's symbol
+    # (NIFTY24CE, per filled_cycle_context's fixture), not a hardcoded index
+    # symbol like "NIFTY" -- this is the exact bug this signature exists to
+    # prevent.
+    assert factory_calls == ["NIFTY24CE"]
 
 
 def test_resume_open_positions_resumes_before_any_new_entry(tmp_path):
@@ -118,20 +133,35 @@ def test_resume_open_positions_resumes_before_any_new_entry(tmp_path):
     first_run.open_position(cycle, now=market_open_time())
 
     restarted = Orchestrator(Settings(database_path=db_path))
+    factory_calls: list[str] = []
+
+    def quote_source_factory(symbol: str):
+        factory_calls.append(symbol)
+        return lambda: 20.0
+
     results = resume_open_positions(
         restarted,
-        quote_source=lambda: 20.0,
+        quote_source_factory=quote_source_factory,
         clock=market_open_time,
         sleeper=lambda _s: None,
     )
 
     assert len(results) == 1 and results[0].should_exit
     assert restarted.database.open_positions() == []
+    # Same requirement as run_trading_day: a recovered position must be
+    # supervised using its own real instrument symbol, not a hardcoded one.
+    assert factory_calls == ["NIFTY24CE"]
 
 
 def test_resume_open_positions_does_nothing_when_none_exist(tmp_path):
     settings = Settings(database_path=tmp_path / "paper.db")
     orchestrator = Orchestrator(settings)
-    assert resume_open_positions(
-        orchestrator, quote_source=lambda: None, clock=market_open_time, sleeper=lambda _s: None
-    ) == []
+    assert (
+        resume_open_positions(
+            orchestrator,
+            quote_source_factory=unavailable_quote_source_factory,
+            clock=market_open_time,
+            sleeper=lambda _s: None,
+        )
+        == []
+    )

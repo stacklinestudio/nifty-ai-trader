@@ -1,0 +1,161 @@
+"""Regression coverage for the exact bug reported: run_scheduled_day
+supervised an open position by querying the index symbol "NIFTY", not the
+actual option contract held. Uses two distinct quote values for two
+distinct symbols from one FakeKite, the same approach as last night's
+market-data tests -- the index LTP (24080.4) is the literal value captured
+live against the real Kite API on 2026-08-31; the option LTP (120.5) is a
+realistic, clearly-labeled representative value, not a literally captured
+one (no real option quote was successfully fetched before the token
+expired -- see V2_BUILD_REPORT.md's honest note on this).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from config import IST
+from data.instruments import OptionInstrument
+from data.option_chain import OptionQuote
+from execution.scheduler import resume_open_positions, run_trading_day
+from main import build_live_quote_source
+
+INDEX_SYMBOL = "NSE:NIFTY 50"
+OPTION_SYMBOL = "NFO:NIFTY2690124200CE"
+REAL_CAPTURED_INDEX_LTP = 24080.4  # literal value captured live, 2026-08-31
+REPRESENTATIVE_OPTION_LTP = 120.5  # realistic, not literally captured (see module docstring)
+
+
+class FakeKite:
+    """Quote timestamps always use the REAL current wall clock
+    (datetime.now(IST) at call time), never a fixed/simulated test time --
+    build_live_quote_source's validate_quote check compares a quote's
+    timestamp against real wall-clock time (correctly, for production use:
+    a live quote's own freshness must be judged against real time, not a
+    test's simulated clock). A fixed simulated timestamp here would make
+    every quote look permanently stale to that check regardless of what
+    run_trading_day/run_supervised's own simulated `clock` says -- exactly
+    the mistake in an earlier version of this file, which made
+    live_quote() always return None and caused a long real supervision
+    loop (with real Discord sends on every stale tick) instead of an
+    immediate, correct exit.
+    """
+
+    def quote(self, symbols: list[str]) -> dict:
+        symbol = symbols[0]
+        ltp = REAL_CAPTURED_INDEX_LTP if symbol == INDEX_SYMBOL else REPRESENTATIVE_OPTION_LTP
+        now = datetime.now(IST)
+        return {
+            symbol: {
+                "last_price": ltp,
+                "volume": 0,
+                "timestamp": now.replace(tzinfo=None),
+                "depth": {"buy": [{"price": ltp - 0.5}], "sell": [{"price": ltp + 0.5}]},
+            }
+        }
+
+
+def test_build_live_quote_source_returns_the_requested_symbols_own_value():
+    kite = FakeKite()
+
+    index_source = build_live_quote_source(_dummy_settings(), INDEX_SYMBOL, kite)
+    option_source = build_live_quote_source(_dummy_settings(), OPTION_SYMBOL, kite)
+
+    assert index_source() == REAL_CAPTURED_INDEX_LTP
+    assert option_source() == REPRESENTATIVE_OPTION_LTP
+    assert index_source() != option_source()
+
+
+def test_quote_source_factory_pattern_supervises_the_option_not_the_index(tmp_path):
+    """End-to-end through the actual factory pattern run_scheduled_day
+    uses: quote_source_factory(symbol) must resolve to the held option's
+    own quote source, never the index's, once a position is open.
+    """
+    from agents.orchestrator import Orchestrator
+    from config import Settings
+    from data.calendar import NseCalendar
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+    kite = FakeKite()
+
+    def quote_source_factory(symbol: str):
+        return build_live_quote_source(settings, f"NFO:{symbol}", kite)
+
+    context = _filled_cycle_context(now)
+    ticks = {"n": 0}
+
+    def clock():
+        ticks["n"] += 1
+        return now + timedelta(seconds=ticks["n"])
+
+    result = run_trading_day(
+        orchestrator,
+        NseCalendar(),
+        context_provider=lambda: context,
+        quote_source_factory=quote_source_factory,
+        clock=clock,
+        sleeper=lambda _s: None,
+    )
+
+    # The fixture's option symbol is NIFTY24CE, entry 10, target 13-14 --
+    # REPRESENTATIVE_OPTION_LTP (120.5) is comfortably past any target,
+    # forcing an immediate real TAKE_PROFIT close using the OPTION's own
+    # value. If this were still querying the index (24080.4) instead, the
+    # same thing would happen for the wrong reason (a nonsensical price for
+    # an option), which is exactly the bug: the number driving stop/target
+    # decisions was never the real premium of the actual contract held.
+    assert result.ran and result.reason == "closed"
+    assert result.supervision is not None and result.supervision.reason == "TAKE_PROFIT"
+    assert result.supervision.exit_price == REPRESENTATIVE_OPTION_LTP
+
+
+def test_resume_open_positions_also_uses_the_options_symbol_not_the_index(tmp_path):
+    from agents.orchestrator import Orchestrator
+    from config import Settings
+
+    db_path = tmp_path / "paper.db"
+    settings = Settings(database_path=db_path)
+    first_run = Orchestrator(settings)
+    now = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+    cycle = first_run.run_cycle(_filled_cycle_context(now))
+    assert cycle.order is not None
+    first_run.open_position(cycle, now=now)
+
+    restarted = Orchestrator(Settings(database_path=db_path))
+    kite = FakeKite()
+
+    def quote_source_factory(symbol: str):
+        return build_live_quote_source(settings, f"NFO:{symbol}", kite)
+
+    results = resume_open_positions(
+        restarted, quote_source_factory, clock=lambda: now, sleeper=lambda _s: None
+    )
+
+    assert len(results) == 1
+    assert results[0].reason == "TAKE_PROFIT"
+    assert results[0].exit_price == REPRESENTATIVE_OPTION_LTP
+
+
+def _dummy_settings():
+    from config import Settings
+
+    return Settings()
+
+
+def _filled_cycle_context(now: datetime) -> dict:
+    instrument = OptionInstrument("NIFTY24CE", 22000, now.date() + timedelta(days=3), "CE", 25)
+    quote = OptionQuote(instrument, 10, now, 9.75, 10.25, 1000)
+    return {
+        "candidate_direction": "CALL",
+        "candidate_confidence": 88,
+        "entry_zone": (10.0, 10.5),
+        "stop_zone": (8.0, 8.5),
+        "target_zone": (13.0, 14.0),
+        "option_quotes": [quote],
+        "spot": 22000,
+        "option_atr": 1,
+        "market_data_fresh": True,
+        "market_open": True,
+        "features": {"ema_fast": 2, "ema_slow": 1, "close": 2, "vwap": 1, "atr": 10},
+    }

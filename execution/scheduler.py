@@ -32,7 +32,7 @@ class DayResult:
 
 def resume_open_positions(
     orchestrator: Orchestrator,
-    quote_source: Callable[[], float | None],
+    quote_source_factory: Callable[[str], Callable[[], float | None]],
     clock: Callable[[], datetime],
     sleeper: Callable[[float], None],
     regime_source: Callable[[], tuple[str | None, str | None]] | None = None,
@@ -41,9 +41,20 @@ def resume_open_positions(
     the caller considers any new entry for the day. Returns one TickResult
     per resumed position (a fresh crash-recovery pass on a later tick could
     surface more, but max_trades_per_day=1 makes more than one unlikely
-    today)."""
+    today).
+
+    quote_source_factory takes the position's own instrument symbol
+    (state.thesis.symbol -- the actual option contract held, e.g.
+    "NIFTY2690124200CE") and returns a quote source for THAT instrument.
+    A single fixed quote_source here would supervise every recovered
+    position -- regardless of what it actually holds -- against whatever
+    one symbol the caller happened to build a quote source for; this was a
+    real bug (fixed on the index symbol "NIFTY") until this signature
+    change.
+    """
     results = []
     for state in orchestrator.recover_open_positions():
+        quote_source = quote_source_factory(state.thesis.symbol)
         results.append(
             orchestrator.run_supervised(
                 state, quote_source, clock=clock, sleeper=sleeper, regime_source=regime_source
@@ -56,7 +67,7 @@ def run_trading_day(
     orchestrator: Orchestrator,
     calendar: NseCalendar,
     context_provider: Callable[[], dict[str, Any]],
-    quote_source: Callable[[], float | None],
+    quote_source_factory: Callable[[str], Callable[[], float | None]],
     clock: Callable[[], datetime],
     sleeper: Callable[[float], None],
     poll_seconds_before_open: float = 30.0,
@@ -68,6 +79,12 @@ def run_trading_day(
     through to its own close. Does NOT check for a recovered position from a
     prior process -- call resume_open_positions first at process start, per
     Part A3, before this.
+
+    quote_source_factory: see resume_open_positions -- the same
+    per-instrument requirement applies to a freshly-filled position here,
+    not just a recovered one. The instrument isn't known until after
+    open_position() builds the thesis, so the quote source for supervision
+    is built from that thesis's own symbol, not decided up front.
     """
     checked_date = today if today is not None else clock().date()
     if not calendar.is_trading_day(checked_date):
@@ -85,6 +102,7 @@ def run_trading_day(
     # against -- using two different time sources here would make the
     # staleness check meaningless.
     state = orchestrator.open_position(cycle, now=clock())
+    quote_source = quote_source_factory(state.thesis.symbol)
     supervision = orchestrator.run_supervised(
         state, quote_source, clock=clock, sleeper=sleeper, regime_source=regime_source
     )
