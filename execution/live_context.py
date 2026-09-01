@@ -262,15 +262,50 @@ def _add_candidate(
     ]
 
 
+def assemble_context(
+    candles: pd.DataFrame,
+    option_quotes: list[OptionQuote],
+    spot: float,
+    now: datetime,
+    market_open: bool,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Pure context assembly from already-fetched data -- no I/O, no Kite
+    calls. Both build_live_context (fetches live) and
+    backtest/daily_backtest.py (fetches historical) call this, so entry
+    logic is identical between live and backtest -- not reimplemented
+    twice, and not a place a backtest-only shortcut could quietly diverge
+    from what actually runs live.
+    """
+    context: dict[str, Any] = {
+        "market_open": market_open,
+        "market_data_fresh": True,
+        "global_context": [],  # no live provider wired -- GlobalResearchAgent fails closed on this
+        "news_items": [],  # no live news source wired -- NewsAgent fails closed on this
+        "spot": spot,
+        "max_position_value": settings.max_position_value,
+        "option_quotes": option_quotes,
+    }
+    if candles.empty:
+        return context
+    features = _technical_features(candles)
+    context["features"] = features
+    context["atr"] = features["atr"]
+    context["gap_pct"] = _gap_pct(candles, now.date())
+    _add_candidate(context, candles, features, settings.signal_threshold)
+    return context
+
+
 def build_live_context(
     settings: Settings, kite: object, calendar: NseCalendar, now: datetime | None = None
 ) -> dict[str, Any]:
     now = now or datetime.now(IST)
-    context: dict[str, Any] = {
-        "market_open": calendar.is_market_open(now),
+    market_open = calendar.is_market_open(now)
+    not_fresh: dict[str, Any] = {
+        "market_open": market_open,
         "market_data_fresh": False,
-        "global_context": [],  # no live provider wired -- GlobalResearchAgent fails closed on this
-        "news_items": [],  # no live news source wired -- NewsAgent fails closed on this
+        "global_context": [],
+        "news_items": [],
     }
 
     try:
@@ -278,9 +313,7 @@ def build_live_context(
         validate_quote(quote, now, settings.stale_data_seconds)
     except Exception as exc:  # noqa: BLE001 - any failure here means "no fresh spot data," fail closed below.
         logger.warning("live_context_spot_quote_unavailable error=%s", exc)
-        return context
-    context["market_data_fresh"] = True
-    context["spot"] = quote.ltp
+        return not_fresh
 
     try:
         candles = KiteHistoricalData(kite).candles(
@@ -288,15 +321,7 @@ def build_live_context(
         )
     except Exception as exc:  # noqa: BLE001 - no candles means no technical/ORB read; still return what we have.
         logger.warning("live_context_candles_unavailable error=%s", exc)
-        return context
-    if candles.empty:
-        return context
-
-    features = _technical_features(candles)
-    context["features"] = features
-    context["atr"] = features["atr"]
-    context["gap_pct"] = _gap_pct(candles, now.date())
-    _add_candidate(context, candles, features, settings.signal_threshold)
+        candles = pd.DataFrame()
 
     try:
         instruments = download_kite_nifty_options(kite)
@@ -304,7 +329,6 @@ def build_live_context(
         logger.warning("live_context_instruments_unavailable error=%s", exc)
         instruments = []
     universe = _select_option_universe(instruments, quote.ltp, now.date())
-    context["option_quotes"] = fetch_option_quotes(kite, universe) if universe else []
-    context["max_position_value"] = settings.max_position_value
+    option_quotes = fetch_option_quotes(kite, universe) if universe else []
 
-    return context
+    return assemble_context(candles, option_quotes, quote.ltp, now, market_open, settings)
