@@ -22,6 +22,26 @@ class MarketDataProvider(Protocol):
     def get_quote(self, symbol: str) -> Quote: ...
 
 
+def parse_kite_timestamp(payload: dict) -> datetime:
+    """Shared by every Kite quote-shaped response parser (index quotes,
+    option quotes) so the naive-timestamp fix lives in exactly one place.
+    Confirmed against a real Kite response (2026-08-31, NSE:NIFTY 50): Kite
+    Connect returns naive datetimes for this field that are implicitly
+    IST -- the API never returns any other timezone here, so attaching IST
+    is recovering known information, not guessing. A genuinely malformed
+    value (not a datetime at all) is still rejected, not just "any naive
+    value is fine no matter what."
+    """
+    timestamp = payload.get("timestamp") or payload.get("last_trade_time")
+    if not isinstance(timestamp, datetime):
+        # ValueError (not TypeError) to match validate_quote's convention --
+        # both are "this Kite payload is malformed," the same category.
+        raise ValueError("Kite response did not include a valid timestamp")  # noqa: TRY004
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=IST)
+    return timestamp
+
+
 class KiteMarketData:
     """Official SDK quote adapter. Errors intentionally propagate to fail closed."""
 
@@ -30,20 +50,7 @@ class KiteMarketData:
 
     def get_quote(self, symbol: str) -> Quote:
         payload = self.kite.quote([symbol])[symbol]
-        timestamp = payload.get("timestamp") or payload.get("last_trade_time")
-        if not isinstance(timestamp, datetime):
-            # ValueError (not TypeError) to match the timezone check right
-            # below and validate_quote's convention -- both are "this Kite
-            # quote payload is malformed," the same failure category.
-            raise ValueError("Kite quote did not include a valid timestamp")  # noqa: TRY004
-        if timestamp.tzinfo is None:
-            # Confirmed against a real Kite response (2026-08-31): Kite
-            # Connect returns naive datetimes for this field that are
-            # implicitly IST -- the API never returns any other timezone
-            # here, so attaching IST is recovering known information, not
-            # guessing. A genuinely malformed value (not a datetime at all)
-            # is still rejected above before reaching this point.
-            timestamp = timestamp.replace(tzinfo=IST)
+        timestamp = parse_kite_timestamp(payload)
         depth = payload.get("depth", {})
         buys, sells = depth.get("buy", []), depth.get("sell", [])
         return Quote(
