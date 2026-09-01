@@ -1036,3 +1036,82 @@ tested, and (for the pieces reused from before) already proven against
 live data. The gap is specifically in how much of the *signal-confidence*
 formula has real inputs — not in whether real data reaches the pipeline at
 all.
+
+---
+
+# Critical Fix: Supervision Quote Source Used the Index, Not the Held Instrument (2026-09-01)
+
+## Fixed — DONE (commit `e75ce8c`)
+
+`run_scheduled_day` built one fixed quote source for the literal symbol
+`"NIFTY"` and used it to supervise **every** position — a fresh fill and
+any position resumed after a crash — regardless of what instrument was
+actually held. A real position's instrument is an option contract (e.g.
+`NIFTY2690124200CE`), not the index; every trailing-stop/target/stop-loss
+check would have been tracking the wrong number entirely.
+
+1. **Fixed.** `execution/scheduler.py::run_trading_day` and
+   `resume_open_positions` now take `quote_source_factory:
+   Callable[[str], Callable[[], float | None]]` instead of one fixed
+   `quote_source`. The quote source is built from `state.thesis.symbol`
+   (the actual held instrument) only after it's known — for
+   `run_trading_day`, that's after `open_position()` produces the real
+   thesis; the instrument isn't known before that.
+2. **Test added, using two distinct real/representative values from one
+   `FakeKite`** — DONE:
+   `tests/test_supervision_quote_symbol.py`. Index LTP (`24080.4`) is the
+   literal value captured live 2026-08-31; option LTP (`120.5`) is
+   realistic but not literally captured (no real option quote was ever
+   successfully fetched — the token expired first, see the live-context
+   report section above). Asserts the supervision loop closes using the
+   option's value, and that `quote_source_factory` is called with the
+   real held symbol, not `"NIFTY"`.
+3. **`resume_open_positions` audited explicitly, confirmed to have the
+   identical bug, fixed identically** — DONE.
+   `test_resume_open_positions_also_uses_the_options_symbol_not_the_index`
+   plus a factory-call assertion added to the existing
+   `test_resume_open_positions_resumes_before_any_new_entry`.
+4. **Could this have affected any prior testing? Confirmed no, not
+   assumed.** Grepped git history and the working directory for any
+   evidence `main.py run`/`run_scheduled_day` was ever actually executed
+   in this engagement: none found — no leftover trade database, and every
+   prior session's own commit messages explicitly state the blocking
+   wait-for-open loop was never invoked directly (deliberately, given the
+   risk of hanging outside market hours). All prior position-supervision
+   testing used directly-constructed fake quote sources, never routed
+   through the buggy fixed-`"NIFTY"` call site. This bug could not have
+   affected any prior test result or any real position.
+
+```
+$ pytest tests/test_supervision_quote_symbol.py tests/test_scheduler.py -q
+...........                                                           [100%]
+11 passed
+$ pytest -q   # full suite, commit e75ce8c
+............................................................................
+....................................................................
+....                                                                  [100%]
+152 passed
+$ ruff check .
+All checks passed!
+```
+
+## Disclosure: an early version of the new test likely sent real Discord messages
+
+Building the test in item 2, an earlier version of its `FakeKite` stamped
+quotes with a **fixed simulated timestamp** instead of real wall-clock
+time. `build_live_quote_source`'s `validate_quote` check (correctly, for
+production use) compares a quote's timestamp against *real* current time
+— so that fixed timestamp always looked stale, `live_quote()` always
+returned `None`, and the supervision loop spun for a long time trying to
+reach forced-exit. Every stale tick fires a `SYSTEM_ERROR` event, and
+`Orchestrator._event` sends every event to Discord (per the category
+routing work) — **against this environment's real, configured `.env.local`
+webhooks**, meaning that run likely sent a real, uncounted number of stale-
+data warning messages to the "system" Discord channel before it was
+noticed and killed (~1–2 minutes of wall-clock time; no exact count is
+available — the run was stopped via `TaskStop`, not observed to
+completion, and no local database survived to count events from). Fixed by
+having `FakeKite` always stamp with `datetime.now(IST)`, documented in the
+fixture's own docstring. **Recommend checking the "system" Discord channel
+and clearing any spam if needed** — not something this session can do on
+your behalf.
