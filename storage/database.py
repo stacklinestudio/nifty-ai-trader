@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
+from data.option_chain import OptionQuote, quotes_from_json, quotes_to_json
 from events.contracts import Event
 from storage.models import SignalRecord, Trade
+
+OPTION_CHAIN_SNAPSHOT_SOURCE = "option_chain"
 
 
 class Database:
@@ -113,3 +117,35 @@ class Database:
     def close_open_position(self, order_id: str) -> None:
         with sqlite3.connect(self.path) as conn:
             conn.execute("DELETE FROM open_positions WHERE order_id = ?", (order_id,))
+
+    def save_option_chain_snapshot(self, timestamp: datetime, quotes: list[OptionQuote]) -> None:
+        """Persists the option chain fetched this cycle so the NEXT cycle
+        can supply it as `previous_option_quotes` -- the real prior-session
+        snapshot intelligence/oi_buildup.py::detect_buildup needs, and that
+        no live source persisted before Brief 5 (execution/live_context.py
+        KNOWN_GAPS). Reuses the `snapshots` table, which existed in the
+        schema but had no reader/writer anywhere until this -- not a new
+        table. Never called with an empty list: an empty snapshot would
+        silently poison the *next* cycle's real "unavailable" read into a
+        fabricated "compared against nothing and found no buildup."
+        """
+        if not quotes:
+            return
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO snapshots(timestamp,source,payload) VALUES(?,?,?)",
+                (timestamp.isoformat(), OPTION_CHAIN_SNAPSHOT_SOURCE, quotes_to_json(quotes)),
+            )
+
+    def latest_option_chain_snapshot(self) -> list[OptionQuote]:
+        """Real prior-session data when one has been persisted; an explicit
+        empty list (not fabricated) the first time this ever runs, or after
+        any gap where no snapshot exists yet -- callers already treat an
+        empty previous_option_quotes as "unavailable," not "no buildup."
+        """
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT payload FROM snapshots WHERE source = ? ORDER BY timestamp DESC LIMIT 1",
+                (OPTION_CHAIN_SNAPSHOT_SOURCE,),
+            ).fetchone()
+        return quotes_from_json(row[0]) if row else []

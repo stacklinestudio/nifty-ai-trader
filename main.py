@@ -125,14 +125,19 @@ def run_scheduled_day(settings: Settings) -> dict:
     quote source built from that specific position's own option symbol
     (quote_source_factory below), not a single quote source fixed to the
     index -- see execution/scheduler.py's docstring for why a fixed one
-    was a real bug. Known, still-open gaps (see
-    execution/live_context.py::KNOWN_GAPS and the accompanying report for
-    the full honest list):
-    - SignalEngine's confidence formula is fed only 2 of 7 real sub-signals
-      right now, capping achievable confidence below the default
-      signal_threshold -- candidates will rarely form until more of
-      KNOWN_GAPS is wired to real data, or signal_threshold is
-      deliberately reconsidered (not silently changed here).
+    was a real bug. Also persists this cycle's option chain
+    (Database.save_option_chain_snapshot) and retrieves the prior one
+    (latest_option_chain_snapshot) so option-based scoring has real
+    day-over-day data to compare, since a fresh process each morning has
+    no other memory of yesterday (Brief 5 Part B). Known, still-open gaps
+    (see execution/live_context.py::KNOWN_GAPS and the accompanying report
+    for the full honest list):
+    - `global_score`/`news` are real wiring over still-empty real data --
+      no live global-market or news provider is wired in yet (researched,
+      not picked, in Brief 5 Part C).
+    - `option`'s OI-buildup scoring stays at its honest "unavailable" floor
+      until a second real snapshot has actually been persisted (i.e. from
+      the second day this runs onward).
     - fetch_option_quotes' `oi` field mapping is unconfirmed against a
       real live option quote (only the index quote and instrument list
       were captured live).
@@ -154,7 +159,22 @@ def run_scheduled_day(settings: Settings) -> dict:
     def context_provider() -> dict:
         if kite is None:
             return {}
-        return build_live_context(settings, kite, calendar, clock())
+        # The real prior-session option chain, if one has ever been
+        # persisted -- Brief 5 Part B. Read here (not before, at function-
+        # definition time) so it reflects whatever's actually in the
+        # database at the moment this cycle runs, not whenever
+        # run_scheduled_day started.
+        previous_option_quotes = database.latest_option_chain_snapshot()
+        context = build_live_context(
+            settings, kite, calendar, clock(), previous_option_quotes=previous_option_quotes
+        )
+        # Persist THIS cycle's chain so the next cycle (a fresh process,
+        # per this deployment's own recommended "one process per trading
+        # day" model) has a real previous snapshot to compare against --
+        # save_option_chain_snapshot no-ops on an empty list, so a day
+        # where no option chain was fetched never poisons tomorrow's read.
+        database.save_option_chain_snapshot(clock(), context.get("option_quotes", []))
+        return context
 
     resumed = resume_open_positions(orchestrator, quote_source_factory, clock, time.sleep)
     day = run_trading_day(

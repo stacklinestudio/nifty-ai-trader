@@ -97,8 +97,32 @@ def run_daily_backtest(
     option_quotes_by_day = option_quotes_by_day or {}
     trading_days = sorted({ts.date() for ts in all_candles.index})
     days: list[BacktestDay] = []
+    # Mirrors the live path's storage.database.Database.latest_option_chain_
+    # snapshot semantics (Brief 5 Part B): "the most recently fetched real
+    # chain," not strictly "yesterday's" -- if a day in option_quotes_by_day
+    # has no entry, the last real one seen so far in this sequential pass
+    # still serves as the comparison baseline, same as a live gap day
+    # wouldn't erase what was last persisted. No SQLite persistence is
+    # needed here specifically because the whole day-indexed dict is
+    # already resident in memory for the entire backtest window -- unlike
+    # live's fresh-process-per-day deployment, there's no process boundary
+    # to carry state across.
+    last_option_snapshot: list[OptionQuote] = []
 
     for trading_day in trading_days:
+        # Read and (if real) record this day's chain before any skip check
+        # below -- a day skipped for insufficient_prior_history/today_bars
+        # (every backtest's first day, always) still really has its own
+        # option chain in option_quotes_by_day if the caller supplied one;
+        # losing that would mean day 1's real data could never become day
+        # 2's real baseline, defeating the point of this sequential pass.
+        todays_option_quotes = option_quotes_by_day.get(trading_day, [])
+        if todays_option_quotes:
+            previous_option_quotes_for_today = last_option_snapshot
+            last_option_snapshot = todays_option_quotes
+        else:
+            previous_option_quotes_for_today = last_option_snapshot
+
         prior = all_candles[all_candles.index.date < trading_day]
         if prior.empty:
             days.append(BacktestDay(trading_day, "insufficient_prior_history"))
@@ -112,8 +136,9 @@ def run_daily_backtest(
 
         spot = float(todays_slice.iloc[-1].close)
         decision_time = todays_slice.index[-1].to_pydatetime()
-        option_quotes = option_quotes_by_day.get(trading_day, [])
-        context = assemble_context(as_of, option_quotes, spot, decision_time, True, settings)
+        context = assemble_context(
+            as_of, todays_option_quotes, spot, decision_time, True, settings, previous_option_quotes_for_today
+        )
         candidate_formed = "candidate_direction" in context
 
         orchestrator = Orchestrator(settings)

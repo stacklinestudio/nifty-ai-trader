@@ -28,6 +28,20 @@ already real before this brief. Each newly-wired input still degrades to
 unavailable for a given day -- see each _*_score function's own
 docstring for exactly what "unavailable" means for that input.
 
+Brief 5 made two of those four inputs receive real DATA, not just real
+wiring: `volume` now prefers real option-contract volume
+(_combined_volume_score/_option_volume_score) over index candle volume,
+which is structurally always 0 for NIFTY 50 on Kite (an index carries no
+traded volume of its own); `option`'s OI-buildup detection becomes real
+once a previous option-chain snapshot exists, which main.py's live path
+now persists and retrieves via storage.database.Database.save_option_
+chain_snapshot/latest_option_chain_snapshot (reusing the schema's
+pre-existing, previously-unused `snapshots` table) -- the mechanism a
+fresh-process-per-day live deployment needs to carry state across days.
+`global_score`/`news` remain real wiring over still-empty real data --
+Brief 5 researched, but deliberately did not pick or wire, a live
+external source for either (see the accompanying report's Part C).
+
 Fail-closed by construction, not by new logic: if the spot quote is
 missing/stale, market_data_fresh stays False, which the existing
 RiskAgent/IndependentTradeValidator checks already refuse to trade on. If
@@ -72,25 +86,35 @@ OPTION_STRIKE_WINDOW = 500.0  # points either side of spot
 
 # As of Brief 4, all 7 of SignalEngine.evaluate()'s inputs are wired to a
 # real computation -- but that does not mean all 7 have real DATA on every
-# day. Two independent gaps remain, both explicit/logged, never fabricated:
+# day. As of Brief 5, `volume` and `option` also have a real live DATA path
+# (see module docstring); `global_score`/`news` remain wiring over
+# still-empty real data, both explicit/logged, never fabricated:
 KNOWN_GAPS = (
-    "option",  # _option_score requires a *previous* option-chain OI snapshot
-    #             (intelligence/oi_buildup.py::detect_buildup needs two
-    #             snapshots to detect a change). No live source persists a
-    #             prior snapshot yet -- build_live_context always passes
-    #             previous_option_quotes=[], so this stays 0.0/"UNAVAILABLE"
-    #             until that's built. Wiring is real and tested; the specific
-    #             data feed for "yesterday's closing OI" is not.
+    "option",  # _option_score is real whenever a previous option-chain
+    #             snapshot exists -- main.py's live path now persists and
+    #             retrieves one via storage.database.Database (Brief 5 Part
+    #             B). Still correctly 0.0/"UNAVAILABLE" the first time this
+    #             feature ever runs (no prior snapshot to retrieve yet), and
+    #             in backtest/daily_backtest.py unless real per-day option
+    #             chain data has actually been fetched for that window
+    #             (option_quotes_by_day) -- neither is a bug, both are the
+    #             same honest "no real data yet" state this system always
+    #             surfaces rather than fabricating.
     "global_score",  # _global_score correctly computes from whatever
     #                   context["global_context"] holds, but
     #                   data/global_market.py::GlobalMarketProvider.snapshot()
     #                   has no live provider implementation, and
     #                   build_live_context always passes global_context=[] --
     #                   so this is real wiring over still-empty real data.
+    #                   Brief 5 researched real provider options (see the
+    #                   accompanying report's Part C) but deliberately did
+    #                   not pick one or wire it in.
     "news",  # same shape as global_score: _news_score is real, but
     #           build_live_context always passes news_items=[] since no live
     #           news source is wired -- see NewsAgent's own docstring, which
     #           already handles real news correctly whenever it's supplied.
+    #           Same Brief 5 Part C research-not-wired treatment as
+    #           global_score.
 )
 
 
@@ -209,6 +233,68 @@ def _volume_score(candles: pd.DataFrame, today: date, opening_minutes: int) -> f
     return max(0.0, min(100.0, ratio * 50.0))
 
 
+def _option_volume_score(
+    option_quotes: list[OptionQuote], previous_option_quotes: list[OptionQuote]
+) -> float:
+    """Real option-contract volume (OptionQuote.volume, already fetched
+    live in fetch_option_quotes) compared to the same real total from the
+    prior real snapshot (see Part B: persisted via
+    storage.database.Database.save_option_chain_snapshot), using the same
+    ratio*50-capped-at-100 shape as _volume_score -- "about average"
+    participation reads 50, real above/below-average reads higher/lower.
+    Not a like-for-like strike match (today's near-ATM universe shifts
+    with spot) -- an aggregate real-participation proxy across the fetched
+    near-ATM/near-week universe on both sides, same spirit as _volume_score
+    comparing aggregate opening-range volume day over day rather than
+    matching individual candles.
+
+    Returns 0.0 -- not a fabricated "average" -- when there's no current
+    quote, no previous snapshot, or every volume field on one side is
+    genuinely null (not yet confirmed against a real live option response,
+    per last week's honest disclosure): a null volume field is
+    "unavailable," never silently treated as zero participation.
+    """
+    if not option_quotes or not previous_option_quotes:
+        return 0.0
+    today_values = [q.volume for q in option_quotes if q.volume is not None]
+    prior_values = [q.volume for q in previous_option_quotes if q.volume is not None]
+    if not today_values or not prior_values:
+        return 0.0
+    prior_total = float(sum(prior_values))
+    if prior_total <= 0:
+        return 0.0
+    ratio = float(sum(today_values)) / prior_total
+    return max(0.0, min(100.0, ratio * 50.0))
+
+
+def _combined_volume_score(
+    candles: pd.DataFrame,
+    today: date,
+    opening_minutes: int,
+    option_quotes: list[OptionQuote],
+    previous_option_quotes: list[OptionQuote],
+) -> tuple[float, str]:
+    """Prefers real option-contract volume over index candle volume as
+    SignalEngine's `volume` input: NIFTY 50 index candle volume from Kite
+    is structurally always 0 (confirmed against the real 42-day captured
+    dataset and the real live index quote fixtures elsewhere in this
+    codebase -- an index has no traded volume of its own, only its
+    constituents and derivatives do), so _volume_score alone can never
+    move on real NIFTY index data. Real option-contract volume is real
+    participation data for the actual tradeable instrument. Falls back to
+    the index-candle score only when no option-volume comparison is yet
+    possible (no current option quotes, or no previous snapshot yet --
+    e.g. the very first day this feature runs) -- kept as the general
+    mechanism rather than deleted, since it is real and correct for any
+    future instrument whose own candle volume isn't structurally zero.
+    """
+    option_score = _option_volume_score(option_quotes, previous_option_quotes)
+    if option_quotes and previous_option_quotes:
+        return option_score, "option_contract_volume"
+    index_score = _volume_score(candles, today, opening_minutes)
+    return index_score, "index_candle_volume(no_prior_option_snapshot)"
+
+
 def _option_score(
     option_quotes: list[OptionQuote],
     previous_option_quotes: list[OptionQuote],
@@ -322,7 +408,9 @@ def _add_candidate(
     volatility_ratio = features["atr"] / features["close"] if features["close"] else 0.0
     risk_penalty = 25.0 if volatility_ratio > 0.008 else 0.0
 
-    volume_score = _volume_score(candles, today, OPENING_RANGE_MINUTES)
+    volume_score, volume_reason = _combined_volume_score(
+        candles, today, OPENING_RANGE_MINUTES, option_quotes, previous_option_quotes
+    )
     option_score, option_reason = _option_score(option_quotes, previous_option_quotes, regime_direction)
     global_score, global_direction = _global_score(context, regime_direction)
     news_score, news_direction = _news_score(context, regime_direction)
@@ -347,11 +435,12 @@ def _add_candidate(
         # from "computed and turned out low."
         logger.info(
             "live_context_signal_below_threshold regime=%s confidence=%.1f threshold=%.1f "
-            "volume=%.1f option=%.1f(%s) global=%.1f(%s) news=%.1f(%s)",
+            "volume=%.1f(%s) option=%.1f(%s) global=%.1f(%s) news=%.1f(%s)",
             regime.value,
             signal.confidence,
             signal_threshold,
             volume_score,
+            volume_reason,
             option_score,
             option_reason,
             global_score,
@@ -383,7 +472,7 @@ def _add_candidate(
         f"regime={regime.value} implies {regime_direction}",
         f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}",
         (
-            f"volume={volume_score:.1f}, option={option_score:.1f} ({option_reason}), "
+            f"volume={volume_score:.1f} ({volume_reason}), option={option_score:.1f} ({option_reason}), "
             f"global={global_score:.1f} ({global_direction}), news={news_score:.1f} ({news_direction})"
         ),
         f"SignalEngine confidence={signal.confidence:.1f} (threshold {signal_threshold})",
@@ -406,12 +495,13 @@ def assemble_context(
     twice, and not a place a backtest-only shortcut could quietly diverge
     from what actually runs live.
 
-    previous_option_quotes defaults to [] (not fabricated) -- no live
-    source persists a prior option-chain snapshot yet (KNOWN_GAPS), so
-    _option_score correctly reads this as "unavailable" rather than a
-    real absence of buildup. A caller that does have a real prior
-    snapshot (e.g. a future backtest fed real day-over-day option data)
-    can pass it here and OI-buildup scoring becomes real for that day.
+    previous_option_quotes defaults to [] (not fabricated) when a caller
+    doesn't have one -- _option_score/_option_volume_score correctly read
+    this as "unavailable" rather than a real absence of buildup/volume
+    change. As of Brief 5, build_live_context's own live callers (main.py)
+    supply a real one, retrieved from storage.database.Database's
+    persisted snapshot (Part B); daily_backtest.py supplies the prior
+    trading day's option_quotes_by_day entry when one exists.
     """
     previous_option_quotes = previous_option_quotes or []
     context: dict[str, Any] = {
@@ -437,8 +527,19 @@ def assemble_context(
 
 
 def build_live_context(
-    settings: Settings, kite: object, calendar: NseCalendar, now: datetime | None = None
+    settings: Settings,
+    kite: object,
+    calendar: NseCalendar,
+    now: datetime | None = None,
+    previous_option_quotes: list[OptionQuote] | None = None,
 ) -> dict[str, Any]:
+    """previous_option_quotes: the real prior-session option chain, when
+    the caller has one (main.py retrieves it from
+    storage.database.Database.latest_option_chain_snapshot before calling
+    this -- Brief 5 Part B). Defaults to None/[] so this function stays
+    usable and correctly fail-closed on its own, e.g. in tests that don't
+    care about OI-buildup scoring.
+    """
     now = now or datetime.now(IST)
     market_open = calendar.is_market_open(now)
     not_fresh: dict[str, Any] = {
@@ -471,4 +572,6 @@ def build_live_context(
     universe = _select_option_universe(instruments, quote.ltp, now.date())
     option_quotes = fetch_option_quotes(kite, universe) if universe else []
 
-    return assemble_context(candles, option_quotes, quote.ltp, now, market_open, settings)
+    return assemble_context(
+        candles, option_quotes, quote.ltp, now, market_open, settings, previous_option_quotes
+    )

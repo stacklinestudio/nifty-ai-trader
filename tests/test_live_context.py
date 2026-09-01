@@ -13,15 +13,18 @@ from data.option_chain import OptionQuote
 from execution.live_context import (
     NIFTY_INDEX_TOKEN,
     OPENING_RANGE_MINUTES,
+    _combined_volume_score,
     _global_score,
     _news_score,
     _option_score,
+    _option_volume_score,
     _select_option_universe,
     _volume_score,
     assemble_context,
     build_live_context,
     fetch_option_quotes,
 )
+from storage.database import Database
 
 
 class FakeKite:
@@ -333,9 +336,17 @@ def test_volume_score_is_zero_not_fabricated_when_no_prior_day_exists():
     assert _volume_score(candles, today, OPENING_RANGE_MINUTES) == 0.0
 
 
-def _option_quote(symbol: str, strike: float, option_type: str, open_interest: int) -> OptionQuote:
+def _option_quote(
+    symbol: str, strike: float, option_type: str, open_interest: int, volume: int | None = None
+) -> OptionQuote:
     instrument = OptionInstrument(symbol, strike, date(2026, 9, 1), option_type, 65)
-    return OptionQuote(instrument, 100.0, datetime(2026, 9, 1, 9, 30, tzinfo=IST), open_interest=open_interest)
+    return OptionQuote(
+        instrument,
+        100.0,
+        datetime(2026, 9, 1, 9, 30, tzinfo=IST),
+        open_interest=open_interest,
+        volume=volume,
+    )
 
 
 def test_option_score_rewards_real_oi_buildup_aligned_with_the_candidate_direction():
@@ -424,10 +435,10 @@ def test_assemble_context_option_score_becomes_real_once_a_previous_snapshot_is_
     """End-to-end proof through the real public entry point (not just the
     private helper): the same clear-breakout scenario as the module-level
     tests above, but this time a real previous option-chain snapshot with
-    genuine call-side OI buildup is supplied -- confidence should move up
-    over the no-snapshot case, though not necessarily enough to clear the
-    default threshold by itself (global/news remain genuinely unavailable
-    on this fixture)."""
+    genuine call-side OI buildup AND genuine higher option-contract volume
+    is supplied -- confidence should move up over the no-snapshot case,
+    though not necessarily enough to clear the default threshold by itself
+    (global/news remain genuinely unavailable on this fixture)."""
     now = datetime(2026, 9, 1, 9, 30, tzinfo=IST)
     prior_day = date(2026, 8, 31)
     today = date(2026, 9, 1)
@@ -436,8 +447,8 @@ def test_assemble_context_option_score_becomes_real_once_a_previous_snapshot_is_
     breakout_up = minute_bars(today, 9, 20, 10, 24080.0, 5.0)
     candles = _candles_with_volume(prior_rows + opening_flat + breakout_up)
 
-    current_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000)]
-    previous_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 5000)]
+    current_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000, volume=20000)]
+    previous_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 5000, volume=5000)]
     # Low enough threshold that a candidate forms either way -- this test
     # is about whether the real option score moves confidence, not about
     # threshold behavior (already covered above).
@@ -458,3 +469,119 @@ def test_assemble_context_option_score_becomes_real_once_a_previous_snapshot_is_
     with_evidence = " ".join(with_snapshot["candidate_evidence"])
     assert "option=0.0" in without_evidence and "No prior snapshot" in without_evidence
     assert "option=75.0" in with_evidence and "Call Buildup" in with_evidence
+    # volume itself also switches source: no previous snapshot means the
+    # (structurally-zero-for-NIFTY) index candle fallback; a real previous
+    # snapshot means real option-contract volume, here a real 4x increase.
+    assert "index_candle_volume" in without_evidence
+    assert "volume=100.0 (option_contract_volume)" in with_evidence
+
+
+def test_option_volume_score_reflects_real_above_average_option_contract_volume():
+    previous = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=4000),
+        _option_quote("NIFTY2690124000CE", 24000.0, "CE", 10000, volume=2000),
+    ]
+    current = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=16000),
+        _option_quote("NIFTY2690124000CE", 24000.0, "CE", 10000, volume=8000),
+    ]  # real total 24000 vs prior real total 6000 -- 4x
+
+    score = _option_volume_score(current, previous)
+
+    assert score == 100.0  # capped, same shape as _volume_score
+
+
+def test_option_volume_score_reflects_real_below_average_option_contract_volume():
+    previous = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=10000)]
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=1000)]
+
+    score = _option_volume_score(current, previous)
+
+    assert 0.0 < score < 50.0
+
+
+def test_option_volume_score_is_zero_not_fabricated_without_a_previous_snapshot():
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=16000)]
+
+    assert _option_volume_score(current, previous_option_quotes=[]) == 0.0
+
+
+def test_option_volume_score_is_zero_not_fabricated_when_volume_field_is_genuinely_null():
+    """Per last week's honest disclosure, the real live option-quote
+    `volume` field is not yet confirmed against a real Kite response --
+    this proves a quote with volume=None (the OptionQuote default) is
+    read as "unavailable," never silently treated as zero participation
+    that would otherwise still average into a real-looking ratio."""
+    previous = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000)]  # volume=None
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000)]  # volume=None
+
+    assert _option_volume_score(current, previous) == 0.0
+
+
+def test_combined_volume_score_prefers_real_option_volume_when_a_previous_snapshot_exists():
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    prior_rows = minute_bars(prior_day, 9, 15, 375, 24080.0, 0.0)  # 1000/min baseline
+    todays_rows = minute_bars(today, 9, 15, OPENING_RANGE_MINUTES + 1, 24080.0, 1.0)
+    candles = _candles_with_volume(prior_rows + todays_rows)  # index score would read 50.0 here
+    previous = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=5000)]
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=20000)]  # real 4x
+
+    score, reason = _combined_volume_score(candles, today, OPENING_RANGE_MINUTES, current, previous)
+
+    assert score == 100.0  # the real option-volume read, not the index fallback's 50.0
+    assert reason == "option_contract_volume"
+
+
+def test_combined_volume_score_falls_back_to_index_candle_volume_without_a_previous_snapshot():
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    prior_rows = minute_bars(prior_day, 9, 15, 375, 24080.0, 0.0)
+    todays_rows = minute_bars(today, 9, 15, OPENING_RANGE_MINUTES + 1, 24080.0, 1.0)
+    candles = _candles_with_volume(prior_rows + todays_rows)
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000, volume=20000)]
+
+    score, reason = _combined_volume_score(candles, today, OPENING_RANGE_MINUTES, current, [])
+
+    assert score == _volume_score(candles, today, OPENING_RANGE_MINUTES)
+    assert "index_candle_volume" in reason
+
+
+def test_two_real_cycles_through_the_database_reproduces_main_pys_context_provider_wiring(tmp_path):
+    """Exercises the exact sequence main.py's run_scheduled_day::
+    context_provider now runs (Brief 5 Part B): read the latest persisted
+    snapshot, build this cycle's context with it as previous_option_quotes,
+    then persist this cycle's own chain for the NEXT cycle. Doesn't call
+    run_scheduled_day itself (that blocks on the real wall clock waiting
+    for real market hours) -- this reproduces its actual database
+    read/build/write sequence directly against two real captured
+    option-chain shapes from _clear_breakout_fixture, one session apart."""
+    db = Database(tmp_path / "two_cycle.db")
+    db.initialize()
+    settings = Settings(signal_threshold=40.0)
+    calendar = NseCalendar()
+
+    # Cycle 1: nothing persisted yet -- correctly unavailable.
+    now1 = datetime(2026, 8, 31, 9, 30, tzinfo=IST)
+    kite1 = _clear_breakout_fixture(now1)
+    previous = db.latest_option_chain_snapshot()
+    assert previous == []
+    context1 = build_live_context(settings, kite1, calendar, now1, previous_option_quotes=previous)
+    assert "option=0.0" in " ".join(context1.get("candidate_evidence", []))
+    db.save_option_chain_snapshot(now1, context1["option_quotes"])
+
+    # Cycle 2 (next real session): the database now hands back cycle
+    # 1's real chain as this cycle's previous_option_quotes.
+    now2 = datetime(2026, 9, 1, 9, 30, tzinfo=IST)
+    kite2 = _clear_breakout_fixture(now2)
+    previous = db.latest_option_chain_snapshot()
+    assert previous == context1["option_quotes"]
+    context2 = build_live_context(settings, kite2, calendar, now2, previous_option_quotes=previous)
+
+    assert context2["previous_option_quotes"] == context1["option_quotes"]
+    # Same OI/volume both cycles here (identical fixture) -- real
+    # buildup detection correctly reads BALANCED (no net change), not
+    # UNAVAILABLE anymore, proving cycle 2 really did receive cycle 1's
+    # real data rather than an empty default.
+    assert "option=" in " ".join(context2.get("candidate_evidence", []))
+    assert "No prior snapshot" not in " ".join(context2.get("candidate_evidence", []))
