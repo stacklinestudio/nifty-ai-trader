@@ -28,6 +28,7 @@ from config import IST, Settings
 from data.calendar import NseCalendar
 from data.historical import validate_candles
 from data.market_data import KiteMarketData, validate_quote
+from execution.live_context import build_live_context
 from execution.process_lock import AlreadyRunningError, ProcessLock
 from execution.scheduler import resume_open_positions, run_trading_day
 from integrations.discord import CATEGORIES, DiscordNotifier, webhooks_by_category_from_settings
@@ -57,19 +58,42 @@ def load(path: str) -> pd.DataFrame:
     return validate_candles(frame)
 
 
-def build_live_quote_source(settings: Settings, symbol: str):
-    """Returns a real Kite-backed quote source when credentials exist,
-    otherwise a source that always reports unavailable -- never fabricated.
-    """
+def build_kite_session(settings: Settings) -> object | None:
+    """Returns an authenticated KiteConnect session when credentials and the
+    kiteconnect package are both available, else None -- callers must treat
+    None as "no live data," never fabricate a session. Shared by
+    context_provider and quote_source in run_scheduled_day so a real day
+    uses one session, not two independently-constructed ones."""
     if not (settings.kite_api_key and settings.kite_access_token):
-        return lambda: None
+        return None
     try:
         from kiteconnect import KiteConnect
     except ImportError:
-        logger.warning("kiteconnect_not_installed; quote source falling back to unavailable")
-        return lambda: None
+        logger.warning("kiteconnect_not_installed; live data unavailable")
+        return None
     kite = KiteConnect(api_key=settings.kite_api_key)
     kite.set_access_token(settings.kite_access_token)
+    return kite
+
+
+def build_live_quote_source(settings: Settings, symbol: str, kite: object | None = None):
+    """Returns a real Kite-backed quote source when a session is available
+    (built fresh if `kite` isn't supplied), otherwise a source that always
+    reports unavailable -- never fabricated.
+
+    KNOWN GAP, not fixed by this call: run_scheduled_day always builds this
+    for the literal symbol "NIFTY" (the index), including for supervising
+    an already-open or resumed position -- but a real open position's
+    instrument is an OPTION contract (e.g. "NFO:NIFTY2690124200CE"), not
+    the index. Supervision would be checking the wrong symbol's price.
+    Flagged in run_scheduled_day's docstring and the accompanying report;
+    not fixed in this pass since it needs execution/scheduler.py's
+    quote_source to become per-position rather than fixed at day start,
+    a separate change from the entry-context assembly this pass built.
+    """
+    kite = kite if kite is not None else build_kite_session(settings)
+    if kite is None:
+        return lambda: None
     market_data = KiteMarketData(kite)
 
     def live_quote() -> float | None:
@@ -93,30 +117,46 @@ def run_scheduled_day(settings: Settings) -> dict:
     process staying resident for days -- this function runs exactly one
     trading day and returns.
 
-    Known gap: there is no live entry-context assembly pipeline in this
-    codebase yet (option chain + spot + technical features + global
-    market + news, combined into the dict run_cycle expects) -- that is a
-    separate, larger piece of work from the scheduler/crash-recovery gap
-    this brief asked to close. Without it, a real trading day correctly
-    produces "no_entry" (fails closed, matching the rest of this codebase's
-    philosophy) rather than fabricating a signal. The quote source used for
-    supervising any already-open or resumed position IS wired to a real
-    Kite session when credentials are configured.
+    The live entry-context assembly pipeline (execution/live_context.py)
+    is now wired in here -- context_provider builds real spot/candles/
+    technicals/option-chain context instead of an empty dict, when a Kite
+    session is available. Known, still-open gaps (see
+    execution/live_context.py::KNOWN_GAPS and the accompanying report for
+    the full honest list):
+    - SignalEngine's confidence formula is fed only 2 of 7 real sub-signals
+      right now, capping achievable confidence below the default
+      signal_threshold -- candidates will rarely form until more of
+      KNOWN_GAPS is wired to real data, or signal_threshold is
+      deliberately reconsidered (not silently changed here).
+    - build_live_quote_source is still called with the literal symbol
+      "NIFTY" for supervising any open/resumed position, not that
+      position's actual option instrument -- see its own docstring.
+    - fetch_option_quotes' `oi` field mapping is unconfirmed against a
+      real live option quote (only the index quote and instrument list
+      were captured live).
+    No credentials configured still correctly produces "no_entry" (fails
+    closed), same as before this pass.
     """
     database = Database(settings.database_path)
     database.initialize()
     orchestrator = Orchestrator(settings, database)
     calendar = NseCalendar()
-    quote_source = build_live_quote_source(settings, "NIFTY")
+    kite = build_kite_session(settings)
+    quote_source = build_live_quote_source(settings, "NIFTY", kite)
 
     def clock() -> datetime.datetime:
         return datetime.datetime.now(IST)
+
+    def context_provider() -> dict:
+        if kite is None:
+            return {}
+        return build_live_context(settings, kite, calendar, clock())
 
     resumed = resume_open_positions(orchestrator, quote_source, clock, time.sleep)
     day = run_trading_day(
         orchestrator,
         calendar,
-        context_provider=dict,
+        context_provider=context_provider,
         quote_source=quote_source,
         clock=clock,
         sleeper=time.sleep,
