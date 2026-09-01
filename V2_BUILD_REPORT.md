@@ -1276,3 +1276,216 @@ All checks passed!
 - **No CLI wrapper** was added for `run_daily_backtest` — it's called
   directly as a Python function in this report's evidence commands. Not
   requested; easy to add as a `main.py` subcommand later if wanted.
+
+# Brief 4 — Wire Remaining Real Signal Inputs (2026-09-01)
+
+Paper only, no path to live orders. `signal_threshold` (75) not touched
+this pass, per the brief's own ground rule.
+
+## Part A. Audit — corrects the brief's own premise
+
+Read `intelligence/signal_engine.py::SignalEngine.evaluate()` directly
+rather than trusting the prior summary ("2 of 7 real, 5th unconfirmed").
+The real, exact state before this brief:
+
+```python
+def evaluate(
+    self, timestamp, regime, technical, opening,
+    volume: float = 0, option: float = 0, global_score: float = 0,
+    news: float = 0, risk_penalty: float = 0,
+) -> Signal:
+    ...
+    confidence = max(0.0, min(100.0,
+        technical * 0.35 + opening * 0.25 + volume * 0.15 + option * 0.10
+        + (global_score + 100) * 0.05 + (news + 100) * 0.025 - risk_penalty * 0.125
+    ))
+```
+
+Exactly **7 inputs**. `execution/live_context.py::_add_candidate` (the only
+real caller) already fed real, computed values for **3** of them —
+`technical`, `opening`, **and `risk_penalty`** — not 2. Exactly **4** were
+hardcoded to `0.0`: `volume`, `option`, `global_score`, `news`. **There is
+no 5th hardcoded input** — the prior "unconfirmed 5th" does not exist in
+the code. This correction changes nothing about the work required (all 4
+real gaps still needed wiring), but the brief explicitly asked for the
+real count over the summary, so it's recorded here plainly.
+
+## Part B. Wired each hardcoded input to an already-built real source — DONE
+
+Commit `a27260f`. No new data plumbing beyond one optional parameter
+(`previous_option_quotes`) — every wired input reuses a source that
+already existed and already worked:
+
+| Input | Real source reused | New code |
+|---|---|---|
+| `volume` | Candle `volume` column already flowing through `KiteHistoricalData.candles()` — confirmed via `data/historical.py` and a prior session's real captured CSV columns (`open,high,low,close,volume`); nothing new fetched | `_volume_score`: today's opening-range volume vs. the average opening-range volume on prior days already in the same DataFrame |
+| `option` | `agents/trading_agents.py::OptionsAgent`'s own OI-buildup detection (`intelligence/oi_buildup.py::detect_buildup`) — confirmed by code read that `detect_buildup` doesn't require a `candidate` to exist, resolving the chicken-and-egg problem (`SignalEngine` itself decides the candidate) | `_option_score`: calls `detect_buildup` directly with the regime-implied direction (already computed earlier in `_add_candidate`) as the alignment reference |
+| `global_score` | `agents/research_agents.py::GlobalResearchAgent` — confirmed its output was computed but never reached `SignalEngine`; dead-ended in `assemble_context`'s always-empty `global_context: []` | `_global_score` + shared `_alignment_score` helper mapping BULLISH/BEARISH/NEUTRAL/UNKNOWN + confidence onto the signed −100..100 scale the formula's `(value + 100)` baseline expects |
+| `news` | `agents/research_agents.py::NewsAgent` — same shape as `global_score`; confirmed separate from `SignalHunterAgent`'s own existing ±5%-capped news nudge (that one only ever applies *after* a candidate exists — this is what lets news evidence affect whether one forms at all) | `_news_score`, same `_alignment_score` reuse |
+
+`_add_candidate`'s signature grew two parameters (`option_quotes`,
+`previous_option_quotes`); `assemble_context` grew one optional parameter
+(`previous_option_quotes: list[OptionQuote] | None = None`, defaulting to
+`[]`) so `build_live_context` and `daily_backtest.py` need no changes to
+keep working, while a caller that does have a real prior option-chain
+snapshot can pass one through and get real OI-buildup scoring.
+
+```
+$ pytest -q
+........................................................................ [ 43%]
+........................................................................ [ 86%]
+.......................                                                  [100%]
+167 passed in 5.73s
+$ ruff check .
+All checks passed!
+```
+
+## Part C. Fail-closed verification — DONE, each input tested for both real and genuinely-missing data
+
+11 new tests in `tests/test_live_context.py`, following the existing
+real-captured-shape pattern (`FakeKite`, `real_index_quote`,
+`real_instrument_row`), one pair per input plus one end-to-end
+`assemble_context` test proving the option-score wiring reaches
+`SignalEngine` through the real public entry point, not just the private
+helper:
+
+- `test_volume_score_reflects_real_above_average_opening_volume` /
+  `..._below_average_...` / `..._is_zero_not_fabricated_when_no_prior_day_exists`
+- `test_option_score_rewards_real_oi_buildup_aligned_with_the_candidate_direction` /
+  `..._penalizes_...contradicting_...` /
+  `..._is_unavailable_not_fabricated_without_a_previous_snapshot`
+- `test_global_score_reflects_real_bullish_context_aligned_with_the_candidate_direction` /
+  `..._is_zero_not_fabricated_when_context_unavailable`
+- `test_news_score_reflects_real_positive_sentiment_aligned_with_the_candidate_direction` /
+  `..._is_zero_not_fabricated_when_no_verified_items_available`
+- `test_assemble_context_option_score_becomes_real_once_a_previous_snapshot_is_passed_in`:
+  same clear-breakout scenario as the existing threshold tests, real
+  call-side OI buildup supplied via `previous_option_quotes` — confidence
+  measurably higher (`candidate_confidence` compared directly) than the
+  no-snapshot case, with the evidence trail showing `option=0.0` /
+  `"No prior snapshot..."` without it and `option=75.0` / `"Call Buildup"`
+  with it.
+
+Every "missing" case asserts an explicit `0.0` + a real reason string
+(`"UNKNOWN"`, `"No prior snapshot to compare OI change against."`), never
+a crash and never a silently-defaulted nonzero value. The existing
+threshold-sensitive tests (`test_build_live_context_at_default_threshold_...`,
+`test_build_live_context_produces_the_right_candidate_once_threshold_is_reachable`)
+were re-verified against the real new computations, not assumed — their
+outcomes were unchanged, and their docstrings were updated to state the
+real, current reason (all 7 inputs now real, but 3 of them still read
+0.0/neutral on that specific fixture because their real data is genuinely
+absent there), not the old inaccurate "only 2 of 7 wired" explanation.
+
+```
+$ pytest tests/test_live_context.py -q
+..................
+18 passed in 0.86s
+```
+
+## Part D. Re-ran the same 42-day backtest, `signal_threshold=75` unmodified — still zero trades, and now precisely explained why
+
+Same file, same driver, same default threshold as the prior real backtest
+report above (`data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`,
+`backtest/daily_backtest.py::run_daily_backtest`, fresh
+`data/private/daily_backtest_brief4.db`):
+
+```
+loaded rows: 15750, volume column unique values: [np.int64(0)]
+=== Brief 4 Part D: real default-threshold (75) re-run ===
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+confidence distribution: min=38.8 max=53.8 n=28 sample=[46.2, 46.2, 46.2, 46.2, 53.8, 46.2, 46.2, 46.2, 46.2, 38.8]
+```
+
+**Before vs. after, real numbers**:
+
+| | Before Brief 4 | After Brief 4 |
+|---|---|---|
+| Candidates formed | 0 | 0 |
+| Trades filled | 0 | 0 |
+| Confidence range | 38.8–53.8 | 38.8–53.8 (unchanged) |
+| Real inputs feeding `SignalEngine` | technical, opening, risk_penalty | technical, opening, risk_penalty, **and** volume/option/global/news are now real *computations*, all wired and independently tested (Part C) |
+
+**The confidence ceiling did not move on this specific dataset — a real,
+honest, non-failure finding, and now precisely explained rather than
+attributed to "unwired inputs"**:
+
+- **`volume` scored 0.0 on every single day** — not a bug in `_volume_score`
+  (proven real and working against controlled fixtures in Part C) but a
+  structural property of this real data: `data/private/nifty_index_minute_...csv`'s
+  `volume` column is **`[0]`** for all 15,750 real captured minute bars.
+  This matches `KiteMarketData`'s own real captured quote shape elsewhere
+  in this codebase (`"volume": 0` in the real index quote fixtures) — the
+  NIFTY 50 **index** itself carries no traded volume from Kite; only its
+  underlying constituent stocks or the derivative contracts do. Wiring
+  `volume` from index candles was correct reuse of already-flowing data,
+  but that data is structurally always zero for an index. A future pass
+  wanting a real nonzero volume signal would need per-stock or
+  per-contract volume, not index candle volume — a different, larger
+  scope, not attempted here.
+- **`option` scored 0.0/`"No prior snapshot..."` on every day** — expected
+  and documented: `daily_backtest.py` doesn't supply
+  `previous_option_quotes` (no per-day historical option-chain OI snapshot
+  was fetched for this window — same `historical_data()`-per-strike gap
+  noted in the prior backtest report's "what wasn't done"). The wiring
+  itself is real and proven (Part C's `test_assemble_context_option_score_...`
+  shows it moving `candidate_confidence` up when a real snapshot is
+  supplied) — this run simply has no snapshot to give it, which is the
+  honest, distinguishable-from-fabrication state the brief required.
+- **`global_score`/`news` scored 0.0/`"UNKNOWN"` on every day** — same
+  known, already-documented gap as before Brief 4: no live global-market
+  provider (`data/global_market.py::GlobalMarketProvider.snapshot()`
+  returns `[]`) and no live news source are wired into `build_live_context`.
+  `GlobalResearchAgent`/`NewsAgent` themselves are real and correctly
+  fail closed on empty input — proven in Part C — there is simply no live
+  feed calling them with real data yet.
+
+Regime detection (untouched by this brief) is identical to the prior real
+run, confirming nothing about the underlying data or classification
+changed:
+
+| Regime | Days |
+|---|---|
+| `TREND_UP` | 13 |
+| `UNCERTAIN` | 13 |
+| `TREND_DOWN` | 9 |
+| `GAP_DOWN` | 3 |
+| `GAP_UP` | 3 |
+
+Win rate / regime breakdown — still honestly nothing to report, same as
+before, confirmed not assumed:
+
+```
+$ python -c "... MemoryStore('data/private/daily_backtest_brief4.db').recent(memory_type='trade', limit=1000) ..."
+trade records in learning.memory: 0
+$ python -c "... pattern_memory.stats_for(store, 'OPENING_RANGE_BREAKOUT', 'TREND_UP') ..."
+PatternStats(setup_type='OPENING_RANGE_BREAKOUT', regime='TREND_UP', sample_size=0, win_rate=None, expectancy=None, low_confidence=True)
+```
+
+## What wasn't done (explicit, not silently skipped)
+
+- **A real nonzero volume signal** was not achieved — see Part D's honest
+  explanation: index candle volume from Kite is structurally always 0.
+  Getting a real, moving volume signal would require sourcing
+  per-instrument (stock or derivative) volume instead, a larger, separate
+  scope not requested or attempted here.
+- **No per-day historical option-chain OI snapshots** were fetched for the
+  42-day backtest window, so `option` scoring stayed at its honest
+  "unavailable" floor for the whole re-run even though the wiring itself
+  is real and independently proven (Part C). Same shape of gap as the
+  prior backtest report's own "what wasn't done" — each day would need
+  its own multi-strike `historical_data()` call across the ~1,000-point
+  spot range, not attempted in this pass.
+- **No live global-market or news provider** was built or wired into
+  `build_live_context` — `GlobalResearchAgent`/`NewsAgent` are real and
+  correctly consume whatever they're given (proven in Part C), but
+  nothing yet supplies them live data. This remains the same documented
+  gap as before Brief 4, just now precisely isolated to "no live feed,"
+  not "not wired to `SignalEngine`."
+- **`signal_threshold` was not touched**, per the brief's explicit ground
+  rule — this pass proves the wiring is real, not that the strategy
+  currently clears the live bar.
