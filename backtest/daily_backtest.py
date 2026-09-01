@@ -6,11 +6,15 @@ of real Kite data, instead of one live day.
 
 Not a faster or different cadence, and not a lowered signal_threshold: if
 this finds few or zero trades, that's the same honest reason the live
-system does (execution/live_context.py::KNOWN_GAPS -- SignalEngine gets
-real data for only 2 of 7 inputs), not a backtest-specific difference. A
-caller wanting to see what *would* fire without that gap should construct
-a second Orchestrator with a deliberately different Settings.signal_threshold
-and run this same function again -- never silently inside here.
+system would show (execution/live_context.py::KNOWN_GAPS -- as of Brief 4
+all 7 of SignalEngine's inputs are wired to real computations, but option
+buildup needs a previous option-chain snapshot this backtest doesn't
+supply either, and global/news have no live data source yet, so those
+three still read as 0.0/neutral on every day), not a backtest-specific
+difference. A caller wanting to see what *would* fire without that gap
+should construct a second Orchestrator with a deliberately different
+Settings.signal_threshold and run this same function again -- never
+silently inside here.
 
 No look-ahead: for each trading day, only candles strictly before that
 day, plus that day's own first few bars (modeling a process that starts

@@ -13,8 +13,20 @@ bars). Direction/confidence reuse intelligence/market_regime.py's classify
 intelligence/signal_engine.py's SignalEngine (already-tested multi-factor
 formula, not a new one invented here) -- fed real sub-scores where a real
 source exists, and explicit 0 (documented, not fabricated) where it
-doesn't yet: volume, options-flow, global market, news. See
-KNOWN_GAPS below and the accompanying report for the honest current state.
+doesn't yet. See KNOWN_GAPS below and the accompanying report for the
+honest current state.
+
+Brief 4 wired 4 of SignalEngine's 7 inputs that were previously hardcoded
+to 0.0 -- volume (real candle volume, already flowing through this same
+data, just never read), option (agents/trading_agents.py::OptionsAgent's
+already-built OI-buildup detection, reused via intelligence/oi_buildup.py
+directly since a candidate doesn't exist yet at this point in the
+pipeline), global_score and news (GlobalResearchAgent/NewsAgent reused
+directly for the same reason). technical/opening/risk_penalty were
+already real before this brief. Each newly-wired input still degrades to
+0.0 (logged, not fabricated) when its underlying real data is genuinely
+unavailable for a given day -- see each _*_score function's own
+docstring for exactly what "unavailable" means for that input.
 
 Fail-closed by construction, not by new logic: if the spot quote is
 missing/stale, market_data_fresh stays False, which the existing
@@ -33,6 +45,7 @@ from typing import Any
 
 import pandas as pd
 
+from agents.research_agents import GlobalResearchAgent, NewsAgent
 from config import IST, Settings
 from data.calendar import NseCalendar
 from data.historical import KiteHistoricalData
@@ -40,6 +53,7 @@ from data.instruments import OptionInstrument, download_kite_nifty_options
 from data.market_data import KiteMarketData, parse_kite_timestamp, validate_quote
 from data.option_chain import OptionQuote
 from intelligence.market_regime import Regime, classify
+from intelligence.oi_buildup import detect_buildup
 from intelligence.signal_engine import SignalEngine
 from intelligence.technicals import feature_frame
 from monitoring.logger import configure_logger
@@ -56,32 +70,28 @@ NIFTY_INDEX_SYMBOL = "NSE:NIFTY 50"
 OPENING_RANGE_MINUTES = 5
 OPTION_STRIKE_WINDOW = 500.0  # points either side of spot
 
-# Sub-scores fed into SignalEngine.evaluate() with no real live source yet.
-# Documented here, not silently defaulted, so a future reader (or a later
-# session) can see exactly what's still missing rather than needing to
-# re-derive it -- see the accompanying report for the same list.
+# As of Brief 4, all 7 of SignalEngine.evaluate()'s inputs are wired to a
+# real computation -- but that does not mean all 7 have real DATA on every
+# day. Two independent gaps remain, both explicit/logged, never fabricated:
 KNOWN_GAPS = (
-    "volume",  # no intraday volume-profile signal computed yet
-    "option",  # OI buildup (intelligence/oi_buildup.py) is wired as informational evidence
-    #            only (agents/trading_agents.py::OptionsAgent), not yet a SignalEngine input
-    "global_score",  # data/global_market.py::GlobalMarketProvider.snapshot() has no live
-    #                   provider implementation; FII/DII (data/fii_dii.py) has no live fetcher
-    "news",  # NewsAgent already handles real news directly when news_items is populated;
-    #           this context builder doesn't have a live news source to populate it with
+    "option",  # _option_score requires a *previous* option-chain OI snapshot
+    #             (intelligence/oi_buildup.py::detect_buildup needs two
+    #             snapshots to detect a change). No live source persists a
+    #             prior snapshot yet -- build_live_context always passes
+    #             previous_option_quotes=[], so this stays 0.0/"UNAVAILABLE"
+    #             until that's built. Wiring is real and tested; the specific
+    #             data feed for "yesterday's closing OI" is not.
+    "global_score",  # _global_score correctly computes from whatever
+    #                   context["global_context"] holds, but
+    #                   data/global_market.py::GlobalMarketProvider.snapshot()
+    #                   has no live provider implementation, and
+    #                   build_live_context always passes global_context=[] --
+    #                   so this is real wiring over still-empty real data.
+    "news",  # same shape as global_score: _news_score is real, but
+    #           build_live_context always passes news_items=[] since no live
+    #           news source is wired -- see NewsAgent's own docstring, which
+    #           already handles real news correctly whenever it's supplied.
 )
-
-# IMPORTANT, verified by test (tests/test_live_context.py): with only
-# "technical" and "opening" backed by real data and the four KNOWN_GAPS
-# above fixed at 0, SignalEngine.evaluate()'s formula caps achievable
-# confidence at roughly 54-59 (technical maxes at 75, opening at 100,
-# weighted 0.35/0.25, plus a ~7.5 baseline from the zeroed global/news
-# terms) -- this can NEVER cross the default signal_threshold (75), no
-# matter how clean the real breakout is. This is not a bug in the wiring;
-# SignalEngine's formula was designed assuming more live sub-signals than
-# are currently connected. Until more of KNOWN_GAPS is wired to real data,
-# or signal_threshold is deliberately lowered (a risk-relevant decision
-# needing explicit sign-off, not a silent change made here), candidates
-# will structurally almost never form even on a genuine breakout.
 
 
 def _select_option_universe(
@@ -168,11 +178,111 @@ def _gap_pct(candles: pd.DataFrame, today: date) -> float:
     return (float(todays.iloc[0].open) - prior_close) / prior_close
 
 
+def _volume_score(candles: pd.DataFrame, today: date, opening_minutes: int) -> float:
+    """Compares today's opening-range volume to the average opening-range
+    volume over the prior trading days already present in `candles` --
+    apples-to-apples (same time-of-day window each day), not "cumulative
+    volume so far," which would trivially grow through the day regardless
+    of real participation. 50.0 means "about average"; higher/lower is a
+    real read on unusually high/low early participation. Returns 0.0 (not
+    a guess) when there is no volume column or no full prior day to
+    compare against -- e.g. the first day of a backtest window.
+    """
+    if "volume" not in candles.columns:
+        return 0.0
+    todays = candles[candles.index.date == today]
+    prior_days = sorted({d for d in candles.index.date if d < today})
+    if not prior_days:
+        return 0.0
+    todays_volume = float(todays.iloc[:opening_minutes]["volume"].sum())
+    prior_volumes = [
+        float(candles[candles.index.date == day].iloc[:opening_minutes]["volume"].sum())
+        for day in prior_days
+        if len(candles[candles.index.date == day]) >= opening_minutes
+    ]
+    if not prior_volumes:
+        return 0.0
+    avg_prior_volume = sum(prior_volumes) / len(prior_volumes)
+    if avg_prior_volume <= 0:
+        return 0.0
+    ratio = todays_volume / avg_prior_volume
+    return max(0.0, min(100.0, ratio * 50.0))
+
+
+def _option_score(
+    option_quotes: list[OptionQuote],
+    previous_option_quotes: list[OptionQuote],
+    regime_direction: str,
+) -> tuple[float, str]:
+    """Reuses agents/trading_agents.py::OptionsAgent's own OI-buildup
+    detection (intelligence/oi_buildup.py::detect_buildup) directly --
+    OptionsAgent itself can't be called with a candidate here, since no
+    candidate exists yet at this point in the pipeline, but detect_buildup
+    doesn't need one. Real OI-change data when a previous snapshot is
+    available; explicit 0.0/"UNAVAILABLE" (not a guess) when it isn't --
+    see KNOWN_GAPS for why no live "previous snapshot" source exists yet.
+    """
+    buildup = detect_buildup(option_quotes, previous_option_quotes)
+    if buildup.bias == "UNAVAILABLE":
+        return 0.0, buildup.reasons[0]
+    if buildup.bias == "BALANCED":
+        return 40.0, buildup.reasons[0]
+    aligned = (buildup.bias == "CALL_BUILDUP" and regime_direction == "CALL") or (
+        buildup.bias == "PUT_BUILDUP" and regime_direction == "PUT"
+    )
+    return (75.0 if aligned else 20.0), buildup.reasons[0]
+
+
+def _alignment_score(direction: str, regime_direction: str, confidence: float) -> float:
+    """Maps a BULLISH/BEARISH/NEUTRAL/UNKNOWN direction + confidence into
+    the signed -100..100 value SignalEngine's global_score/news inputs
+    expect (its formula does `(value + 100) * weight`, so positive means
+    "supports this candidate's direction," negative means "contradicts
+    it" -- the same alignment concept SignalHunterAgent's own separate
+    news nudge already uses). NEUTRAL/UNKNOWN carries no directional
+    information, so it contributes exactly 0.0, never a guessed lean.
+    """
+    if direction == "BULLISH":
+        return confidence if regime_direction == "CALL" else -confidence
+    if direction == "BEARISH":
+        return confidence if regime_direction == "PUT" else -confidence
+    return 0.0
+
+
+def _global_score(context: dict[str, Any], regime_direction: str) -> tuple[float, str]:
+    """Reuses GlobalResearchAgent directly rather than reimplementing its
+    averaging logic. Real whenever context["global_context"] holds real
+    ContextValue entries; 0.0/"UNKNOWN" (GlobalResearchAgent's own,
+    unmodified fail-closed behavior) when it's empty -- currently always,
+    since no live global-market provider is wired (KNOWN_GAPS)."""
+    review = GlobalResearchAgent().run({"global_context": context.get("global_context", [])})
+    direction = review.data.get("global_direction", "UNKNOWN")
+    return _alignment_score(direction, regime_direction, review.confidence), direction
+
+
+def _news_score(context: dict[str, Any], regime_direction: str) -> tuple[float, str]:
+    """Reuses NewsAgent directly -- the same real sentiment classification
+    Brief 3 Part C already fixed (data.news.aggregate_sentiment), not a
+    second implementation. Real whenever context["news_items"] holds real
+    NewsItem entries; 0.0/"UNKNOWN" (NewsAgent's own fail-closed behavior)
+    when it's empty -- currently always, since no live news source is
+    wired here (KNOWN_GAPS). This is separate from SignalHunterAgent's own
+    ±5%-capped news nudge, which only ever applies after a candidate
+    already exists; this is what lets news evidence affect whether one
+    forms in the first place.
+    """
+    review = NewsAgent().run({"news_items": context.get("news_items", [])})
+    direction = review.data.get("direction", "UNKNOWN")
+    return _alignment_score(direction, regime_direction, review.confidence), direction
+
+
 def _add_candidate(
     context: dict[str, Any],
     candles: pd.DataFrame,
     features: dict[str, float],
     signal_threshold: float,
+    option_quotes: list[OptionQuote],
+    previous_option_quotes: list[OptionQuote],
 ) -> None:
     today = candles.index[-1].date()
     todays = candles[candles.index.date == today]
@@ -212,28 +322,42 @@ def _add_candidate(
     volatility_ratio = features["atr"] / features["close"] if features["close"] else 0.0
     risk_penalty = 25.0 if volatility_ratio > 0.008 else 0.0
 
+    volume_score = _volume_score(candles, today, OPENING_RANGE_MINUTES)
+    option_score, option_reason = _option_score(option_quotes, previous_option_quotes, regime_direction)
+    global_score, global_direction = _global_score(context, regime_direction)
+    news_score, news_direction = _news_score(context, regime_direction)
+
     signal = SignalEngine(threshold=signal_threshold).evaluate(
         timestamp=datetime.now(IST),
         regime=regime,
         technical=technical_score,
         opening=opening_score,
-        volume=0.0,
-        option=0.0,
-        global_score=0.0,
-        news=0.0,
+        volume=volume_score,
+        option=option_score,
+        global_score=global_score,
+        news=news_score,
         risk_penalty=risk_penalty,
     )
     if signal.direction not in {"CALL", "PUT"}:
-        # SignalEngine itself vetoed -- most likely below signal_threshold,
-        # since only technical+opening are backed by real data right now
-        # (volume/option/global/news are 0, a known gap -- see KNOWN_GAPS).
-        # Logged, not silent: this is a real computed signal that didn't
-        # clear the bar, not "nothing happened."
+        # SignalEngine itself vetoed -- a real computed signal that didn't
+        # clear signal_threshold, not "nothing happened." All 7 inputs are
+        # real computations as of Brief 4, though option/global/news may
+        # still be 0.0 on days their underlying real data is unavailable
+        # (see KNOWN_GAPS) -- logged explicitly so that's distinguishable
+        # from "computed and turned out low."
         logger.info(
-            "live_context_signal_below_threshold regime=%s confidence=%.1f threshold=%.1f",
+            "live_context_signal_below_threshold regime=%s confidence=%.1f threshold=%.1f "
+            "volume=%.1f option=%.1f(%s) global=%.1f(%s) news=%.1f(%s)",
             regime.value,
             signal.confidence,
             signal_threshold,
+            volume_score,
+            option_score,
+            option_reason,
+            global_score,
+            global_direction,
+            news_score,
+            news_direction,
         )
         return
 
@@ -258,6 +382,10 @@ def _add_candidate(
     context["candidate_evidence"] = [
         f"regime={regime.value} implies {regime_direction}",
         f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}",
+        (
+            f"volume={volume_score:.1f}, option={option_score:.1f} ({option_reason}), "
+            f"global={global_score:.1f} ({global_direction}), news={news_score:.1f} ({news_direction})"
+        ),
         f"SignalEngine confidence={signal.confidence:.1f} (threshold {signal_threshold})",
     ]
 
@@ -269,6 +397,7 @@ def assemble_context(
     now: datetime,
     market_open: bool,
     settings: Settings,
+    previous_option_quotes: list[OptionQuote] | None = None,
 ) -> dict[str, Any]:
     """Pure context assembly from already-fetched data -- no I/O, no Kite
     calls. Both build_live_context (fetches live) and
@@ -276,7 +405,15 @@ def assemble_context(
     logic is identical between live and backtest -- not reimplemented
     twice, and not a place a backtest-only shortcut could quietly diverge
     from what actually runs live.
+
+    previous_option_quotes defaults to [] (not fabricated) -- no live
+    source persists a prior option-chain snapshot yet (KNOWN_GAPS), so
+    _option_score correctly reads this as "unavailable" rather than a
+    real absence of buildup. A caller that does have a real prior
+    snapshot (e.g. a future backtest fed real day-over-day option data)
+    can pass it here and OI-buildup scoring becomes real for that day.
     """
+    previous_option_quotes = previous_option_quotes or []
     context: dict[str, Any] = {
         "market_open": market_open,
         "market_data_fresh": True,
@@ -285,6 +422,7 @@ def assemble_context(
         "spot": spot,
         "max_position_value": settings.max_position_value,
         "option_quotes": option_quotes,
+        "previous_option_quotes": previous_option_quotes,
     }
     if candles.empty:
         return context
@@ -292,7 +430,9 @@ def assemble_context(
     context["features"] = features
     context["atr"] = features["atr"]
     context["gap_pct"] = _gap_pct(candles, now.date())
-    _add_candidate(context, candles, features, settings.signal_threshold)
+    _add_candidate(
+        context, candles, features, settings.signal_threshold, option_quotes, previous_option_quotes
+    )
     return context
 
 

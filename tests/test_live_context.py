@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
+import pandas as pd
+
 from config import IST, Settings
 from data.calendar import NseCalendar
+from data.global_market import ContextValue
 from data.instruments import OptionInstrument
+from data.news import NewsItem
+from data.option_chain import OptionQuote
 from execution.live_context import (
     NIFTY_INDEX_TOKEN,
+    OPENING_RANGE_MINUTES,
+    _global_score,
+    _news_score,
+    _option_score,
     _select_option_universe,
+    _volume_score,
+    assemble_context,
     build_live_context,
     fetch_option_quotes,
 )
@@ -146,16 +157,19 @@ def _clear_breakout_fixture(now: datetime):
 
 
 def test_build_live_context_at_default_threshold_correctly_produces_no_candidate_even_on_a_clear_breakout():
-    """The honest, current-state behavior, not a bug: SignalEngine.evaluate()
-    is fed only 2 of its 7 inputs from real data (technical, opening) --
-    volume/option/global_score/news are all 0, a documented gap (KNOWN_GAPS
-    in execution/live_context.py). That structurally caps achievable
-    confidence around 54-59, which can never clear the default
-    signal_threshold (75) -- so even this clean, textbook upward breakout
-    correctly produces no candidate. Market data itself is still fresh and
-    real; the gate that blocks this is the same one that would block a
-    genuinely bad setup, just currently mis-calibrated for how few real
-    sub-signals are wired in yet.
+    """The honest, current-state behavior, not a bug: as of Brief 4, all 7
+    of SignalEngine.evaluate()'s inputs are real computations (technical,
+    opening, volume, option, global_score, news, risk_penalty) -- but
+    option/global_score/news still read as 0.0/neutral on THIS fixture
+    because their underlying real data genuinely isn't available here (no
+    previous option-chain snapshot, no live global/news source wired --
+    KNOWN_GAPS in execution/live_context.py), and volume (~50, "about
+    average") doesn't add enough by itself. Confidence lands around 61,
+    still short of the default signal_threshold (75) -- so even this
+    clean, textbook upward breakout correctly produces no candidate.
+    Market data itself is still fresh and real; the gate that blocks this
+    is the same one that would block a genuinely bad setup, just fed
+    partial real inputs on this particular fixture, not fabricated ones.
     """
     now = datetime(2026, 9, 1, 9, 30, tzinfo=IST)
     kite = _clear_breakout_fixture(now)
@@ -274,3 +288,173 @@ def test_fetch_option_quotes_parses_real_shaped_response_including_oi():
     assert quote.open_interest == 45000
     assert quote.timestamp.tzinfo is not None
     assert quote.bid == 120.0 and quote.ask == 121.0
+
+
+def _candles_with_volume(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows).set_index("date")
+
+
+def test_volume_score_reflects_real_above_average_opening_volume():
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    # Prior day's opening 5 minutes: 1000/min (average baseline). Today's
+    # opening 5 minutes: 3000/min -- 3x the real prior baseline, not a
+    # guessed "high" label.
+    prior_rows = minute_bars(prior_day, 9, 15, 375, 24080.0, 0.0)
+    todays_rows = minute_bars(today, 9, 15, OPENING_RANGE_MINUTES + 1, 24080.0, 1.0)
+    for row in todays_rows:
+        row["volume"] = 3000
+    candles = _candles_with_volume(prior_rows + todays_rows)
+
+    score = _volume_score(candles, today, OPENING_RANGE_MINUTES)
+
+    assert score == 100.0  # capped: 3x average maps to max, not fabricated headroom
+
+
+def test_volume_score_reflects_real_below_average_opening_volume():
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    prior_rows = minute_bars(prior_day, 9, 15, 375, 24080.0, 0.0)
+    todays_rows = minute_bars(today, 9, 15, OPENING_RANGE_MINUTES + 1, 24080.0, 1.0)
+    for row in todays_rows:
+        row["volume"] = 200  # 1/5th of the real prior baseline
+    candles = _candles_with_volume(prior_rows + todays_rows)
+
+    score = _volume_score(candles, today, OPENING_RANGE_MINUTES)
+
+    assert 0.0 < score < 50.0
+
+
+def test_volume_score_is_zero_not_fabricated_when_no_prior_day_exists():
+    today = date(2026, 9, 1)
+    todays_rows = minute_bars(today, 9, 15, OPENING_RANGE_MINUTES + 1, 24080.0, 1.0)
+    candles = _candles_with_volume(todays_rows)
+
+    assert _volume_score(candles, today, OPENING_RANGE_MINUTES) == 0.0
+
+
+def _option_quote(symbol: str, strike: float, option_type: str, open_interest: int) -> OptionQuote:
+    instrument = OptionInstrument(symbol, strike, date(2026, 9, 1), option_type, 65)
+    return OptionQuote(instrument, 100.0, datetime(2026, 9, 1, 9, 30, tzinfo=IST), open_interest=open_interest)
+
+
+def test_option_score_rewards_real_oi_buildup_aligned_with_the_candidate_direction():
+    previous = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000),
+        _option_quote("NIFTY2690124200PE", 24200.0, "PE", 10000),
+    ]
+    current = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000),  # +30000 call OI
+        _option_quote("NIFTY2690124200PE", 24200.0, "PE", 10500),  # +500 put OI
+    ]
+
+    score, reason = _option_score(current, previous, regime_direction="CALL")
+
+    assert score == 75.0  # call buildup aligned with a CALL candidate
+    assert "Call Buildup" in reason
+
+
+def test_option_score_penalizes_real_oi_buildup_contradicting_the_candidate_direction():
+    previous = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 10000),
+        _option_quote("NIFTY2690124200PE", 24200.0, "PE", 10000),
+    ]
+    current = [
+        _option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000),  # call buildup...
+        _option_quote("NIFTY2690124200PE", 24200.0, "PE", 10500),
+    ]
+
+    score, reason = _option_score(current, previous, regime_direction="PUT")  # ...but candidate is PUT
+
+    assert score == 20.0
+    assert "Call Buildup" in reason
+
+
+def test_option_score_is_unavailable_not_fabricated_without_a_previous_snapshot():
+    current = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000)]
+
+    score, reason = _option_score(current, previous_option_quotes=[], regime_direction="CALL")
+
+    assert score == 0.0
+    assert reason == "No prior snapshot to compare OI change against."
+
+
+def test_global_score_reflects_real_bullish_context_aligned_with_the_candidate_direction():
+    context = {
+        "global_context": [
+            ContextValue("SGX_NIFTY", 40.0, datetime(2026, 9, 1, 8, 30, tzinfo=IST), "sgx", True),
+            ContextValue("SP500", 20.0, datetime(2026, 9, 1, 8, 30, tzinfo=IST), "sp500", True),
+        ]
+    }
+
+    score, direction = _global_score(context, regime_direction="CALL")
+
+    assert direction == "BULLISH"
+    assert score > 0  # aligned with the CALL candidate -- positive per SignalEngine's +100 baseline
+
+
+def test_global_score_is_zero_not_fabricated_when_context_unavailable():
+    score, direction = _global_score({"global_context": []}, regime_direction="CALL")
+
+    assert score == 0.0
+    assert direction == "UNKNOWN"
+
+
+def test_news_score_reflects_real_positive_sentiment_aligned_with_the_candidate_direction():
+    context = {
+        "news_items": [
+            NewsItem(datetime(2026, 9, 1, 8, 0, tzinfo=IST), "Strong GDP print", "reuters", 1.0, "POSITIVE", 35.0),
+        ]
+    }
+
+    score, direction = _news_score(context, regime_direction="CALL")
+
+    assert direction == "BULLISH"
+    assert score > 0
+
+
+def test_news_score_is_zero_not_fabricated_when_no_verified_items_available():
+    score, direction = _news_score({"news_items": []}, regime_direction="CALL")
+
+    assert score == 0.0
+    assert direction == "UNKNOWN"
+
+
+def test_assemble_context_option_score_becomes_real_once_a_previous_snapshot_is_passed_in():
+    """End-to-end proof through the real public entry point (not just the
+    private helper): the same clear-breakout scenario as the module-level
+    tests above, but this time a real previous option-chain snapshot with
+    genuine call-side OI buildup is supplied -- confidence should move up
+    over the no-snapshot case, though not necessarily enough to clear the
+    default threshold by itself (global/news remain genuinely unavailable
+    on this fixture)."""
+    now = datetime(2026, 9, 1, 9, 30, tzinfo=IST)
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    prior_rows = full_prior_day(prior_day, 24080.4)
+    opening_flat = minute_bars(today, 9, 15, 5, 24080.0, 0.0)
+    breakout_up = minute_bars(today, 9, 20, 10, 24080.0, 5.0)
+    candles = _candles_with_volume(prior_rows + opening_flat + breakout_up)
+
+    current_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 40000)]
+    previous_quotes = [_option_quote("NIFTY2690124200CE", 24200.0, "CE", 5000)]
+    # Low enough threshold that a candidate forms either way -- this test
+    # is about whether the real option score moves confidence, not about
+    # threshold behavior (already covered above).
+    settings = Settings(signal_threshold=40.0)
+
+    without_snapshot = assemble_context(candles, current_quotes, 24080.4, now, True, settings)
+    with_snapshot = assemble_context(
+        candles, current_quotes, 24080.4, now, True, settings, previous_option_quotes=previous_quotes
+    )
+
+    assert without_snapshot["previous_option_quotes"] == []
+    assert with_snapshot["previous_option_quotes"] == previous_quotes
+    assert "candidate_direction" in without_snapshot and "candidate_direction" in with_snapshot
+    # Real call-side OI buildup aligned with the CALL candidate should push
+    # confidence above the no-snapshot (option=0.0/UNAVAILABLE) case.
+    assert with_snapshot["candidate_confidence"] > without_snapshot["candidate_confidence"]
+    without_evidence = " ".join(without_snapshot["candidate_evidence"])
+    with_evidence = " ".join(with_snapshot["candidate_evidence"])
+    assert "option=0.0" in without_evidence and "No prior snapshot" in without_evidence
+    assert "option=75.0" in with_evidence and "Call Buildup" in with_evidence
