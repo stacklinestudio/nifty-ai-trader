@@ -1115,3 +1115,164 @@ having `FakeKite` always stamp with `datetime.now(IST)`, documented in the
 fixture's own docstring. **Recommend checking the "system" Discord channel
 and clearing any spam if needed** — not something this session can do on
 your behalf.
+
+---
+
+# Real Historical Backtest Over a Real Kite Window (2026-09-01)
+
+## 1. How far back does real option premium history actually go? — Checked, real answer
+
+Empirically tested against the real Kite API (fresh login, single-use
+request token exchanged, then everything below done in as few calls as
+practical):
+
+- **Index/spot**: real daily candles go back to at least **2023-08-28**
+  (748 daily rows fetched for a 3-year window) — deep history, as expected.
+- **Options — the real, somewhat surprising finding**: the currently-listed
+  near-week NIFTY option (`NIFTY2690124100CE`, strike 24100, expiry
+  2026-09-01) has real `historical_data()` coverage back to
+  **2026-07-22** — 30 real daily bars, 11,308 real minute bars. That's
+  **~41 calendar days / ~30 trading days** of real premium history for one
+  specific, currently-active contract, which is considerably more than the
+  "a few weeks at most for a weekly option" a naive assumption would
+  predict. No full explanation for *why* Kite retains this much history for
+  a nominally-weekly contract is claimed here — only the observed fact,
+  reported plainly rather than rationalized.
+- **The real caveat this creates**: that data is for **one fixed strike**.
+  NIFTY spot moved from 23767 to 24774 over the same ~45-day window (a
+  ~1,000-point range) — a fixed strike is only realistically "near-ATM"
+  for a fraction of that window. A faithful multi-week backtest with real
+  near-ATM premiums *every day* would need historical data for multiple
+  strikes spanning that range, each its own `historical_data()` call. Not
+  fetched for this pass (see "What wasn't done" below) — the actual result
+  didn't end up needing it (see item 3).
+
+## 2. Ran the exact same entry pipeline over the real available window — DONE
+
+`backtest/daily_backtest.py::run_daily_backtest` (built and unit-tested
+with synthetic data before touching real data, commit `326b7be`) drove
+**42 real trading days** (2026-07-06 to 2026-09-01, 15,750 real minute
+bars, fetched live and saved to
+`data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`) through
+`Orchestrator.run_cycle` via `execution/live_context.py::assemble_context`
+— the identical function `build_live_context` calls live (extracted for
+exactly this reuse in commit `9f615eb`). Same `SignalEngine`, same regime
+classifier, same real default `Settings.signal_threshold` (75) for the
+real run. No look-ahead: each day only ever saw candles strictly before it
+plus that day's own first 6 bars.
+
+```
+$ python -c "... run_daily_backtest(Settings(), frame) ..."
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+```
+
+## 3. Zero real trades — for the same honest reason, confirmed on real data, not a verdict on strategy quality
+
+This morning's `live_context.py` work found `SignalEngine` gets real data
+for only 2 of its 7 inputs, capping achievable confidence around 54–59
+against a threshold of 75, using one synthetic breakout scenario. **This
+backtest confirms that finding directly on 41 real trading days**: regime
+was correctly detected every day (varying sensibly — `TREND_UP`,
+`TREND_DOWN`, `GAP_UP`, `GAP_DOWN` across different real days, not a
+constant), but confidence topped out at **38.8–53.8** on every single one —
+never once approaching 75. Zero is the correct, honest count given the
+system's actual current inputs; it says nothing about whether the
+opening-range-breakout logic itself is good or bad, because that logic
+was never actually tested against the risk/validation pipeline — it never
+got past the confidence gate.
+
+**Second, clearly-separate illustrative pass** (per item 3's explicit
+option), unambiguously labeled and never mixed into the numbers above: a
+*different* `Settings(signal_threshold=50.0)` (a real config knob, still
+not the live default) against a *different* database file
+(`data/private/daily_backtest_illustrative.db`):
+
+```
+=== ILLUSTRATIVE PASS (signal_threshold=50, NOT the real default of 75) ===
+trading days evaluated: 42
+candidates formed: 4
+trades filled: 0
+```
+
+Even generously lowering the threshold by 25 points, only **4 of 42 days**
+(~9.5%) would have formed a candidate — `2026-07-15` (BULLISH),
+`2026-07-30` (BULLISH), `2026-08-10` (BULLISH), `2026-08-11` (BEARISH).
+All four still show `trades filled: 0` because this illustrative pass
+deliberately didn't supply option data — the point was to show candidate
+*formation rate*, not to fabricate a P&L outcome for days where real
+near-ATM premium data wasn't fetched. **This illustrative count is not a
+win rate and must not be read as one** — it has no outcomes attached.
+
+## 4. Win rate / regime breakdown — honestly, there isn't one
+
+Zero trades were filled in the real run, so there is nothing to compute a
+win rate or a regime-by-regime performance breakdown from. Confirmed, not
+assumed:
+
+```
+$ python -c "... MemoryStore(db_path).recent(memory_type='trade', limit=1000) ..."
+trade records in learning.memory: 0
+$ python -c "... pattern_memory.stats_for(store, 'OPENING_RANGE_BREAKOUT', 'TREND_UP') ..."
+PatternStats(setup_type='OPENING_RANGE_BREAKOUT', regime='TREND_UP', sample_size=0, win_rate=None, expectancy=None, low_confidence=True)
+```
+
+`pattern_memory` — the already-built system, reused unmodified — correctly
+reports `sample_size=0, win_rate=None, low_confidence=True` rather than
+fabricating a number from nothing. This is the same low-sample-size
+protection built in Brief 3 Part C doing exactly its job here.
+
+**What *is* real and reportable**: the distribution of **detected regimes**
+across all 41 evaluable real trading days (this is regime detection on
+real data, explicitly *not* a win-rate breakdown, since no trade outcomes
+exist to break down):
+
+| Regime | Days |
+|---|---|
+| `TREND_UP` | 13 |
+| `UNCERTAIN` | 13 |
+| `TREND_DOWN` | 9 |
+| `GAP_DOWN` | 3 |
+| `GAP_UP` | 3 |
+
+## 5. Entirely separate from the live daily scheduler — confirmed
+
+```
+$ git diff 58a9dd8..HEAD --stat
+ backtest/daily_backtest.py   | 132 +++++++++++++++++++++++++++++++++++++++++++
+ execution/live_context.py    |  62 +++++++++++++-------
+ tests/test_daily_backtest.py |  90 +++++++++++++++++++++++++++++
+ 3 files changed, 265 insertions(+), 19 deletions(-)
+```
+
+`main.py` and `execution/scheduler.py` — the only files that drive
+`main.py run`'s real once-a-day behavior — are untouched by this work.
+`execution/live_context.py`'s change is an internal refactor only (`assemble_context`
+extracted for reuse); all 7 of its existing tests pass unchanged, confirming
+`build_live_context`'s live behavior is identical to before.
+
+```
+$ pytest -q   # commit 326b7be
+............................................................................
+............                                                          [100%]
+156 passed
+$ ruff check .
+All checks passed!
+```
+
+## What wasn't done (explicit, not silently skipped)
+
+- **Multi-strike real option history** was not fetched. Given the real
+  default-threshold result was 0 candidates and the illustrative pass's 4
+  candidate days weren't pursued into simulated fills (see item 3), there
+  was nothing that would have consumed it in this pass. Fetching a spread
+  of strikes to cover the full ~1,000-point spot range across the 42-day
+  window remains straightforward to do (each `historical_data()` call is
+  the same shape already proven working) if a future pass wants real,
+  simulated fills for the illustrative candidate days specifically.
+- **No CLI wrapper** was added for `run_daily_backtest` — it's called
+  directly as a Python function in this report's evidence commands. Not
+  requested; easy to add as a `main.py` subcommand later if wanted.
