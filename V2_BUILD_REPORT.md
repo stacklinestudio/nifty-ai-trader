@@ -1489,3 +1489,204 @@ PatternStats(setup_type='OPENING_RANGE_BREAKOUT', regime='TREND_UP', sample_size
 - **`signal_threshold` was not touched**, per the brief's explicit ground
   rule — this pass proves the wiring is real, not that the strategy
   currently clears the live bar.
+
+# Brief 5 — Real Volume/OI-Buildup, and Scoping Global/News (2026-09-02)
+
+Paper only. `signal_threshold` not touched. Commits `7e73765` (Part A/B
+code + tests).
+
+## Part A. Real option-contract volume — DONE
+
+`OptionQuote.volume` was already fetched live in `fetch_option_quotes`
+but never read by `SignalEngine`'s `volume` input, which only compared
+index candle volume — a real number, but **structurally always 0 for
+NIFTY 50 on Kite** (confirmed against all 15,750 real captured minute
+bars in `data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`:
+`volume column unique values: [0]`) — an index carries no traded volume
+of its own.
+
+**Decision (supplementing, with a stated preference)**: `_combined_volume_score`
+prefers real option-contract volume (`_option_volume_score`, comparing
+today's real total contract volume across the fetched near-ATM/near-week
+universe against the same real total from the previous session) and
+falls back to the original index-candle score (`_volume_score`, unchanged)
+only when no option-volume comparison is possible yet (no current quotes,
+or no previous snapshot yet — e.g. the very first day this feature runs).
+Reasoning: index candle volume can never move for NIFTY specifically, so
+making it primary would leave `volume` structurally frozen forever;
+keeping `_volume_score` as the fallback (rather than deleting it) keeps
+the mechanism correct for any future instrument whose own candle volume
+isn't structurally zero.
+
+**Fail-closed, verified**: a quote with `volume=None` (real Kite response
+shape unconfirmed for this field, per last week's honest disclosure) is
+excluded from the real sum rather than treated as zero participation; if
+every quote on one side is null, `_option_volume_score` returns an
+explicit `0.0`, same floor as "no data," never a fabricated ratio.
+
+```
+$ pytest tests/test_live_context.py -q
+.........................
+25 passed in 0.99s
+```
+
+7 new tests cover: real above/below-average option volume, no-previous-
+snapshot unavailability, genuinely-null-volume unavailability, and
+`_combined_volume_score`'s source selection (option-preferred vs.
+index-fallback) — see `test_option_volume_score_*` and
+`test_combined_volume_score_*` in `tests/test_live_context.py`.
+
+## Part B. Persisted option-chain snapshot for real OI-buildup — DONE
+
+`storage/database.py`'s `snapshots` table (`id, timestamp, source,
+payload`) existed in the schema with **no reader or writer anywhere** —
+confirmed by grep before writing anything new. Reused it rather than
+adding a table: `Database.save_option_chain_snapshot`/
+`latest_option_chain_snapshot`, serializing through new
+`data/option_chain.py::quotes_to_json`/`quotes_from_json` (round-trips
+every `OptionQuote`/`OptionInstrument` field, including a genuinely-null
+`volume`/`open_interest` staying `None`, not becoming a fabricated `0`).
+
+**Live wiring** (`main.py::run_scheduled_day`'s `context_provider`):
+reads `database.latest_option_chain_snapshot()` before each cycle, passes
+it to `build_live_context` as `previous_option_quotes` (new optional
+parameter, threaded straight to `assemble_context`), then persists that
+cycle's own `option_quotes` after — `save_option_chain_snapshot` no-ops
+on an empty list, so a day where no chain was fetched can't overwrite a
+real prior snapshot with an empty one. First cycle ever run: nothing
+persisted yet, correctly reads `[]`/"unavailable" — expected, not a bug.
+
+```
+$ pytest tests/test_option_chain_snapshot.py -q
+......
+6 passed in 0.70s
+```
+
+6 tests cover the JSON round-trip (including a null `volume` staying
+`None`), save/retrieve, empty-database "unavailable" not fabricated,
+latest-of-multiple-snapshots ordering, and the empty-save no-op. A 7th
+test (`test_two_real_cycles_through_the_database_reproduces_main_pys_
+context_provider_wiring` in `tests/test_live_context.py`) reproduces
+`main.py`'s exact read→build→write sequence across two simulated cycles
+using the real `_clear_breakout_fixture` option-chain shape — cycle 1
+correctly reads "unavailable," cycle 2 correctly receives cycle 1's real
+persisted chain and produces a real (non-"No prior snapshot") OI-buildup
+read.
+
+**`daily_backtest.py` (Part B.3's own question — answered)**: no SQLite
+persistence needed there. The whole `option_quotes_by_day` dict is
+already resident in memory for the entire backtest window (unlike live's
+fresh-process-per-day deployment, there's no process boundary to carry
+state across), so day N's real chain is threaded directly into day N+1's
+`assemble_context` call as `previous_option_quotes`. One real bug caught
+and fixed during this: the loop originally read `option_quotes_by_day`
+*after* the `insufficient_prior_history` skip-check, which meant day 1's
+real chain — every backtest's first day is always skipped for this reason
+— could never become day 2's baseline. Fixed by recording each day's own
+chain before any skip check. Verified with a monkeypatch spy on the real
+`assemble_context` call arguments (`tests/test_daily_backtest.py`):
+
+```
+$ pytest tests/test_daily_backtest.py -q
+......
+6 passed in 1.12s
+```
+
+## Real before/after on the 42-day backtest — unchanged, honestly explained
+
+Same file, same driver, same unmodified `signal_threshold=75`
+(`data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`, fresh
+`data/private/daily_backtest_brief5.db`):
+
+```
+=== Brief 5: real default-threshold (75) re-run, same 42-day CSV, no option_quotes_by_day supplied ===
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+confidence min/max/n: 38.8 53.8 28
+```
+
+**Identical to Brief 4's result, and correctly so, not a wiring failure**:
+this specific saved dataset has no per-day option-chain data at all (no
+multi-strike historical option fetch was ever done for this window — the
+same "what wasn't done" gap noted in both prior backtest reports). With
+no option quotes supplied to the backtest, `_combined_volume_score` falls
+back to the index score (still 0, structurally) and `_option_score` stays
+at "unavailable" on every single day — exactly the same real inputs as
+before Part A/B, so an unchanged result is the only honest outcome. Part
+A/B's real benefit is on the **live** path (`main.py`, which now
+genuinely persists and retrieves day-over-day option data) and is
+independently proven in isolation by Part A/B's own tests above, not by
+this specific historical window, which was never given the option data
+that would exercise it. A future backtest pass that actually fetches
+real per-day option-chain snapshots for this window (flagged as
+unfetched in both prior reports) would be a fair test of Part A/B's
+real-data impact; this pass, honestly, is not that test.
+
+## Part C. Global market data and news feed — researched, not wired
+
+Per the brief's explicit instruction, this is presented for a decision,
+not implemented. Real, current figures below (websearched 2026-09-02) —
+each provider's own current pricing page should be re-checked before
+any purchase, since terms and free-tier limits change.
+
+### Global market data (S&P 500, Nasdaq, Nikkei, Hang Seng, crude, gold, USD-INR)
+
+| Provider | Free tier | Coverage of the requested 7 symbols | Cost to go further |
+|---|---|---|---|
+| **Alpha Vantage** | 25 requests/day, 5/min | Forex (USD-INR) and several commodities (WTI/Brent crude documented free; gold's free-tier status unconfirmed) directly on the free key. A dedicated "Index Data" endpoint exists for 200+ global indices (S&P 500 confirmed reachable) but whether Nikkei/Hang Seng and full free-tier access are gated behind a premium key is **unconfirmed from documentation alone** — needs a real test call against a live key before relying on it. | Paid tiers exist; exact price for indices-inclusive tier not confirmed this pass. |
+| **Twelve Data** | 800 requests/day, 8/min — generous for "a handful of calls/day" | Free tier covers US equities/forex/crypto only; true index-level symbols (S&P 500, Nikkei, Hang Seng) and commodities require the paid **Grow plan**. Free tier would only get an *ETF proxy* (e.g. SPY for S&P 500), not the real index. | Grow plan **$29/month** — 55-377 req/min, no daily cap, real index/commodity access. Cleanest low-risk paid option for this specific symbol set. |
+| **Finnhub** | 60 requests/min, generous — but **free tier is personal/non-commercial only and US-exchanges only** | No global indices (Nikkei, Hang Seng) on the free tier at all. | Premium/Pro ~$100-$500+/month for global data — expensive relative to this project's actual call volume. |
+| **Financial Modeling Prep** | 250 requests/day | Free tier is explicitly **US-only**; international indices need a paid plan. | Starter ~$22/month for US fundamentals/forex/news; international-indices tier price not confirmed this pass. |
+| **yfinance (unofficial Yahoo Finance wrapper)** | Free, no formal quota | Full real coverage of all 7 requested symbols in one library (`^GSPC`, `^IXIC`, `^N225`, `^HSI`, `GC=F`, `CL=F`, `USDINR=X`) — the only option here with complete coverage at $0. | **Real risk, not a cost**: Yahoo's Terms of Service prohibit automated access without written permission (enforcement risk described as low for personal/research use, materially higher for anything commercial/customer-facing); the library wraps undocumented endpoints Yahoo can and does change without notice, and has had real outages/breaking changes. Described by multiple 2026 sources as fine for occasional/low-frequency lookups (which matches this project's actual "handful of calls per trading day" usage) but explicitly *not* reliable for continuous or high-frequency collection. |
+
+**Tradeoff, stated plainly, no pick made**: Twelve Data's Grow plan
+($29/month) is the only option surveyed that gives real, official, ToS-
+compliant access to the actual requested index/commodity symbols with a
+real support relationship — at a small fixed monthly cost. yfinance gives
+full coverage of the exact requested symbol set at $0 but carries a real
+ToS/reliability risk that must be accepted knowingly, not silently, if
+chosen — and V2's own "paper only, no path to live orders" framing may or
+may not be judged to meaningfully lower that risk; that's a judgment call
+for whoever approves it, not this pass. Alpha Vantage's free tier is the
+cheapest *if* its indices coverage turns out to be free-tier-accessible,
+but that specific fact needs verifying against a real key before being
+relied on — not assumed from marketing copy.
+
+### Real news feed (financial/market news relevant to NIFTY and Indian markets)
+
+| Provider | Free tier | Fit for this codebase | Cost to go further |
+|---|---|---|---|
+| **NewsAPI.org** | 100 queries/day | **Not viable even for this scale**: free tier explicitly forbids anything beyond localhost/non-production use, 24-hour article delay, no historical data beyond 1 month. | First commercial tier is **$449/month** — a steep, disproportionate jump for this project's actual usage. |
+| **GNews** | 100 requests/day, 12-hour delay, non-commercial only | Broad source coverage (80,000+ sources, 71 countries) but **no sentiment scoring** — `data/news.py::aggregate_sentiment` and `NewsAgent` expect each `NewsItem` to already carry a `POSITIVE/NEGATIVE/NEUTRAL` sentiment; GNews would require building a real sentiment classifier ourselves on top, a nontrivial separate task. | Essential tier €49.99/month; still no native sentiment. |
+| **Marketaux** | 100 requests/day, 3 articles/request, 5,000+ sources across 80+ countries, **includes tagged entities and market-relevant categorization** | Best functional fit surveyed: closest to directly filling `NewsItem`'s existing shape without a separate classifier being built first (exact sentiment-field availability on the free tier should be confirmed against a real key before committing, same caveat as everywhere else in this table). | Basic $29/month (2,500 req/day) if the free 100/day proves too tight. |
+| **Alpha Vantage NEWS_SENTIMENT** | Same 25 requests/day key as the market-data option above | Single-vendor convenience (one key for both global market data and news) — but the shared 25/day budget would be split across ~7 market symbols *and* news queries, likely too tight for both uses reliably at the free tier. | Same Alpha Vantage paid tiers as above. |
+| **Economic Times / Moneycontrol RSS feeds** | Free, official, no request quota (feeds refresh ~15 min) | The **only India/NIFTY-specific** source surveyed — most generic global news APIs skew heavily US/UK. Raw headlines only, no sentiment scoring — same "build our own classifier" cost as GNews. | $0, but real ongoing engineering cost to parse RSS + classify sentiment ourselves. |
+
+**Tradeoff, stated plainly, no pick made**: every option that's free and
+fits this project's scale (GNews, Marketaux, RSS feeds) lacks confirmed
+native sentiment scoring except possibly Marketaux (needs a real-key
+check) — meaning unless Marketaux's free tier really does include
+sentiment, wiring **any** of these into `NewsAgent` honestly also means
+building a real sentiment classifier as a second, separate piece of work,
+not just an API integration. NewsAPI.org is disqualified outright for
+this project's scale by its own free-tier ToS. RSS feeds are the most
+India-relevant and truly free but need the most additional engineering.
+
+## What wasn't done (explicit, not silently skipped)
+
+- **No global-market or news provider was picked or wired in** — Part C
+  is research only, per the brief's explicit instruction. `global_score`/
+  `news` remain real wiring over still-empty real data, unchanged from
+  Brief 4/5's KNOWN_GAPS.
+- **No real per-day option-chain data was fetched** for the 42-day
+  backtest window, so Part A/B's real benefit isn't visible in this
+  pass's before/after comparison — see that section's own honest
+  explanation above.
+- **Alpha Vantage's and Marketaux's free-tier coverage of specific
+  requested symbols/fields (global indices; sentiment field) was not
+  verified against a real live key this pass** — flagged explicitly in
+  both tables above rather than assumed from documentation/marketing
+  copy alone.
