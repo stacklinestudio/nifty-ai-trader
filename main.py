@@ -117,6 +117,17 @@ def run_scheduled_day(settings: Settings) -> dict:
     process staying resident for days -- this function runs exactly one
     trading day and returns.
 
+    As of Brief 6, run_trading_day periodically re-scans for a new entry
+    through the day (Settings.entry_scan_interval_seconds,
+    Settings.entry_scan_cutoff_time) instead of evaluating exactly once
+    near open -- so this can now open, supervise, and close more than one
+    position in a single day, up to Settings.max_trades_per_day, pausing
+    scanning while a position is open and resuming once it closes with
+    capacity remaining. context_provider is called once per scan, not
+    once per day -- each call also persists that scan's own option chain
+    (see below), so the "previous snapshot" OI-buildup scoring compares
+    against gets fresher through the day too, not just day over day.
+
     The live entry-context assembly pipeline (execution/live_context.py)
     is wired in here -- context_provider builds real spot/candles/
     technicals/option-chain context instead of an empty dict, when a Kite
@@ -189,6 +200,8 @@ def run_scheduled_day(settings: Settings) -> dict:
         "resumed_positions": len(resumed),
         "day_ran": day.ran,
         "day_reason": day.reason,
+        "scans": len(day.rounds),
+        "trades_today": sum(1 for r in day.rounds if r.cycle.order),
         "order": day.cycle.order if day.cycle else None,
     }
 

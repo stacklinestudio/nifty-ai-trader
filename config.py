@@ -63,6 +63,22 @@ class Settings:
     trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
     supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
     max_consecutive_tick_failures: int = int(os.getenv("MAX_CONSECUTIVE_TICK_FAILURES", "5"))
+    # Brief 6: periodic entry re-scanning. 240s (4 min) sits in the
+    # brief's own suggested 3-5 minute range -- comfortably inside Kite's
+    # documented 1 quote req/sec, 3 historical req/sec limits (enormous
+    # headroom at this cadence) and matches the timescale these setups
+    # actually develop on; deliberately not sub-minute (see
+    # execution/scheduler.py's run_trading_day docstring for the
+    # polling-vs-WebSocket tradeoff this pairs with).
+    entry_scan_interval_seconds: float = float(os.getenv("ENTRY_SCAN_INTERVAL_SECONDS", "240"))
+    # A full 15 minutes before forced_exit_time (15:15 default) so a fresh
+    # position never opens with no realistic time to develop before
+    # mandatory square-off. Only gates STARTING a new scan/entry -- an
+    # already-open position at this time is unaffected and still
+    # supervised through to forced_exit_time via run_supervised.
+    entry_scan_cutoff_time: time = field(
+        default_factory=lambda: time.fromisoformat(os.getenv("ENTRY_SCAN_CUTOFF_TIME", "15:00"))
+    )
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -93,6 +109,8 @@ class Settings:
         # actually presented and considered in that decision.
         if not 1 <= self.max_trades_per_day <= 4:
             raise ValueError("max_trades_per_day must be between 1 and 4")
+        if self.entry_scan_cutoff_time >= self.forced_exit_time:
+            raise ValueError("entry_scan_cutoff_time must be before forced_exit_time")
 
     @property
     def live_execution_allowed(self) -> bool:

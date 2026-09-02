@@ -84,6 +84,51 @@ NIFTY_INDEX_SYMBOL = "NSE:NIFTY 50"
 OPENING_RANGE_MINUTES = 5
 OPTION_STRIKE_WINDOW = 500.0  # points either side of spot
 
+# Brief 6 Part A: how long after the real session open an open-window
+# setup stays eligible -- distinct from OPENING_RANGE_MINUTES above, which
+# is how many bars *define* the opening range itself, not how long a
+# breakout of it stays a "fresh" signal. "Roughly the first 15-30 minutes"
+# per the brief; 30 chosen as the more permissive end so a real breakout
+# forming late in a slow opening range isn't cut off prematurely.
+OPEN_WINDOW_MINUTES = 30
+
+# Confirmed against strategy/regime_selector.py's own setup-type strings --
+# the only other place in this codebase that references setup_type by
+# name. NOT SignalHunterAgent: it has no setup-detection logic of its own,
+# it only *weights* whatever setup_type execution/live_context.py already
+# put in the candidate. As of Brief 6, `_add_candidate` below is still the
+# ONLY code that ever actually produces a setup_type, and it only ever
+# produces "OPENING_RANGE_BREAKOUT" -- the other 8 strings below are
+# recognized by regime_selector.py's weighting table but have no detection
+# logic anywhere in this codebase yet. Gating them here is forward
+# scaffolding for whichever gets implemented next, not evidence they're
+# active today.
+OPEN_WINDOW_SETUPS = frozenset(
+    {
+        "OPENING_RANGE_BREAKOUT",
+        "OPENING_RANGE_REJECTION",
+        "GAP_CONTINUATION",
+        "GAP_REVERSAL",
+    }
+)
+# Brief 6's own suggested "valid all day" list also named "volatility
+# expansion" as a setup type; no such setup_type string exists anywhere in
+# this codebase -- strategy/regime_selector.py instead has a *volatility_
+# regime* value "HIGH" it calls "high volatility expansion" internally, a
+# different concept (a market-state read, not a setup type). Not included
+# here since it isn't a real setup_type; VWAP_BREAKOUT/VWAP_REJECTION/
+# MOMENTUM_CONTINUATION/TREND_CONTINUATION/SUPPORT_RESISTANCE_REACTION are
+# real regime_selector.py setup-type strings and are listed.
+ALL_DAY_SETUPS = frozenset(
+    {
+        "VWAP_BREAKOUT",
+        "VWAP_REJECTION",
+        "MOMENTUM_CONTINUATION",
+        "TREND_CONTINUATION",
+        "SUPPORT_RESISTANCE_REACTION",
+    }
+)
+
 # As of Brief 4, all 7 of SignalEngine.evaluate()'s inputs are wired to a
 # real computation -- but that does not mean all 7 have real DATA on every
 # day. As of Brief 5, `volume` and `option` also have a real live DATA path
@@ -362,6 +407,21 @@ def _news_score(context: dict[str, Any], regime_direction: str) -> tuple[float, 
     return _alignment_score(direction, regime_direction, review.confidence), direction
 
 
+def _setup_eligible_now(setup_type: str, now: datetime, session_open: datetime) -> bool:
+    """Open-window setups (OPEN_WINDOW_SETUPS) are only eligible within
+    OPEN_WINDOW_MINUTES of the real session open -- Brief 6's periodic
+    re-scanning means this can now be checked hours after open, and
+    without this gate a stale opening range would keep re-reporting the
+    same old structure as if it were a fresh breakout every scan. All-day
+    setups, and any setup_type not recognized in either set, are eligible
+    on every scan -- the safer default for an unrecognized name is NOT to
+    silently block it.
+    """
+    if setup_type not in OPEN_WINDOW_SETUPS:
+        return True
+    return now <= session_open + timedelta(minutes=OPEN_WINDOW_MINUTES)
+
+
 def _add_candidate(
     context: dict[str, Any],
     candles: pd.DataFrame,
@@ -369,6 +429,7 @@ def _add_candidate(
     signal_threshold: float,
     option_quotes: list[OptionQuote],
     previous_option_quotes: list[OptionQuote],
+    now: datetime,
 ) -> None:
     today = candles.index[-1].date()
     todays = candles[candles.index.date == today]
@@ -388,6 +449,23 @@ def _add_candidate(
     )
     if regime_direction is None:
         return  # UNCERTAIN/RANGE/HIGH_VOLATILITY/LOW_VOLATILITY regime -- no directional bias to trade
+
+    session_open = todays.index[0].to_pydatetime()
+    if not _setup_eligible_now("OPENING_RANGE_BREAKOUT", now, session_open):
+        # Brief 6 Part A: a re-scan hours into the session must not detect
+        # a breakout of an opening range computed from that same fixed
+        # first-OPENING_RANGE_MINUTES-bars window and report it as a fresh
+        # signal -- this is exactly what periodic re-scanning (Part B)
+        # would otherwise do every single interval for the rest of the day.
+        logger.info(
+            "live_context_setup_outside_time_window setup_type=%s now=%s session_open=%s "
+            "window_minutes=%d",
+            "OPENING_RANGE_BREAKOUT",
+            now.isoformat(),
+            session_open.isoformat(),
+            OPEN_WINDOW_MINUTES,
+        )
+        return
 
     # opening score: reward a real ORB breakout confirming the same
     # direction the regime implies, penalize a contradicting breakout,
@@ -416,7 +494,12 @@ def _add_candidate(
     news_score, news_direction = _news_score(context, regime_direction)
 
     signal = SignalEngine(threshold=signal_threshold).evaluate(
-        timestamp=datetime.now(IST),
+        # The real `now` this scan is evaluating at, not a fresh wall-clock
+        # read -- matters once assemble_context can be called repeatedly
+        # through the day (Brief 6 Part B) or from a backtest's simulated
+        # clock; a second, independent time source here would silently
+        # diverge from both.
+        timestamp=now,
         regime=regime,
         technical=technical_score,
         opening=opening_score,
@@ -521,7 +604,7 @@ def assemble_context(
     context["atr"] = features["atr"]
     context["gap_pct"] = _gap_pct(candles, now.date())
     _add_candidate(
-        context, candles, features, settings.signal_threshold, option_quotes, previous_option_quotes
+        context, candles, features, settings.signal_threshold, option_quotes, previous_option_quotes, now
     )
     return context
 

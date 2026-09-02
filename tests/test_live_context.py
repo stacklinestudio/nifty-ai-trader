@@ -585,3 +585,72 @@ def test_two_real_cycles_through_the_database_reproduces_main_pys_context_provid
     # real data rather than an empty default.
     assert "option=" in " ".join(context2.get("candidate_evidence", []))
     assert "No prior snapshot" not in " ".join(context2.get("candidate_evidence", []))
+
+
+def _extended_breakout_historical_rows(hold_minutes: int) -> list[dict]:
+    """Same real breakout shape as _clear_breakout_fixture, but continues
+    flat (holding the breakout level) for `hold_minutes` more bars past
+    9:30 -- lets a test observe the exact same underlying technical/regime
+    structure at a much later real scan time."""
+    prior_rows = full_prior_day(date(2026, 8, 31), 24080.4)
+    opening_flat = minute_bars(date(2026, 9, 1), 9, 15, 5, 24080.0, 0.0)
+    breakout_up = minute_bars(date(2026, 9, 1), 9, 20, 10, 24080.0, 5.0)
+    holding = minute_bars(date(2026, 9, 1), 9, 30, hold_minutes, 24130.0, 0.0)
+    return prior_rows + opening_flat + breakout_up + holding
+
+
+def test_opening_range_breakout_correctly_excluded_hours_after_the_real_open():
+    """Brief 6 Part A: exactly the scenario a periodic re-scan (Part B)
+    would otherwise hit every single interval for the rest of the day.
+    OPENING_RANGE_BREAKOUT is an open-window setup (OPEN_WINDOW_SETUPS);
+    it must not fire outside OPEN_WINDOW_MINUTES of the real session open,
+    even with a threshold low enough that only the time gate could be
+    blocking it."""
+    scan_time = datetime(2026, 9, 1, 13, 0, tzinfo=IST)  # ~3h45m after the 9:15 open
+    historical_rows = _extended_breakout_historical_rows(hold_minutes=210)  # 9:30 -> 13:00
+    instruments = [real_instrument_row("NIFTY2690124200CE", 24200.0, date(2026, 9, 1), "CE")]
+    kite = FakeKite(real_index_quote(now=scan_time), historical_rows, instruments)
+    settings = Settings(signal_threshold=1.0)  # trivially low -- only the time gate can block this
+
+    context = build_live_context(settings, kite, NseCalendar(), now=scan_time)
+
+    assert "candidate_direction" not in context
+
+
+def test_opening_range_breakout_still_fires_within_the_real_open_window():
+    """Same real breakout structure and same low threshold as the test
+    above -- only the scan time differs (still within OPEN_WINDOW_MINUTES
+    of the real 9:15 open) -- proving the exclusion above is really about
+    time, not some other difference between the fixtures."""
+    scan_time = datetime(2026, 9, 1, 9, 30, tzinfo=IST)  # 15 minutes after open
+    historical_rows = _extended_breakout_historical_rows(hold_minutes=0)
+    instruments = [real_instrument_row("NIFTY2690124200CE", 24200.0, date(2026, 9, 1), "CE")]
+    kite = FakeKite(real_index_quote(now=scan_time), historical_rows, instruments)
+    settings = Settings(signal_threshold=1.0)
+
+    context = build_live_context(settings, kite, NseCalendar(), now=scan_time)
+
+    assert context["candidate_direction"] == "CALL"
+
+
+def test_setup_eligible_now_gates_open_window_setups_by_real_elapsed_time():
+    from execution.live_context import OPEN_WINDOW_MINUTES, _setup_eligible_now
+
+    session_open = datetime(2026, 9, 1, 9, 15, tzinfo=IST)
+    just_inside = session_open + timedelta(minutes=OPEN_WINDOW_MINUTES)
+    just_outside = session_open + timedelta(minutes=OPEN_WINDOW_MINUTES, seconds=1)
+
+    assert _setup_eligible_now("OPENING_RANGE_BREAKOUT", just_inside, session_open) is True
+    assert _setup_eligible_now("OPENING_RANGE_BREAKOUT", just_outside, session_open) is False
+
+
+def test_setup_eligible_now_never_gates_all_day_or_unrecognized_setups():
+    from execution.live_context import _setup_eligible_now
+
+    session_open = datetime(2026, 9, 1, 9, 15, tzinfo=IST)
+    hours_later = session_open + timedelta(hours=5)
+
+    assert _setup_eligible_now("VWAP_BREAKOUT", hours_later, session_open) is True
+    # An unrecognized setup_type defaults to eligible -- the safer failure
+    # mode is not silently blocking a name this gate doesn't know about.
+    assert _setup_eligible_now("SOME_FUTURE_SETUP_TYPE", hours_later, session_open) is True

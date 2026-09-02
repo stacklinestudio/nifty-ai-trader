@@ -74,7 +74,11 @@ def test_quote_source_factory_pattern_supervises_the_option_not_the_index(tmp_pa
     from config import Settings
     from data.calendar import NseCalendar
 
-    settings = Settings(database_path=tmp_path / "paper.db")
+    # max_trades_per_day=1: _filled_cycle_context is a static
+    # always-fillable candidate, so with Brief 6's real periodic
+    # re-scanning and the default cap of 3, the loop would otherwise keep
+    # taking the same trade again after this one closes.
+    settings = Settings(database_path=tmp_path / "paper.db", max_trades_per_day=1)
     orchestrator = Orchestrator(settings)
     now = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
     kite = FakeKite()
@@ -105,7 +109,7 @@ def test_quote_source_factory_pattern_supervises_the_option_not_the_index(tmp_pa
     # same thing would happen for the wrong reason (a nonsensical price for
     # an option), which is exactly the bug: the number driving stop/target
     # decisions was never the real premium of the actual contract held.
-    assert result.ran and result.reason == "closed"
+    assert result.ran and result.reason == "daily_limit_reached"
     assert result.supervision is not None and result.supervision.reason == "TAKE_PROFIT"
     assert result.supervision.exit_price == REPRESENTATIVE_OPTION_LTP
 

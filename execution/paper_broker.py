@@ -33,7 +33,15 @@ class PaperBroker:
     ) -> dict:
         if quantity <= 0 or requested_price <= 0:
             raise ValueError("Invalid paper order")
-        key = (symbol, side, quantity, timestamp.date())
+        # Brief 6: fingerprinting on timestamp.date() (not the full
+        # timestamp) meant a genuine SECOND same-symbol/side/quantity
+        # trade later the same day -- exactly what periodic re-scanning
+        # (execution/scheduler.py) and Brief 3's max_trades_per_day>1 both
+        # intend to allow -- was silently rejected as a false "duplicate."
+        # The full timestamp still catches a real accidental double-
+        # submission at the same instant while correctly allowing two
+        # distinct real orders placed at different times the same day.
+        key = (symbol, side, quantity, timestamp)
         if key in self._fingerprints:
             raise ValueError("Duplicate order prevented")
         self._fingerprints.add(key)
