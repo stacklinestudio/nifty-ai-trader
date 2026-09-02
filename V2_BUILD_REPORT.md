@@ -2071,3 +2071,79 @@ specific historical window.
   directly, not a change to the backtest driver. A future pass wanting
   this as a standing, repeatable capability would need to fold that
   loop into `run_daily_backtest` itself.
+
+## 5. Follow-up, same day: user decision on the SignalEngine question — wired
+
+Presented as a decision point (extend `SignalEngine` vs. leave the two
+range-favored setups unwired); user chose to extend it. Commit `1534b3d`.
+
+`intelligence/signal_engine.py::SignalEngine.evaluate()` gained an
+optional `override_direction: str | None = None` parameter. When a
+caller supplies `"CALL"`/`"PUT"`, it's used instead of deriving
+`direction` from `regime`; the confidence formula and threshold gate are
+**completely unchanged** either way. Every existing caller that omits it
+(every caller before this pass) gets byte-identical behavior — confirmed,
+not assumed:
+
+```
+$ pytest tests/test_strategy.py -q
+........
+8 passed in 0.60s
+```
+
+The `"uncertain regime"` risk flag — which previously forced `NO_TRADE`
+on every `RANGE`/`UNCERTAIN` regime unconditionally, regardless of
+confidence — now only applies when **no** override is supplied, since an
+override means a setup already found a real direction the regime
+classifier itself doesn't provide for a non-trending market (exactly what
+`VWAP_REJECTION`/`SUPPORT_RESISTANCE_REACTION` are for).
+`HIGH_VOLATILITY` still always forces `NO_TRADE` regardless of override —
+real whipsaw risk, independent of where the direction came from.
+
+`_select_setup` now also tries `VWAP_REJECTION` then
+`SUPPORT_RESISTANCE_REACTION` (in that order) whenever `regime` is
+`RANGE`/`UNCERTAIN`, passing whichever fires as `override_direction`. All
+5 setup types from the original spec are now real, tested, and reachable
+— proven end to end (not just at the detector-function level):
+
+```
+$ pytest tests/test_live_context.py tests/test_setup_detection.py tests/test_strategy.py -q
+................................................................
+64 passed in 1.15s
+$ pytest -q
+226 passed
+$ ruff check .
+All checks passed!
+```
+
+### Real re-confirmation: still 0 candidates on this dataset, even with all 5 setups active
+
+Re-ran both the official single-scan backtest driver and the simulated
+periodic-scan evidence from section 4, now with `VWAP_REJECTION`/
+`SUPPORT_RESISTANCE_REACTION` wired in too:
+
+```
+$ python -c "... run_daily_backtest(Settings(), frame) ..."   # official driver, unchanged
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+
+$ python simulate_multi_scan_backtest.py   # simulated periodic scan, all 5 setups active
+trading days evaluated: 42
+total simulated scans: 3485
+days with at least one real candidate: 0
+confidence distribution: min=28.2 max=53.8 n=2189   # n rose from 2043 -> 2189: real evidence the
+                                                       # additional setups are genuinely being evaluated
+                                                       # and logged, not silently skipped
+```
+
+Honest, unchanged result: the architectural gate is now open, and the
+new setups are demonstrably being tried (more below-threshold evaluation
+log lines, same confidence ceiling), but this specific historical window
+still doesn't produce a single real candidate clearing `signal_threshold
+=75`. The already-documented data gaps (`option`/`global_score`/`news`
+sitting at or near 0 for most scans on this window) remain the binding
+constraint — wiring more real setup types was necessary but not
+sufficient to change this dataset's outcome. Both findings are real and
+both are reported plainly, not reconciled into a more flattering single
+number.
