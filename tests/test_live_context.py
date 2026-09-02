@@ -654,3 +654,31 @@ def test_setup_eligible_now_never_gates_all_day_or_unrecognized_setups():
     # An unrecognized setup_type defaults to eligible -- the safer failure
     # mode is not silently blocking a name this gate doesn't know about.
     assert _setup_eligible_now("SOME_FUTURE_SETUP_TYPE", hours_later, session_open) is True
+
+
+def test_build_live_context_produces_a_real_trend_continuation_candidate_outside_the_orb_window():
+    """Brief 7 end-to-end proof: a real, sustained uptrend scanned hours
+    after the real session open (well outside OPENING_RANGE_BREAKOUT's own
+    window) still produces a real candidate, via a genuinely different
+    setup type this time -- not by loosening any threshold or fabricating
+    data, just by having a second, real detector actually wired in."""
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    scan_time = datetime(2026, 9, 1, 13, 0, tzinfo=IST)  # hours after the 9:15 open
+    prior_rows = full_prior_day(prior_day, 24080.4)
+    opening_flat = minute_bars(today, 9, 15, 5, 24080.0, 0.0)
+    # A real, steady, unbroken climb from just after the opening range all
+    # the way through the scan time -- well past OPEN_WINDOW_MINUTES, so
+    # OPENING_RANGE_BREAKOUT itself is correctly excluded (Part A), leaving
+    # room for TREND_CONTINUATION's real sustained-trend read to fire.
+    climb = minute_bars(today, 9, 20, 220, 24080.0, 2.0)
+    historical_rows = prior_rows + opening_flat + climb
+    instruments = [real_instrument_row("NIFTY2690124200CE", 24200.0, today, "CE")]
+    kite = FakeKite(real_index_quote(now=scan_time), historical_rows, instruments)
+    settings = Settings(signal_threshold=1.0)  # trivially low -- proves the setup wiring, not threshold tuning
+
+    context = build_live_context(settings, kite, NseCalendar(), now=scan_time)
+
+    assert context["candidate_direction"] == "CALL"
+    assert context["setup_type"] == "TREND_CONTINUATION"
+    assert "TREND_CONTINUATION" in " ".join(context["candidate_evidence"])

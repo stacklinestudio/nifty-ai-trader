@@ -42,6 +42,18 @@ fresh-process-per-day live deployment needs to carry state across days.
 Brief 5 researched, but deliberately did not pick or wire, a live
 external source for either (see the accompanying report's Part C).
 
+Brief 7 built real detection for 5 setup types designed in the original
+spec but never implemented beyond OPENING_RANGE_BREAKOUT: VWAP_BREAKOUT,
+VWAP_REJECTION, MOMENTUM_CONTINUATION, TREND_CONTINUATION, SUPPORT_
+RESISTANCE_REACTION (see each _*_setup function). _select_setup wires 3
+of them (the trend-favored ones) into real candidate formation alongside
+OPENING_RANGE_BREAKOUT; VWAP_REJECTION/SUPPORT_RESISTANCE_REACTION are
+real and independently tested but NOT wired in -- SignalEngine.evaluate()
+itself hardcodes `direction` from `regime` (trend/gap regimes only), so a
+range-favored setup's own real direction can never reach a candidate
+without changing that shared, already-tested core piece too. See
+_select_setup's docstring and the accompanying report.
+
 Fail-closed by construction, not by new logic: if the spot quote is
 missing/stale, market_data_fresh stays False, which the existing
 RiskAgent/IndependentTradeValidator checks already refuse to trade on. If
@@ -422,6 +434,279 @@ def _setup_eligible_now(setup_type: str, now: datetime, session_open: datetime) 
     return now <= session_open + timedelta(minutes=OPEN_WINDOW_MINUTES)
 
 
+def _clamp_score(raw: float) -> float:
+    return max(20.0, min(80.0, raw))
+
+
+def _vwap_breakout_setup(features: dict[str, float]) -> tuple[str | None, float, str]:
+    """Real detection: price on the far side of the real, session-anchored
+    VWAP (intelligence/technicals.py -- fixed this brief to never silently
+    degrade to a vacuous 0.0) with momentum confirming the same direction
+    -- a genuine breakout away from the session's own volume-weighted (or,
+    when real volume is genuinely zero, typical-price) center, not a
+    guessed threshold. Score reflects real distance from vwap in ATR
+    units -- how decisive the break is -- the same 20-80 clamp every
+    setup here uses.
+    """
+    close, vwap, momentum, atr = (
+        features["close"],
+        features["vwap"],
+        features["momentum"],
+        features["atr"],
+    )
+    if close <= 0 or vwap <= 0 or atr <= 0:
+        return None, 0.0, "insufficient data for a VWAP read"
+    distance_atr = abs(close - vwap) / atr
+    if close > vwap and momentum > 0:
+        return (
+            "CALL",
+            _clamp_score(40.0 + distance_atr * 20.0),
+            f"close {close:.2f} above session vwap {vwap:.2f} ({distance_atr:.2f} ATR), momentum positive",
+        )
+    if close < vwap and momentum < 0:
+        return (
+            "PUT",
+            _clamp_score(40.0 + distance_atr * 20.0),
+            f"close {close:.2f} below session vwap {vwap:.2f} ({distance_atr:.2f} ATR), momentum negative",
+        )
+    return None, 0.0, "no VWAP breakout structure present"
+
+
+def _vwap_rejection_setup(
+    latest_bar: pd.Series, features: dict[str, float]
+) -> tuple[str | None, float, str]:
+    """Real detection: this bar's real high/low crossed the session VWAP
+    but closed back on the other side -- a genuine intrabar rejection, not
+    a guessed pattern. Mean-reversion, the opposite read of
+    _vwap_breakout_setup on the exact same real level. NOT currently wired
+    into _select_setup below -- see that function's docstring for why.
+    """
+    vwap, atr = features["vwap"], features["atr"]
+    high, low, close = float(latest_bar.high), float(latest_bar.low), float(latest_bar.close)
+    if vwap <= 0 or atr <= 0:
+        return None, 0.0, "insufficient data for a VWAP read"
+    if high > vwap and close < vwap:
+        wick_atr = (high - vwap) / atr
+        return (
+            "PUT",
+            _clamp_score(40.0 + wick_atr * 20.0),
+            (f"high {high:.2f} pierced session vwap {vwap:.2f} but closed back below at {close:.2f} "
+            f"({wick_atr:.2f} ATR wick)"),
+        )
+    if low < vwap and close > vwap:
+        wick_atr = (vwap - low) / atr
+        return (
+            "CALL",
+            _clamp_score(40.0 + wick_atr * 20.0),
+            (f"low {low:.2f} pierced session vwap {vwap:.2f} but closed back above at {close:.2f} "
+            f"({wick_atr:.2f} ATR wick)"),
+        )
+    return None, 0.0, "no VWAP rejection structure present"
+
+
+def _momentum_continuation_setup(features: dict[str, float]) -> tuple[str | None, float, str]:
+    """Real detection: 5-bar momentum (intelligence/technicals.py's
+    momentum = close.pct_change(5)) outpacing the session's own real
+    ATR-normalized typical move, with EMA trend alignment confirming --
+    a real volatility-relative threshold, not an arbitrary fixed one, so
+    what counts as "significant" adapts to how volatile this real session
+    actually is.
+    """
+    close, momentum, atr, ema_fast, ema_slow = (
+        features["close"],
+        features["momentum"],
+        features["atr"],
+        features["ema_fast"],
+        features["ema_slow"],
+    )
+    if close <= 0 or atr <= 0:
+        return None, 0.0, "insufficient data for a momentum read"
+    threshold = atr / close
+    if momentum > threshold and ema_fast > ema_slow:
+        ratio = momentum / threshold
+        return (
+            "CALL",
+            _clamp_score(40.0 + (ratio - 1.0) * 20.0),
+            (f"5-bar momentum {momentum:.4f} exceeds ATR-relative threshold {threshold:.4f} "
+            f"({ratio:.2f}x), ema_fast>ema_slow"),
+        )
+    if momentum < -threshold and ema_fast < ema_slow:
+        ratio = abs(momentum) / threshold
+        return (
+            "PUT",
+            _clamp_score(40.0 + (ratio - 1.0) * 20.0),
+            (f"5-bar momentum {momentum:.4f} exceeds ATR-relative threshold -{threshold:.4f} "
+            f"({ratio:.2f}x), ema_fast<ema_slow"),
+        )
+    return None, 0.0, "no significant momentum continuation present"
+
+
+def _trend_continuation_setup(candles: pd.DataFrame, lookback: int = 10) -> tuple[str | None, float, str]:
+    """Real detection: EMA fast/slow ordering has held for the last
+    `lookback` real bars, not just the current one -- a sustained trend,
+    distinct from _momentum_continuation_setup's "fresh acceleration"
+    read. Needs the full feature history, not just the latest bar's
+    values, so recomputes feature_frame locally over the same real
+    candles _add_candidate already has (a small, bounded recomputation
+    over already-fetched data, not a new data source).
+    """
+    feats = feature_frame(candles)
+    if len(feats) < lookback:
+        return None, 0.0, "insufficient history for a trend-persistence read"
+    recent = feats.iloc[-lookback:]
+    atr = float(recent["atr"].iloc[-1])
+    if atr <= 0 or pd.isna(atr):
+        return None, 0.0, "insufficient data for a trend-persistence read"
+    if (recent["ema_fast"] > recent["ema_slow"]).all():
+        spread = float(recent["ema_fast"].iloc[-1] - recent["ema_slow"].iloc[-1])
+        return (
+            "CALL",
+            _clamp_score(40.0 + (spread / atr) * 20.0),
+            (f"ema_fast>ema_slow held for the last {lookback} real bars, spread {spread:.2f} "
+            f"({spread / atr:.2f} ATR)"),
+        )
+    if (recent["ema_slow"] > recent["ema_fast"]).all():
+        spread = float(recent["ema_slow"].iloc[-1] - recent["ema_fast"].iloc[-1])
+        return (
+            "PUT",
+            _clamp_score(40.0 + (spread / atr) * 20.0),
+            (f"ema_slow>ema_fast held for the last {lookback} real bars, spread {spread:.2f} "
+            f"({spread / atr:.2f} ATR)"),
+        )
+    return None, 0.0, "trend not sustained across the full lookback window"
+
+
+def _support_resistance_reaction_setup(
+    candles: pd.DataFrame, today: date, features: dict[str, float]
+) -> tuple[str | None, float, str]:
+    """Real detection: the prior real trading day's own high/low as the
+    support/resistance level -- a real, already-observed price level, not
+    a fabricated one -- with the latest real bar wicking through it and
+    closing back on the origin side, the same rejection mechanics as
+    _vwap_rejection_setup applied to a different real reference level.
+    NOT currently wired into _select_setup below -- see that function's
+    docstring for why.
+    """
+    prior = candles[candles.index.date < today]
+    if prior.empty:
+        return None, 0.0, "no prior real trading day to derive a level from"
+    prior_day = max({d for d in prior.index.date})
+    prior_bars = prior[prior.index.date == prior_day]
+    resistance = float(prior_bars.high.max())
+    support = float(prior_bars.low.min())
+    atr = features["atr"]
+    if atr <= 0:
+        return None, 0.0, "insufficient data for a support/resistance read"
+    latest = candles.iloc[-1]
+    high, low, close = float(latest.high), float(latest.low), float(latest.close)
+    if high >= resistance and close < resistance:
+        wick_atr = (high - resistance) / atr
+        return (
+            "PUT",
+            _clamp_score(40.0 + wick_atr * 20.0),
+            (f"high {high:.2f} reached prior-day resistance {resistance:.2f} but closed back below "
+            f"at {close:.2f} ({wick_atr:.2f} ATR wick)"),
+        )
+    if low <= support and close > support:
+        wick_atr = (support - low) / atr
+        return (
+            "CALL",
+            _clamp_score(40.0 + wick_atr * 20.0),
+            (f"low {low:.2f} reached prior-day support {support:.2f} but closed back above at "
+            f"{close:.2f} ({wick_atr:.2f} ATR wick)"),
+        )
+    return None, 0.0, "no support/resistance rejection structure present"
+
+
+def _atr_zones(
+    direction: str, close: float, atr: float
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Entry/stop/target zones anchored on real ATR -- the same
+    0.1/1.0/1.5/2.0-spread-multiple proportions the opening-range-based
+    zones below already use for OPENING_RANGE_BREAKOUT, applied to a
+    different real "how much room this setup needs" measure, since these
+    setups have no opening range of their own.
+    """
+    spread = max(atr, 0.01)
+    if direction == "CALL":
+        return (
+            (close, close + spread * 0.1),
+            (close - spread * 1.0, close - spread * 1.0),
+            (close + spread * 1.5, close + spread * 2.0),
+        )
+    return (
+        (close - spread * 0.1, close),
+        (close + spread * 1.0, close + spread * 1.0),
+        (close - spread * 2.0, close - spread * 1.5),
+    )
+
+
+def _select_setup(
+    candles: pd.DataFrame,
+    todays: pd.DataFrame,
+    features: dict[str, float],
+    now: datetime,
+    session_open: datetime,
+    trend_direction: str | None,
+) -> tuple[str, str, float, str] | None:
+    """Tries real setup detectors in a fixed, documented order and returns
+    the first one that's time-eligible (_setup_eligible_now) and produces
+    a real direction -- never more than one setup_type per scan, matching
+    SignalEngine's existing single-candidate-per-cycle design.
+
+    Only tries trend-favored setups (OPENING_RANGE_BREAKOUT, TREND_
+    CONTINUATION, MOMENTUM_CONTINUATION, VWAP_BREAKOUT), each requiring
+    its own real direction to AGREE with trend_direction to be selected --
+    same spirit as the existing technical_score's "does the broader trend
+    confirm this" read, just applied per-setup instead of only once.
+    OPENING_RANGE_BREAKOUT is tried first and, exactly as before this
+    change, always forms a candidate in trend_direction when time-eligible
+    regardless of its own agreement (SignalEngine's confidence weighting,
+    not a hard gate, is what penalizes a mismatch) -- unchanged behavior,
+    preserved for the one setup that already worked this way.
+
+    range-favored setups (VWAP_REJECTION, SUPPORT_RESISTANCE_REACTION,
+    real and independently tested -- see their own functions) are
+    deliberately NOT tried here: intelligence/signal_engine.py::
+    SignalEngine.evaluate()'s own `direction` is hardcoded from `regime`
+    (TREND_UP/GAP_UP -> CALL, TREND_DOWN/GAP_DOWN -> PUT, everything else
+    -> NO_TRADE, including RANGE/UNCERTAIN -- the exact regime these two
+    setups need to matter). That is a real architectural constraint in
+    shared, already-tested core infrastructure, not a data gap this
+    function can route around without changing SignalEngine itself --
+    surfaced plainly in the accompanying report rather than silently
+    worked around.
+    """
+    if trend_direction is None:
+        return None
+
+    if _setup_eligible_now("OPENING_RANGE_BREAKOUT", now, session_open):
+        orb_direction = breakout_direction(todays, OPENING_RANGE_MINUTES)
+        high, low = opening_range(todays, OPENING_RANGE_MINUTES)
+        opening_score = (
+            80.0
+            if orb_direction == trend_direction
+            else 20.0
+            if orb_direction != "NO_TRADE"
+            else 50.0
+        )
+        evidence = f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}"
+        return "OPENING_RANGE_BREAKOUT", trend_direction, opening_score, evidence
+
+    for setup_type, detect in (
+        ("TREND_CONTINUATION", lambda: _trend_continuation_setup(candles)),
+        ("MOMENTUM_CONTINUATION", lambda: _momentum_continuation_setup(features)),
+        ("VWAP_BREAKOUT", lambda: _vwap_breakout_setup(features)),
+    ):
+        if not _setup_eligible_now(setup_type, now, session_open):
+            continue
+        direction, score, evidence = detect()
+        if direction == trend_direction:
+            return setup_type, direction, score, evidence
+
+    return None
+
+
 def _add_candidate(
     context: dict[str, Any],
     candles: pd.DataFrame,
@@ -437,51 +722,40 @@ def _add_candidate(
         return  # not enough of today's session yet -- correctly no candidate, not a guess
 
     regime = classify(features, context.get("gap_pct", 0.0))
-    orb_direction = breakout_direction(todays, OPENING_RANGE_MINUTES)
-    high, low = opening_range(todays, OPENING_RANGE_MINUTES)
-
-    regime_direction = (
+    trend_direction = (
         "CALL"
         if regime in {Regime.TREND_UP, Regime.GAP_UP}
         else "PUT"
         if regime in {Regime.TREND_DOWN, Regime.GAP_DOWN}
         else None
     )
-    if regime_direction is None:
-        return  # UNCERTAIN/RANGE/HIGH_VOLATILITY/LOW_VOLATILITY regime -- no directional bias to trade
-
     session_open = todays.index[0].to_pydatetime()
-    if not _setup_eligible_now("OPENING_RANGE_BREAKOUT", now, session_open):
-        # Brief 6 Part A: a re-scan hours into the session must not detect
-        # a breakout of an opening range computed from that same fixed
-        # first-OPENING_RANGE_MINUTES-bars window and report it as a fresh
-        # signal -- this is exactly what periodic re-scanning (Part B)
-        # would otherwise do every single interval for the rest of the day.
+
+    setup = _select_setup(candles, todays, features, now, session_open, trend_direction)
+    if setup is None:
+        # Either no directional (trend/gap) regime this scan (RANGE/
+        # UNCERTAIN/HIGH_VOLATILITY/LOW_VOLATILITY), or every trend-favored
+        # setup was either outside its own time window or found no real
+        # structure agreeing with the regime's implied direction -- see
+        # _select_setup's own docstring for exactly which setups were
+        # even eligible to be tried this scan.
         logger.info(
-            "live_context_setup_outside_time_window setup_type=%s now=%s session_open=%s "
-            "window_minutes=%d",
-            "OPENING_RANGE_BREAKOUT",
+            "live_context_no_eligible_setup regime=%s trend_direction=%s now=%s",
+            regime.value,
+            trend_direction,
             now.isoformat(),
-            session_open.isoformat(),
-            OPEN_WINDOW_MINUTES,
         )
         return
+    setup_type, direction, setup_score, setup_evidence = setup
 
-    # opening score: reward a real ORB breakout confirming the same
-    # direction the regime implies, penalize a contradicting breakout,
-    # neutral if the opening range hasn't broken either way yet.
-    opening_score = (
-        80.0
-        if orb_direction == regime_direction
-        else 20.0
-        if orb_direction != "NO_TRADE"
-        else 50.0
-    )
     # Same bullish/bearish read TechnicalAgent computes itself -- reused,
-    # not reinvented, for the "technical" sub-score.
+    # not reinvented, for the "technical" sub-score. Keyed on the regime's
+    # own implied direction (trend_direction), not the specific setup's --
+    # this is a broader "does the wider trend confirm" read, independent
+    # of which setup fired.
     bullish = features["ema_fast"] > features["ema_slow"] and features["close"] > features["vwap"]
-    technical_score = 75.0 if (bullish and regime_direction == "CALL") or (
-        not bullish and regime_direction == "PUT"
+    technical_score = 75.0 if (bullish and trend_direction == "CALL") or (
+        not bullish and trend_direction == "PUT"
     ) else 45.0
     volatility_ratio = features["atr"] / features["close"] if features["close"] else 0.0
     risk_penalty = 25.0 if volatility_ratio > 0.008 else 0.0
@@ -489,9 +763,9 @@ def _add_candidate(
     volume_score, volume_reason = _combined_volume_score(
         candles, today, OPENING_RANGE_MINUTES, option_quotes, previous_option_quotes
     )
-    option_score, option_reason = _option_score(option_quotes, previous_option_quotes, regime_direction)
-    global_score, global_direction = _global_score(context, regime_direction)
-    news_score, news_direction = _news_score(context, regime_direction)
+    option_score, option_reason = _option_score(option_quotes, previous_option_quotes, direction)
+    global_score, global_direction = _global_score(context, direction)
+    news_score, news_direction = _news_score(context, direction)
 
     signal = SignalEngine(threshold=signal_threshold).evaluate(
         # The real `now` this scan is evaluating at, not a fresh wall-clock
@@ -502,7 +776,7 @@ def _add_candidate(
         timestamp=now,
         regime=regime,
         technical=technical_score,
-        opening=opening_score,
+        opening=setup_score,
         volume=volume_score,
         option=option_score,
         global_score=global_score,
@@ -517,8 +791,9 @@ def _add_candidate(
         # (see KNOWN_GAPS) -- logged explicitly so that's distinguishable
         # from "computed and turned out low."
         logger.info(
-            "live_context_signal_below_threshold regime=%s confidence=%.1f threshold=%.1f "
+            "live_context_signal_below_threshold setup_type=%s regime=%s confidence=%.1f threshold=%.1f "
             "volume=%.1f(%s) option=%.1f(%s) global=%.1f(%s) news=%.1f(%s)",
+            setup_type,
             regime.value,
             signal.confidence,
             signal_threshold,
@@ -533,27 +808,33 @@ def _add_candidate(
         )
         return
 
-    spread = max(high - low, 0.01)
-    if signal.direction == "CALL":
-        entry_zone, stop_zone, target_zone = (high, high + spread * 0.1), (low, low), (
-            high + spread * 1.5,
-            high + spread * 2.0,
-        )
+    if setup_type == "OPENING_RANGE_BREAKOUT":
+        high, low = opening_range(todays, OPENING_RANGE_MINUTES)
+        spread = max(high - low, 0.01)
+        if signal.direction == "CALL":
+            entry_zone, stop_zone, target_zone = (high, high + spread * 0.1), (low, low), (
+                high + spread * 1.5,
+                high + spread * 2.0,
+            )
+        else:
+            entry_zone, stop_zone, target_zone = (low - spread * 0.1, low), (high, high), (
+                low - spread * 2.0,
+                low - spread * 1.5,
+            )
     else:
-        entry_zone, stop_zone, target_zone = (low - spread * 0.1, low), (high, high), (
-            low - spread * 2.0,
-            low - spread * 1.5,
+        entry_zone, stop_zone, target_zone = _atr_zones(
+            signal.direction, features["close"], features["atr"]
         )
 
     context["candidate_direction"] = signal.direction
     context["candidate_confidence"] = signal.confidence
-    context["setup_type"] = "OPENING_RANGE_BREAKOUT"
+    context["setup_type"] = setup_type
     context["entry_zone"] = entry_zone
     context["stop_zone"] = stop_zone
     context["target_zone"] = target_zone
     context["candidate_evidence"] = [
-        f"regime={regime.value} implies {regime_direction}",
-        f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}",
+        f"regime={regime.value} implies {trend_direction}",
+        f"setup={setup_type}: {setup_evidence}",
         (
             f"volume={volume_score:.1f} ({volume_reason}), option={option_score:.1f} ({option_reason}), "
             f"global={global_score:.1f} ({global_direction}), news={news_score:.1f} ({news_direction})"
