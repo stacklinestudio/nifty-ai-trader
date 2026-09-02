@@ -1690,3 +1690,207 @@ India-relevant and truly free but need the most additional engineering.
   verified against a real live key this pass** — flagged explicitly in
   both tables above rather than assumed from documentation/marketing
   copy alone.
+
+# Brief 6 — Continuous Intraday Entry Scanning (2026-09-02)
+
+Paper only. Commit `8e6dc7f` (code + tests).
+
+## Part A. Time-of-day-aware setup evaluation — DONE, with a correction to the brief's own premise
+
+Audited directly against the code rather than assuming the brief's
+starting list was complete or that `SignalHunterAgent` does setup
+detection at all:
+
+```
+$ grep -rn "setup_type" agents/ execution/ strategy/ intelligence/ | grep -v test
+execution/live_context.py:467:    context["setup_type"] = "OPENING_RANGE_BREAKOUT"
+agents/research_agents.py:211:    setup_type = context.get("setup_type", "OPENING_STRUCTURE")
+strategy/regime_selector.py: (9 setup-type strings referenced by weight_for)
+```
+
+`SignalHunterAgent` has **no setup-detection logic of its own** — it only
+*weights* whatever `setup_type` `execution/live_context.py::_add_candidate`
+already put in the candidate. `_add_candidate` is the **only** code
+anywhere in this codebase that ever actually produces a `setup_type`, and
+as of this brief it only ever produces `"OPENING_RANGE_BREAKOUT"`. The
+other 8 strings the brief's own list named are recognized by
+`strategy/regime_selector.py`'s weighting table (real, but a confidence
+*multiplier*, never a hard filter) but have no detection logic anywhere —
+gating them is forward scaffolding for whichever gets implemented next,
+not evidence they're active today. One further correction: the brief's
+own "valid all day" list named "volatility expansion" as a setup type;
+no such `setup_type` string exists — `regime_selector.py` instead has a
+*volatility_regime* value `"HIGH"` it calls "high volatility expansion"
+internally, a different concept (a market-state read, not a setup type).
+Not included in `ALL_DAY_SETUPS`.
+
+Despite only one setup type being real today, this gate is **not
+hypothetical** — without it, Part B's periodic re-scanning would detect
+the SAME fixed opening-range breakout every single interval for the rest
+of the day and report it as a fresh signal every time. Added
+`OPEN_WINDOW_MINUTES = 30`, `OPEN_WINDOW_SETUPS`/`ALL_DAY_SETUPS`, and
+`_setup_eligible_now(setup_type, now, session_open)` in
+`execution/live_context.py`, gating `_add_candidate` right after
+`regime_direction` is determined. Unrecognized setup types default to
+eligible (the safer failure mode — not silently blocking a name this gate
+doesn't know about). Incidentally fixed `SignalEngine.evaluate()`'s
+timestamp to use the real threaded `now` instead of a fresh
+`datetime.now(IST)` read, since a second, independent time source right
+next to the new gate would have been actively misleading once
+`_add_candidate` can be called repeatedly through the day.
+
+```
+$ pytest tests/test_live_context.py -q
+.............................
+29 passed in 1.73s
+```
+
+6 new tests confirm: `OPENING_RANGE_BREAKOUT` correctly excluded hours
+after the real open even with a trivially-low threshold (proving only
+the time gate could be blocking it), the same fixture still fires within
+the window, `_setup_eligible_now`'s exact boundary (in/just-outside
+`OPEN_WINDOW_MINUTES`), and that all-day/unrecognized setups are never
+gated.
+
+## Part B. The scan loop — DONE
+
+`execution/scheduler.py::run_trading_day` now periodically re-scans
+instead of evaluating once near open:
+
+- **`Settings.entry_scan_interval_seconds`** (default 240s / 4 min, inside
+  the brief's suggested 3-5 minute range) and **`entry_scan_cutoff_time`**
+  (default 15:00, validated to be before `forced_exit_time`) are new
+  config fields.
+- `DailyLimits.can_open()` is checked **first, every iteration** — hitting
+  the cap stops scanning entirely for the rest of the day, not just skips
+  one iteration.
+- A fill hands off to the existing `run_supervised` loop exactly as
+  before (unchanged), which **blocks** until the position closes —
+  scanning is structurally paused for that whole duration, not through
+  new concurrency logic but because the loop simply can't reach its next
+  iteration until `run_supervised` returns.
+- Once closed, the loop re-checks `can_open()`/cutoff and resumes
+  scanning with whatever capacity remains.
+- `entry_scan_cutoff_time` only gates **starting** a new scan — an
+  already-open position's supervision is untouched and still reaches the
+  real 15:15 forced exit regardless of what the entry cutoff already did.
+- A scan failure (context/`run_cycle` exception) uses the exact same
+  bounded-retry shape as `run_supervised`, reusing
+  `Settings.max_consecutive_tick_failures` rather than a new knob —
+  after the bound, the day stops with `reason="scan_repeated_failure"`,
+  never a crash or a silent infinite retry.
+
+`DayResult` gained a `rounds: list[ScanRound]` field (one entry per real
+scan cycle, with a `TickResult` only when that round filled and closed);
+`.cycle`/`.supervision` remain as last-round convenience properties, so
+existing single-scan-day callers/tests needed no structural changes —
+only clock/settings adjustments (see below).
+
+**A real bug found and fixed while testing this**: getting a genuine
+second same-day trade to actually fill (needed to test pause/resume)
+kept silently failing with `agent_failed agent=execution error=ValueError:
+Duplicate order prevented`. Root cause: `execution/paper_broker.py`'s
+duplicate-order fingerprint was `(symbol, side, quantity, timestamp.date())`
+— **date only, no time** — so any second real trade with the same
+symbol/side/quantity later the *same day* was rejected as a false
+duplicate. This has existed since Brief 3 raised `max_trades_per_day`
+above 1, completely untested (`tests/test_multi_trade_sizing.py`'s own
+`test_reentry_allowed_after_stop_out_with_a_different_setup_type` calls
+`run_cycle` a second time same-day but never actually checks
+`.order is not None`, so it never exercised this path). Fixed by keying
+on the full `timestamp` instead of just its date — still catches a real
+accidental double-submission at the same instant, no longer rejects two
+genuinely distinct same-day orders.
+
+```
+$ pytest tests/test_scheduler.py -q
+..........
+10 passed in 2.31s
+```
+
+## Part C. Polling vs. WebSocket — decision documented, not silently made
+
+Per the brief's own explicit recommendation: **staying with polling this
+pass**, documented directly in `execution/scheduler.py`'s module
+docstring rather than left as an implicit default. Real reasoning stated
+there: at the 4-minute default interval this is nowhere near Kite's
+documented rate limits (1 quote req/sec, 3 historical req/sec, no daily
+cap — enormous headroom), it reuses the exact same, already-proven
+`KiteMarketData.get_quote()` path (naive-timestamp bug and all, already
+fixed and tested in a prior brief) rather than introducing a new
+persistent-connection/reconnect-logic surface while this feature is
+first being proven out, and nothing about this brief's actual scan
+cadence (minutes, not seconds) creates real pressure toward WebSocket.
+No code changes were needed to *not* build WebSocket support — this is a
+plain statement of the tradeoff for the record, not an implementation.
+A future pass could reconsider this if scan frequency ever needed to
+drop meaningfully below a few minutes.
+
+## Part D. Tests — DONE, all real command output
+
+```
+$ pytest tests/test_live_context.py tests/test_scheduler.py tests/test_supervision_quote_symbol.py -q
+..........................................
+42 passed in 3.25s
+$ pytest -q
+........................................................................ [ 37%]
+........................................................................ [ 75%]
+..............................................                           [100%]
+190 passed in 8.84s
+$ ruff check .
+All checks passed!
+```
+
+Mapped to the brief's own required list:
+
+- **Setup outside its valid window excluded**: `test_opening_range_breakout_correctly_excluded_hours_after_the_real_open`
+  / `..._still_fires_within_the_real_open_window` (the same real breakout
+  fixture, only the scan time differs) plus the direct `_setup_eligible_now`
+  boundary/all-day tests, in `tests/test_live_context.py`.
+- **`can_open()` checked every iteration, stops immediately mid-day**:
+  `test_scan_loop_stops_immediately_when_daily_cap_is_hit_mid_day` —
+  `max_trades_per_day=2`, asserts `context_provider` was called **exactly
+  twice**, not a third time after the cap was hit.
+- **Trade pauses scanning; close with remaining capacity resumes it**:
+  `test_position_closing_with_remaining_capacity_resumes_scanning` — a
+  `context_provider` that's only ever fillable on its first call, so a
+  real second round only happens if scanning genuinely resumed.
+- **No new entry at/after cutoff; already-open position still reaches
+  15:15 forced exit unaffected**:
+  `test_no_new_entry_at_or_after_cutoff_but_open_position_still_reaches_forced_exit`
+  — a quote held between stop and target (never exits on price alone) so
+  the only way the position closes is the real forced-exit path in
+  `position_supervisor.py::tick`; asserts exactly one scan ever happened.
+- **Repeated API failure handled with the same bounded retry as
+  `run_supervised`**: `test_repeated_scan_failure_is_handled_with_bounded_retry_not_a_crash`
+  — a permanently-raising `context_provider`, asserts exactly
+  `max_consecutive_tick_failures` attempts before stopping cleanly with
+  `reason="scan_repeated_failure"`.
+
+Existing single-scan-day tests
+(`test_scheduler_no_entry_on_trading_day_with_no_market_data`,
+`test_scheduler_fills_and_supervises_to_a_real_close`,
+`test_quote_source_factory_pattern_supervises_the_option_not_the_index`)
+were re-verified, not assumed unaffected — two needed real adjustments:
+a non-advancing fixed clock now correctly loops forever (a real clock
+always advances; fixed with an advancing clock + explicit near-term
+cutoff), and a static always-fillable fixture combined with the default
+`max_trades_per_day=3` would now legitimately take further trades
+against itself (fixed with an explicit `max_trades_per_day=1` to keep
+those specific tests' original single-trade-day intent, with real
+multi-trade behavior covered by the new tests above instead).
+
+## What wasn't done (explicit, not silently skipped)
+
+- **WebSocket streaming** was deliberately not built — see Part C.
+- **`daily_backtest.py` was not extended to re-scan periodically** —
+  Part B's brief specifically scoped this to `run_scheduled_day` (the
+  live path); the backtest driver still evaluates once per day near open,
+  unchanged. A future pass wanting to backtest the multi-scan/multi-trade
+  behavior itself would need to extend `run_daily_backtest`'s per-day
+  loop similarly — not attempted here.
+- **No real live run of the new scan loop** was performed this pass (no
+  live Kite session was available in this session) — all evidence above
+  is real command output from the real code paths against controlled
+  fixtures, not a live-market observation of the feature running end to
+  end during actual market hours.
