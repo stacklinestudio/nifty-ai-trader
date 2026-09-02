@@ -1894,3 +1894,180 @@ multi-trade behavior covered by the new tests above instead).
   is real command output from the real code paths against controlled
   fixtures, not a live-market observation of the feature running end to
   end during actual market hours.
+
+# Real 42-Day Backtest Re-Run, and 5 New Setup Types (2026-09-02)
+
+Paper only. `signal_threshold` not touched anywhere in this pass. Commits
+`7815623` (VWAP fix), `1e815de` (5 new setup detectors).
+
+## 1. Real 42-day backtest re-run — still 0 candidates, 0 trades, unchanged
+
+Requested first, reported exactly as it came out:
+
+```
+$ python -c "... run_daily_backtest(Settings(), frame) ..."   # signal_threshold=75.0
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+confidence distribution: min=38.8 max=53.8 n=28
+trade records in learning.memory: 0
+```
+
+Identical to both prior real runs (Brief 4, Brief 5) — honest, not a
+regression: `backtest/daily_backtest.py` still evaluates once per day
+near open (Brief 6 explicitly scoped continuous re-scanning to the live
+path only, not the backtest driver), so this run exercises exactly the
+same code path as before. Re-confirmed unchanged again after this pass's
+own new setup-detection work landed (same 0/0 result), since
+`OPENING_RANGE_BREAKOUT` is always still within its own time window at
+that single early evaluation point and so always wins the dispatcher —
+the new setups are structurally unreachable through this specific driver.
+Win rate: none — zero trades, nothing to compute one from.
+
+## 2. Real VWAP bug found and fixed before building anything on top of it
+
+Building `VWAP_BREAKOUT`/`VWAP_REJECTION` required real, non-degenerate
+`vwap` data. Checked first rather than assumed:
+
+```
+$ python -c "... feature_frame(real_42day_candles) ..."
+any non-nan vwap: False
+```
+
+`intelligence/technicals.py::feature_frame`'s `vwap` was a multi-day
+cumulative `price*volume/volume` with no session reset. Against real
+NIFTY 50 index data — where Kite's real volume is structurally always 0
+(Brief 5's finding) — this produced `NaN` (0/0) for literally every real
+bar in the 42-day dataset, which `_technical_features`'s own
+`NaN->0.0` fallback quietly turned into a permanent `vwap=0.0`. Since
+real index price is always a large positive number, `close > vwap` was
+**vacuously true on every real bar** — a real, pre-existing correctness
+bug affecting both `execution/live_context.py`'s own bullish read and
+`agents/research_agents.py::TechnicalAgent`'s identical check, neither
+ever exercised against real zero-volume data in a test before now (the
+existing test fixtures all use synthetic `volume=1000`, which never hit
+the degenerate path). Fixed: `vwap` now resets per real trading session
+and degrades to a real cumulative typical-price average — never
+fabricated, never silently `NaN`/`0` — when real volume is genuinely
+zero for that session; unchanged (real volume-weighted) when volume is
+real and nonzero.
+
+```
+$ pytest tests/test_technicals.py -q
+....
+4 passed in 0.62s
+```
+
+## 3. Five real setup detectors built — 3 wired, 2 real-but-not-wired (architectural reason, not data)
+
+Each detector uses real indicator data already flowing through
+`execution/live_context.py` — no fixed/arbitrary thresholds, all scaled
+relative to real ATR:
+
+| Setup | Real signal | Wired into candidate formation? |
+|---|---|---|
+| `VWAP_BREAKOUT` | close on the far side of real session vwap + momentum agreeing | **Yes** |
+| `MOMENTUM_CONTINUATION` | 5-bar momentum exceeding a real ATR-relative threshold + EMA alignment | **Yes** |
+| `TREND_CONTINUATION` | EMA fast/slow ordering sustained across the last 10 real bars | **Yes** |
+| `VWAP_REJECTION` | real intrabar wick through session vwap, closing back on the origin side | Real, tested — **not wired** |
+| `SUPPORT_RESISTANCE_REACTION` | real wick through the prior real trading day's own high/low, closing back | Real, tested — **not wired** |
+
+`_select_setup` (`execution/live_context.py`) dispatches the 3 wired
+setups in a fixed order (`OPENING_RANGE_BREAKOUT` first if still in its
+own window — exact prior behavior, unchanged — then `TREND_CONTINUATION`,
+`MOMENTUM_CONTINUATION`, `VWAP_BREAKOUT`), each gated by the real
+`_setup_eligible_now` pattern from Brief 6 as instructed. Each requires
+its own real detected direction to **agree** with the regime's implied
+direction to be selected — a real corroboration read, not an override.
+
+```
+$ pytest tests/test_setup_detection.py -q
+......................
+22 passed in 0.89s
+$ pytest tests/test_live_context.py -q
+..............................
+30 passed in 0.99s
+$ pytest -q
+........................................................................ [ 33%]
+........................................................................ [ 66%]
+........................................................................ [ 99%]
+.
+217 passed in 7.74s
+$ ruff check .
+All checks passed!
+```
+
+### The real, honest reason 2 of 5 are not wired
+
+`intelligence/signal_engine.py::SignalEngine.evaluate()`'s own
+`direction` is **hardcoded from `regime`** — `TREND_UP`/`GAP_UP` → CALL,
+`TREND_DOWN`/`GAP_DOWN` → PUT, **everything else (including RANGE/
+UNCERTAIN) → `NO_TRADE`, regardless of confidence**. `VWAP_REJECTION`
+and `SUPPORT_RESISTANCE_REACTION` are exactly the two setups
+`strategy/regime_selector.py`'s own real weighting table calls
+"range-favored" — they're specifically meant to matter when the market
+is ranging, not trending. But under the current, shared, already-tested
+`SignalEngine`, a RANGE/UNCERTAIN regime can never produce a real CALL/PUT
+candidate no matter what a setup detects. This is a **real architectural
+constraint in core infrastructure**, discovered by building against it,
+not a data availability gap — the detectors themselves are real,
+correct, and independently tested (`test_support_resistance_reaction_*`,
+`test_vwap_rejection_*` in `tests/test_setup_detection.py`), they simply
+cannot reach `context["candidate_direction"]` without `SignalEngine`
+itself learning to accept a setup-supplied direction. Not changed this
+pass — flagged plainly rather than silently routed around with a parallel
+decision path, or silently left unmentioned.
+
+## 4. Real evidence: would the 3 newly-wired setups actually create more opportunities on this data?
+
+`daily_backtest.py` only evaluates once per day (near open), so it can
+never reach `TREND_CONTINUATION`/`MOMENTUM_CONTINUATION`/`VWAP_BREAKOUT`
+in practice (`OPENING_RANGE_BREAKOUT` is always still in its own window
+at that single point). To honestly test whether the new setups find real
+opportunities the old single-scan driver couldn't, simulated Brief 6's
+real periodic-scan cadence (every `entry_scan_interval_seconds`, up to
+`entry_scan_cutoff_time`) directly over the real 42-day dataset:
+
+```
+trading days evaluated: 42
+total simulated scans: 3485
+days with at least one real candidate: 0
+setup_type distribution across all candidates: {}
+confidence distribution: min=28.2 max=53.8 n=2043
+```
+
+**Still zero, honestly** — even with 3,485 real intraday scan
+opportunities across all 42 real days and 3 additional real setup types
+in play, none produced a candidate that cleared the unmodified
+`signal_threshold=75`. This is not evidence the new detectors are
+broken — the confidence floor actually moved (28.2 vs. the single-scan
+run's 38.8, showing the new setups' own scores genuinely entering the
+formula on scans where they fired) — it's the same structural ceiling
+this whole engagement has repeatedly found and reported honestly:
+`option`/`global_score`/`news` still sit at or near 0 for most scans (no
+per-day option-chain data was fetched for this historical window; no
+live global/news provider is wired), so even a real, newly-detected
+setup with a strong `technical`/`opening` read tops out well short of
+75. **More valid setup types finding real chances is real progress and
+is what this pass delivered** — it doesn't by itself overcome the other,
+already-documented real data gaps that cap achievable confidence on this
+specific historical window.
+
+## What wasn't done (explicit, not silently skipped)
+
+- **`VWAP_REJECTION`/`SUPPORT_RESISTANCE_REACTION` are not wired into
+  candidate formation** — see section 3's architectural finding. A
+  decision on whether/how to extend `SignalEngine.evaluate()` to accept a
+  setup-supplied direction is a real, separate architectural call, not
+  made silently in this pass.
+- **`GAP_CONTINUATION`/`GAP_REVERSAL`** (the two open-window setups named
+  in Brief 6's own list but not requested by this brief) remain
+  undetected — out of this pass's explicit scope.
+- **`daily_backtest.py` was not extended** to simulate continuous
+  intraday scanning itself — the honest evidence in section 4 was
+  produced by a separate, one-off script reusing `assemble_context`
+  directly, not a change to the backtest driver. A future pass wanting
+  this as a standing, repeatable capability would need to fold that
+  loop into `run_daily_backtest` itself.
