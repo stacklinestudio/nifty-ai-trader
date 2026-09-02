@@ -478,9 +478,9 @@ def _vwap_rejection_setup(
     """Real detection: this bar's real high/low crossed the session VWAP
     but closed back on the other side -- a genuine intrabar rejection, not
     a guessed pattern. Mean-reversion, the opposite read of
-    _vwap_breakout_setup on the exact same real level. NOT currently wired
-    into _select_setup below -- see that function's docstring for why.
-    """
+    _vwap_breakout_setup on the exact same real level. Wired into
+    _select_setup for RANGE/UNCERTAIN regimes via SignalEngine.evaluate()'s
+    override_direction (Brief 7's follow-up)."""
     vwap, atr = features["vwap"], features["atr"]
     high, low, close = float(latest_bar.high), float(latest_bar.low), float(latest_bar.close)
     if vwap <= 0 or atr <= 0:
@@ -584,8 +584,8 @@ def _support_resistance_reaction_setup(
     a fabricated one -- with the latest real bar wicking through it and
     closing back on the origin side, the same rejection mechanics as
     _vwap_rejection_setup applied to a different real reference level.
-    NOT currently wired into _select_setup below -- see that function's
-    docstring for why.
+    Wired into _select_setup for RANGE/UNCERTAIN regimes via
+    SignalEngine.evaluate()'s override_direction (Brief 7's follow-up).
     """
     prior = candles[candles.index.date < today]
     if prior.empty:
@@ -645,8 +645,10 @@ def _select_setup(
     candles: pd.DataFrame,
     todays: pd.DataFrame,
     features: dict[str, float],
+    today: date,
     now: datetime,
     session_open: datetime,
+    regime: Regime,
     trend_direction: str | None,
 ) -> tuple[str, str, float, str] | None:
     """Tries real setup detectors in a fixed, documented order and returns
@@ -654,55 +656,65 @@ def _select_setup(
     a real direction -- never more than one setup_type per scan, matching
     SignalEngine's existing single-candidate-per-cycle design.
 
-    Only tries trend-favored setups (OPENING_RANGE_BREAKOUT, TREND_
-    CONTINUATION, MOMENTUM_CONTINUATION, VWAP_BREAKOUT), each requiring
-    its own real direction to AGREE with trend_direction to be selected --
-    same spirit as the existing technical_score's "does the broader trend
+    Trend-favored setups (OPENING_RANGE_BREAKOUT, TREND_CONTINUATION,
+    MOMENTUM_CONTINUATION, VWAP_BREAKOUT) are tried only in a real
+    trend/gap regime (trend_direction is not None), each requiring its own
+    real direction to AGREE with trend_direction to be selected -- same
+    spirit as the existing technical_score's "does the broader trend
     confirm this" read, just applied per-setup instead of only once.
-    OPENING_RANGE_BREAKOUT is tried first and, exactly as before this
-    change, always forms a candidate in trend_direction when time-eligible
+    OPENING_RANGE_BREAKOUT is tried first and, exactly as before Brief 7,
+    always forms a candidate in trend_direction when time-eligible
     regardless of its own agreement (SignalEngine's confidence weighting,
     not a hard gate, is what penalizes a mismatch) -- unchanged behavior,
     preserved for the one setup that already worked this way.
 
-    range-favored setups (VWAP_REJECTION, SUPPORT_RESISTANCE_REACTION,
-    real and independently tested -- see their own functions) are
-    deliberately NOT tried here: intelligence/signal_engine.py::
-    SignalEngine.evaluate()'s own `direction` is hardcoded from `regime`
-    (TREND_UP/GAP_UP -> CALL, TREND_DOWN/GAP_DOWN -> PUT, everything else
-    -> NO_TRADE, including RANGE/UNCERTAIN -- the exact regime these two
-    setups need to matter). That is a real architectural constraint in
-    shared, already-tested core infrastructure, not a data gap this
-    function can route around without changing SignalEngine itself --
-    surfaced plainly in the accompanying report rather than silently
-    worked around.
+    Range-favored setups (VWAP_REJECTION, SUPPORT_RESISTANCE_REACTION) are
+    tried only in a real ranging regime (RANGE/UNCERTAIN -- trend_direction
+    is None), each returning its OWN real direction rather than needing
+    to agree with anything (there is no trend_direction to agree with by
+    definition here) -- reachable since intelligence/signal_engine.py::
+    SignalEngine.evaluate() gained override_direction specifically to let
+    a setup-supplied direction through on a non-directional regime, Brief
+    7's follow-up to the architectural constraint this function's Brief 7
+    version originally reported.
     """
-    if trend_direction is None:
+    if trend_direction is not None:
+        if _setup_eligible_now("OPENING_RANGE_BREAKOUT", now, session_open):
+            orb_direction = breakout_direction(todays, OPENING_RANGE_MINUTES)
+            high, low = opening_range(todays, OPENING_RANGE_MINUTES)
+            opening_score = (
+                80.0
+                if orb_direction == trend_direction
+                else 20.0
+                if orb_direction != "NO_TRADE"
+                else 50.0
+            )
+            evidence = f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}"
+            return "OPENING_RANGE_BREAKOUT", trend_direction, opening_score, evidence
+
+        for setup_type, detect in (
+            ("TREND_CONTINUATION", lambda: _trend_continuation_setup(candles)),
+            ("MOMENTUM_CONTINUATION", lambda: _momentum_continuation_setup(features)),
+            ("VWAP_BREAKOUT", lambda: _vwap_breakout_setup(features)),
+        ):
+            if not _setup_eligible_now(setup_type, now, session_open):
+                continue
+            direction, score, evidence = detect()
+            if direction == trend_direction:
+                return setup_type, direction, score, evidence
         return None
 
-    if _setup_eligible_now("OPENING_RANGE_BREAKOUT", now, session_open):
-        orb_direction = breakout_direction(todays, OPENING_RANGE_MINUTES)
-        high, low = opening_range(todays, OPENING_RANGE_MINUTES)
-        opening_score = (
-            80.0
-            if orb_direction == trend_direction
-            else 20.0
-            if orb_direction != "NO_TRADE"
-            else 50.0
-        )
-        evidence = f"opening range {low:.2f}-{high:.2f}, ORB read={orb_direction}"
-        return "OPENING_RANGE_BREAKOUT", trend_direction, opening_score, evidence
-
-    for setup_type, detect in (
-        ("TREND_CONTINUATION", lambda: _trend_continuation_setup(candles)),
-        ("MOMENTUM_CONTINUATION", lambda: _momentum_continuation_setup(features)),
-        ("VWAP_BREAKOUT", lambda: _vwap_breakout_setup(features)),
-    ):
-        if not _setup_eligible_now(setup_type, now, session_open):
-            continue
-        direction, score, evidence = detect()
-        if direction == trend_direction:
-            return setup_type, direction, score, evidence
+    if regime in {Regime.RANGE, Regime.UNCERTAIN}:
+        latest_bar = todays.iloc[-1]
+        for setup_type, detect in (
+            ("VWAP_REJECTION", lambda: _vwap_rejection_setup(latest_bar, features)),
+            ("SUPPORT_RESISTANCE_REACTION", lambda: _support_resistance_reaction_setup(candles, today, features)),
+        ):
+            if not _setup_eligible_now(setup_type, now, session_open):
+                continue
+            direction, score, evidence = detect()
+            if direction is not None:
+                return setup_type, direction, score, evidence
 
     return None
 
@@ -731,14 +743,13 @@ def _add_candidate(
     )
     session_open = todays.index[0].to_pydatetime()
 
-    setup = _select_setup(candles, todays, features, now, session_open, trend_direction)
+    setup = _select_setup(candles, todays, features, today, now, session_open, regime, trend_direction)
     if setup is None:
-        # Either no directional (trend/gap) regime this scan (RANGE/
-        # UNCERTAIN/HIGH_VOLATILITY/LOW_VOLATILITY), or every trend-favored
-        # setup was either outside its own time window or found no real
-        # structure agreeing with the regime's implied direction -- see
-        # _select_setup's own docstring for exactly which setups were
-        # even eligible to be tried this scan.
+        # Either a HIGH_VOLATILITY/LOW_VOLATILITY regime (no setup family
+        # is tried in either), or every setup that WAS eligible for this
+        # regime was either outside its own time window or found no real
+        # structure -- see _select_setup's own docstring for exactly
+        # which setups were even eligible to be tried this scan.
         logger.info(
             "live_context_no_eligible_setup regime=%s trend_direction=%s now=%s",
             regime.value,
@@ -782,6 +793,12 @@ def _add_candidate(
         global_score=global_score,
         news=news_score,
         risk_penalty=risk_penalty,
+        # Always the selected setup's own real direction -- identical to
+        # regime-derived direction for every trend-favored setup (the
+        # dispatcher only selects one when it already agrees), and the
+        # only way a range-favored setup's direction can reach a
+        # candidate at all on a RANGE/UNCERTAIN regime.
+        override_direction=direction,
     )
     if signal.direction not in {"CALL", "PUT"}:
         # SignalEngine itself vetoed -- a real computed signal that didn't

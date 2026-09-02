@@ -21,6 +21,7 @@ from execution.live_context import (
     _vwap_breakout_setup,
     _vwap_rejection_setup,
 )
+from intelligence.market_regime import Regime
 
 
 def _features(**overrides: float) -> dict[str, float]:
@@ -234,17 +235,19 @@ def test_support_resistance_reaction_is_unavailable_not_fabricated_without_a_pri
 # --- _select_setup dispatcher ---------------------------------------------
 
 
-def test_select_setup_returns_none_without_a_directional_regime():
-    """Range-favored setups (VWAP_REJECTION, SUPPORT_RESISTANCE_REACTION)
-    are real and independently tested above, but are deliberately not
-    tried by the dispatcher at all -- see _select_setup's own docstring."""
-    rows = _minute_bars(date(2026, 9, 1), 9, 15, 10, 24080.0, 0.0)
+def test_select_setup_returns_none_for_high_volatility_regime_neither_family_tried():
+    """HIGH_VOLATILITY/LOW_VOLATILITY are neither a real trend/gap regime
+    nor RANGE/UNCERTAIN -- no setup family is tried for either."""
+    today = date(2026, 9, 1)
+    rows = _minute_bars(today, 9, 15, 10, 24080.0, 0.0)
     candles = pd.DataFrame(rows).set_index("date")
     todays = candles
     now = candles.index[-1].to_pydatetime()
     session_open = candles.index[0].to_pydatetime()
 
-    result = _select_setup(candles, todays, _features(), now, session_open, trend_direction=None)
+    result = _select_setup(
+        candles, todays, _features(), today, now, session_open, Regime.HIGH_VOLATILITY, trend_direction=None
+    )
 
     assert result is None
 
@@ -261,7 +264,9 @@ def test_select_setup_prefers_opening_range_breakout_within_its_window_regardles
     now = candles.index[-1].to_pydatetime()
     session_open = candles.index[0].to_pydatetime()
 
-    result = _select_setup(candles, todays, _features(), now, session_open, trend_direction="CALL")
+    result = _select_setup(
+        candles, todays, _features(), today, now, session_open, Regime.TREND_UP, trend_direction="CALL"
+    )
 
     assert result is not None
     setup_type, direction, score, _evidence = result
@@ -278,7 +283,9 @@ def test_select_setup_falls_through_to_trend_continuation_outside_the_orb_window
     session_open = candles.index[0].to_pydatetime()
     now = session_open + timedelta(hours=3)  # well outside OPENING_RANGE_BREAKOUT's window
 
-    result = _select_setup(candles, todays, _features(), now, session_open, trend_direction="CALL")
+    result = _select_setup(
+        candles, todays, _features(), today, now, session_open, Regime.TREND_UP, trend_direction="CALL"
+    )
 
     assert result is not None
     setup_type, direction, _score, _evidence = result
@@ -295,6 +302,80 @@ def test_select_setup_returns_none_when_no_eligible_setup_agrees_with_the_regime
     now = session_open + timedelta(hours=3)
 
     flat_features = _features(ema_fast=24080.0, ema_slow=24080.0, close=24080.0, vwap=24080.0, momentum=0.0)
-    result = _select_setup(candles, todays, flat_features, now, session_open, trend_direction="CALL")
+    result = _select_setup(
+        candles, todays, flat_features, today, now, session_open, Regime.TREND_UP, trend_direction="CALL"
+    )
+
+    assert result is None
+
+
+def test_select_setup_tries_range_favored_setups_on_a_real_uncertain_regime():
+    """Brief 7's follow-up: SUPPORT_RESISTANCE_REACTION/VWAP_REJECTION are
+    now reachable on a RANGE/UNCERTAIN regime (trend_direction is None),
+    via SignalEngine.evaluate()'s override_direction."""
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    prior_rows = _minute_bars(prior_day, 9, 15, 375, 24080.0, 0.0)  # prior day high ~24081
+    todays_rows = _minute_bars(today, 9, 15, 5, 24075.0, 0.0)
+    todays_rows[-1]["high"] = 24090.0
+    todays_rows[-1]["close"] = 24075.0
+    candles = pd.DataFrame(prior_rows + todays_rows).set_index("date")
+    todays = candles[candles.index.date == today]
+    now = candles.index[-1].to_pydatetime()
+    session_open = todays.index[0].to_pydatetime()
+
+    # vwap set far below today's real price action so _vwap_rejection_setup
+    # (tried first) finds no structure of its own, isolating this test to
+    # SUPPORT_RESISTANCE_REACTION specifically.
+    result = _select_setup(
+        candles,
+        todays,
+        _features(atr=20.0, vwap=23000.0),
+        today,
+        now,
+        session_open,
+        Regime.UNCERTAIN,
+        trend_direction=None,
+    )
+
+    assert result is not None
+    setup_type, direction, _score, _evidence = result
+    assert setup_type == "SUPPORT_RESISTANCE_REACTION"
+    assert direction == "PUT"
+
+
+def test_select_setup_tries_vwap_rejection_first_among_range_favored_setups():
+    today = date(2026, 9, 1)
+    rows = _minute_bars(today, 9, 15, 10, 24080.0, 0.0)
+    candles = pd.DataFrame(rows).set_index("date")
+    todays = candles
+    now = candles.index[-1].to_pydatetime()
+    session_open = candles.index[0].to_pydatetime()
+    latest = todays.iloc[-1]
+    # A real VWAP rejection at the latest bar (high pierced vwap, closed
+    # back below) -- no prior trading day exists at all, so
+    # SUPPORT_RESISTANCE_REACTION couldn't fire here even if tried first.
+    vwap_features = _features(vwap=(float(latest.high) + float(latest.close)) / 2, atr=5.0)
+
+    result = _select_setup(
+        candles, todays, vwap_features, today, now, session_open, Regime.UNCERTAIN, trend_direction=None
+    )
+
+    assert result is not None
+    setup_type, _direction, _score, _evidence = result
+    assert setup_type == "VWAP_REJECTION"
+
+
+def test_select_setup_returns_none_when_range_favored_setups_find_no_structure_either():
+    today = date(2026, 9, 1)
+    rows = _minute_bars(today, 9, 15, 10, 24080.0, 0.0)  # flat, no prior day, no rejection structure
+    candles = pd.DataFrame(rows).set_index("date")
+    todays = candles
+    session_open = candles.index[0].to_pydatetime()
+    now = session_open + timedelta(hours=1)
+
+    result = _select_setup(
+        candles, todays, _features(), today, now, session_open, Regime.UNCERTAIN, trend_direction=None
+    )
 
     assert result is None

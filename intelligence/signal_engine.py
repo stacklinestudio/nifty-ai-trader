@@ -35,14 +35,29 @@ class SignalEngine:
         global_score: float = 0,
         news: float = 0,
         risk_penalty: float = 0,
+        override_direction: str | None = None,
     ) -> Signal:
-        direction = (
-            "CALL"
-            if regime in {Regime.TREND_UP, Regime.GAP_UP}
-            else "PUT"
-            if regime in {Regime.TREND_DOWN, Regime.GAP_DOWN}
-            else "NO_TRADE"
-        )
+        """override_direction (Brief 7): a caller that has already
+        determined a real direction independent of `regime` -- e.g. a
+        range-favored setup detector (execution/live_context.py's
+        VWAP_REJECTION/SUPPORT_RESISTANCE_REACTION), which by design finds
+        its own real signal specifically in RANGE/UNCERTAIN regimes, where
+        `regime` alone implies no direction at all -- can supply it here
+        instead of `regime` deciding. The confidence formula below is
+        completely unchanged either way; only which direction that
+        confidence attaches to. Omit (default None) for identical
+        behavior to every existing caller.
+        """
+        if override_direction in {"CALL", "PUT"}:
+            direction = override_direction
+        else:
+            direction = (
+                "CALL"
+                if regime in {Regime.TREND_UP, Regime.GAP_UP}
+                else "PUT"
+                if regime in {Regime.TREND_DOWN, Regime.GAP_DOWN}
+                else "NO_TRADE"
+            )
         confidence = max(
             0.0,
             min(
@@ -56,7 +71,20 @@ class SignalEngine:
                 - risk_penalty * 0.125,
             ),
         )
-        risks = ["uncertain regime"] if regime in {Regime.UNCERTAIN, Regime.HIGH_VOLATILITY} else []
+        risks = []
+        if regime == Regime.HIGH_VOLATILITY:
+            # A real whipsaw-risk flag regardless of direction source --
+            # matches strategy/regime_selector.py's own "high volatility
+            # expansion increases whipsaw risk" reasoning, which applies
+            # broadly, not just to trend-derived directions.
+            risks.append("high volatility regime")
+        if regime in {Regime.UNCERTAIN, Regime.RANGE} and override_direction is None:
+            # Only a real risk when there's no independent direction to
+            # rely on -- an override means a setup already found one
+            # despite the regime classifier itself being non-directional
+            # here, which is exactly the case range-favored setups exist
+            # for, not something to veto by construction.
+            risks.append("uncertain regime")
         if confidence < self.threshold:
             risks.append("below configured confidence threshold")
         if risks:

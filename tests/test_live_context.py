@@ -682,3 +682,34 @@ def test_build_live_context_produces_a_real_trend_continuation_candidate_outside
     assert context["candidate_direction"] == "CALL"
     assert context["setup_type"] == "TREND_CONTINUATION"
     assert "TREND_CONTINUATION" in " ".join(context["candidate_evidence"])
+
+
+def test_build_live_context_produces_a_real_range_favored_candidate_on_an_uncertain_regime():
+    """Brief 7's follow-up end-to-end proof: a real range-favored setup
+    (VWAP_REJECTION or SUPPORT_RESISTANCE_REACTION -- both real rejection
+    structures at the exact same real price level here) can now actually
+    reach candidate_direction on a real UNCERTAIN regime, via
+    SignalEngine.evaluate()'s new override_direction -- structurally
+    impossible before this follow-up (regime alone implies no direction
+    for UNCERTAIN)."""
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    scan_time = datetime(2026, 9, 1, 9, 30, tzinfo=IST)
+    prior_rows = full_prior_day(prior_day, 24080.4)  # real prior-day high ~24081.4
+    todays_rows = minute_bars(today, 9, 15, 15, 24075.0, 0.0)  # flat -- real UNCERTAIN regime
+    # Force only the latest real bar's high to wick up through the prior
+    # day's real resistance -- close is left untouched (still the same
+    # flat 24075.0 every other bar already has) so momentum/EMA stay flat
+    # too and classify() genuinely reads UNCERTAIN, not a trend from the
+    # close itself moving.
+    todays_rows[-1]["high"] = 24095.0
+    historical_rows = prior_rows + todays_rows
+    instruments = [real_instrument_row("NIFTY2690124200CE", 24200.0, today, "CE")]
+    kite = FakeKite(real_index_quote(now=scan_time), historical_rows, instruments)
+    settings = Settings(signal_threshold=1.0)  # trivially low -- proves the wiring, not threshold tuning
+
+    context = build_live_context(settings, kite, NseCalendar(), now=scan_time)
+
+    assert context["candidate_direction"] == "PUT"
+    assert context["setup_type"] in {"VWAP_REJECTION", "SUPPORT_RESISTANCE_REACTION"}
+    assert "regime=UNCERTAIN" in " ".join(context["candidate_evidence"])
