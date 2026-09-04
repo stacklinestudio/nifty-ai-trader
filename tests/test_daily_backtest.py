@@ -162,3 +162,40 @@ def test_no_option_data_anywhere_still_correctly_reads_unavailable(tmp_path, mon
 
     assert len(calls) == 1  # day2 only
     assert calls[0][0][6] == []  # never any real data to compare against -- explicit [], not fabricated
+
+
+def test_global_context_by_day_threads_the_real_per_day_value_with_no_carry_forward(tmp_path, monkeypatch):
+    """Brief 8 Part D: unlike option_quotes_by_day (carried forward when a
+    day has no entry), global_context_by_day has a genuinely real value
+    for every real trading day (data/global_market.py::fetch_global_history
+    has no gaps to carry across) -- each day's own entry (or explicit []
+    if genuinely missing) is used as-is, never the previous day's."""
+    from data.global_market import ContextValue
+
+    day1, day2, day3 = date(2026, 8, 3), date(2026, 8, 4), date(2026, 8, 5)
+    rows = (
+        minute_bars(day1, 375, 24000.0, 0.0)
+        + minute_bars(day2, 375, 24000.0, 0.0)
+        + minute_bars(day3, 375, 24000.0, 0.0)
+    )
+    frame = pd.DataFrame(rows).set_index("date")
+    settings = Settings(database_path=tmp_path / "backtest.db")
+    day2_context = [ContextValue("SP500", 0.01, datetime.now(IST), "yfinance", True)]
+    # day3 deliberately has no entry -- must read as [] (genuinely
+    # unavailable that day), not silently carry day2's real value forward.
+    global_context_by_day = {day2: day2_context}
+
+    calls = []
+    real_assemble_context = daily_backtest_module.assemble_context
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_assemble_context(*args, **kwargs)
+
+    monkeypatch.setattr(daily_backtest_module, "assemble_context", spy)
+
+    run_daily_backtest(settings, frame, global_context_by_day=global_context_by_day)
+
+    day2_call, day3_call = calls[0], calls[1]
+    assert day2_call[0][7] == day2_context
+    assert day3_call[0][7] == []
