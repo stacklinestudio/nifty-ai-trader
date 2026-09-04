@@ -2551,3 +2551,106 @@ currently blocked on billing per that report section). Each real trading
 day from here on will be reported honestly as it happens — a real trade
 or a correct `no_entry`, either is real information, per the brief's own
 acceptance criteria (no single "DONE" for this part).
+
+# Part E — Tighten the Entry Scan Interval (2026-09-04, same day)
+
+Paper only. No decision logic touched — `signal_threshold`, risk limits,
+and what counts as a valid setup are all unchanged. Commit `30a91e8`.
+
+## Real math for 60s vs. Kite's documented rate limits
+
+Confirmed by reading every real Kite call site directly (not estimated):
+one full scan cycle (`execution/live_context.py::build_live_context`)
+makes **exactly 4 real Kite API calls**:
+
+```
+$ grep -n "kite\." execution/live_context.py data/market_data.py data/historical.py data/instruments.py
+data/market_data.py:52:  payload = self.kite.quote([symbol])[symbol]              # quote (index spot)
+data/historical.py:27:   rows = self.kite.historical_data(instrument_token, ...)  # historical (index candles)
+data/instruments.py:38:  return parse_kite_instruments(kite.instruments("NFO"))   # instruments (NFO dump)
+execution/live_context.py:209: raw = kite.quote(list(by_symbol.keys()))           # quote (option-chain batch)
+```
+
+2 quote-category calls, 1 historical-category call, 1 instruments call,
+per cycle. At the new 60s interval:
+
+| Category | Calls/cycle | Calls/sec (sustained avg over 60s) | Documented ceiling | Headroom |
+|---|---|---|---|---|
+| Quote | 2 | 0.033 | 1 req/sec | ~30x |
+| Historical | 1 | 0.0167 | 3 req/sec | ~180x |
+| Instruments | 1 | 0.0167 | (none documented) | — |
+
+**Burst risk, honestly assessed, not just averaged away**: the 2 quote
+calls happen within the same cycle's execution, not evenly spread across
+the 60s. They're separated by the historical and instruments calls in
+between — each a real network round-trip for a non-trivial payload (10
+days of minute candles; a 33,439-row NFO instruments dump, confirmed
+live in Brief 9's Part A investigation the same day) — so in practice
+they land seconds apart, not back-to-back. This is a reasoned
+expectation from the real call sequence, not a mathematically-guaranteed
+one given real-world network timing variance — stated plainly rather
+than asserted as certain.
+
+**No documented daily cap**, but for real scale: a full scanning day
+(9:15 open to the 15:00 `entry_scan_cutoff_time`, worst case if no trade
+ever fires) is ~345 minutes → **~345 cycles → ~1,380 real Kite calls**
+across the whole day — small in absolute terms for a retail API client.
+Actual daily volume is usually lower: a fill pauses entry scanning
+entirely until that position closes (`run_supervised`'s own polling uses
+the separate, unchanged `Settings.supervision_poll_seconds`).
+
+**Real secondary cost, stated plainly**: the NFO instruments dump
+(~33k rows) is re-fetched and re-parsed every single cycle — unchanged
+in kind from Brief 6 (it always happened every cycle), but now 4x more
+frequent. This is real, non-trivial CPU/bandwidth work, not a documented
+rate-limit concern — worth naming rather than silently absorbing into
+"headroom" language that only addresses the formal per-second ceilings.
+
+## Real command output
+
+```
+$ pytest tests/test_scheduler.py -q
+...........
+11 passed in 2.00s
+$ pytest -q
+259 passed, 1 failed (same pre-existing, unrelated failure — see Brief 8's report section)
+$ ruff check .
+All checks passed!
+```
+
+**Test coverage, addressing the brief's own requirements**:
+
+- **Nothing previously tested the literal default value at all** —
+  every existing scan-loop test injects its own `clock` and a no-op
+  `sleeper`, so `Settings.entry_scan_interval_seconds`'s actual value was
+  never exercised end-to-end before this pass. Added
+  `test_default_entry_scan_interval_is_60_seconds_and_reaches_the_real_sleeper`,
+  which confirms both halves: `Settings().entry_scan_interval_seconds ==
+  60.0`, and that value genuinely reaches the real `sleeper()` call for
+  the between-scan wait when a caller doesn't override it (not just that
+  the config field holds 60).
+- **Daily-cap/cutoff-time logic (Brief 6) is unaffected, confirmed by
+  existing evidence, not just assumption**: every existing test covering
+  `daily_limit_reached`/`scan_cutoff_reached` behavior
+  (`test_scan_loop_stops_immediately_when_daily_cap_is_hit_mid_day`,
+  `test_position_closing_with_remaining_capacity_resumes_scanning`,
+  `test_no_new_entry_at_or_after_cutoff_but_open_position_still_reaches_forced_exit`)
+  already did not override `entry_scan_interval_seconds` and continues
+  to pass, byte-identical in assertions, after the default flip from 240
+  to 60 — real, pre-existing evidence that this logic is interval-
+  agnostic, not something newly proven by a fresh test.
+- One real bug caught while writing the new test: an early version
+  miscounted the real number of `clock()` calls before the scan loop's
+  first iteration (missed `run_trading_day`'s own `checked_date =
+  clock().date()` call at the very top) and asserted on too tight a
+  cutoff margin, making the test fail for the wrong reason — fixed by
+  widening the real margin rather than hard-coding an exact call count,
+  matching the more robust pattern already used elsewhere in this file.
+
+## Part A/B — unchanged, as instructed
+
+No new work this pass — Brief 9's Part A (historical option backfill
+investigation, real answer: not feasible for the elapsed window) and
+Part B (continued live-run tracking) stand exactly as reported in the
+section above. No new real trading day has occurred yet since that
+report (still the same real day, market closed).
