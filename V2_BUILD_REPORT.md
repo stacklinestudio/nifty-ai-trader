@@ -2433,3 +2433,121 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+# Historical Option Backfill Investigation + Live Tracking Begins (2026-09-04)
+
+Paper only. No decision logic changed, `signal_threshold` untouched. This
+pass is research + a fresh real backtest confirmation, no code changes.
+
+## Part A. Real historical option-chain backfill — investigated live, genuinely not feasible for the elapsed window
+
+Required a real, fresh Kite login (the prior session's token, generated
+2026-09-01, was expired as designed — single-use request tokens, exchanged
+live twice this pass with the user's real interactive login each time).
+
+**Real, empirical finding, checked rather than assumed**:
+
+```
+$ python -c "... kite.instruments('NFO') ..."
+total NFO instruments: 33439
+NIFTY options: 1580
+distinct expiries: 18
+earliest expiry: 2026-09-08
+expiries in the past (before today, 2026-09-04): 0
+```
+
+Kite's live `/instruments` dump — the **only** instrument-discovery
+mechanism this codebase has, or that Kite Connect's SDK exposes at all
+(checked: `dir(KiteConnect)` has no `expired_instruments`, no
+`historical_instruments`, no date-parameterized variant of `instruments()`)
+— is **completely purged of every contract whose expiry has already
+passed**. The 42-day backtest window (2026-07-06 to 2026-09-01) had
+roughly 8-9 real weekly NIFTY expiries; every one of them, and every
+strike within each, is now entirely absent from the only place this
+system (or apparently any Kite Connect retail-tier client) can look up
+an `instrument_token`.
+
+Confirmed this is a real, hard wall, not just an inconvenience to work
+around:
+
+```
+$ python -c "... kite.historical_data(999999999, ...) ..."
+REAL FAILURE MODE for an unrecognized instrument_token: InputException - invalid token
+```
+
+`historical_data()` validates `instrument_token` against Kite's own
+server-side records and rejects an unrecognized one outright. Since this
+project never captured and saved an instruments dump *before* the
+42-day window's contracts expired (checked `data/private/` — nothing
+saved), there is no legitimate `instrument_token` for any of those
+now-expired contracts to even attempt a `historical_data()` call with.
+**The real blocker is instrument discovery, not (necessarily) data
+retention** — whether Kite would still serve real candles for an expired
+contract given a genuinely valid token is a real, different question
+this pass could not test, because no such token can be honestly obtained
+for this already-elapsed window.
+
+**Conclusion: not genuinely feasible**, for the specific 42-day window
+already elapsed. Per the brief's own explicit instruction, no synthetic
+approximation was built to paper over this — the gap stays real and
+stated, exactly as it has been since Brief 4.
+
+**One real, useful, related data point** while a live session was
+available — re-confirms Brief 4/5's original finding still holds, using
+today's real data rather than assuming it still applies:
+
+```
+$ python -c "... near-ATM contract for the nearest real expiry (2026-09-08) ..."
+real spot: 23897.7
+near-ATM contract: NIFTY2690823900CE strike 23900.0
+real daily candles returned: 23
+earliest real date: 2026-08-05
+latest real date: 2026-09-04
+```
+
+A **currently-listed** weekly contract still shows real history well
+beyond its own ~1-week nominal life (30 real calendar days here) —
+consistent with Brief 4/5's original finding, confirmed as a repeatable
+real pattern, not a fluke. This remains useful for **future** backtest
+windows if instrument dumps are proactively saved before contracts
+expire (a real, actionable idea for later, not attempted this pass) —
+it does not help the already-elapsed window this brief asked about.
+
+### Part A.4 — re-ran the same 42-day backtest, real result unchanged
+
+```
+$ python -c "... run_daily_backtest(Settings(), frame, global_context_by_day=real_history) ..."
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+```
+
+Identical to Brief 8's result — expected and correct, since nothing
+about the decision pipeline changed this pass; this re-run is a real
+confirmation of no drift/regression, not new evidence of a different
+outcome.
+
+## Part B. Continued live-run tracking — acknowledged, nothing to execute this pass
+
+Real NSE market hours are 9:15-15:30 IST; this session's real clock read
+22:16 IST on 2026-09-04 when this brief was worked — after real market
+close. Running the live scheduler right now would either wait
+indefinitely for a market that's already closed or correctly report
+`no_entry`/closed for reasons unrelated to the actual pipeline being
+exercised — not real evidence either way. Per the brief's own framing,
+this is inherently a **next real trading morning** activity requiring
+the user's own interactive Kite login each day (single-use request
+tokens, no way to automate this step) — nothing for this session to
+execute preemptively.
+
+**No code changes were needed or made for this to work** — confirmed
+true by everything already built and tested through Brief 8: 5 real
+setup types (Brief 7), real global market data (Brief 8 Part A), real
+news classification (Brief 8 Part B), real day-over-day option-chain
+snapshot persistence (Brief 5 Part B, meaning day 2 of live tracking
+onward gets a real previous snapshot for the first time ever), and real
+AI enrichment once the Anthropic account has credit (Brief 8 Part C,
+currently blocked on billing per that report section). Each real trading
+day from here on will be reported honestly as it happens — a real trade
+or a correct `no_entry`, either is real information, per the brief's own
+acceptance criteria (no single "DONE" for this part).
