@@ -143,20 +143,32 @@ def run_scheduled_day(settings: Settings) -> dict:
     (Database.save_option_chain_snapshot) and retrieves the prior one
     (latest_option_chain_snapshot) so option-based scoring has real
     day-over-day data to compare, since a fresh process each morning has
-    no other memory of yesterday (Brief 5 Part B). Known, still-open gaps
-    (see execution/live_context.py::KNOWN_GAPS and the accompanying report
-    for the full honest list):
-    - `global_score`/`news` are real wiring over still-empty real data --
-      no live global-market or news provider is wired in yet (researched,
-      not picked, in Brief 5 Part C).
-    - `option`'s OI-buildup scoring stays at its honest "unavailable" floor
-      until a second real snapshot has actually been persisted (i.e. from
-      the second day this runs onward).
+    no other memory of yesterday (Brief 5 Part B). As of Brief 8, real
+    global-market data (YFinanceGlobalMarketProvider) and real news
+    (data/rss_news.py -- real RSS feeds, classified by AI when configured
+    or a real deterministic keyword fallback otherwise) are both wired
+    into every scan's context here too -- `global_score`/`news` are no
+    longer wired-but-empty; each independently fails closed to an empty
+    list on its own real fetch failure, same as everything else. Known,
+    still-open gaps (see execution/live_context.py::KNOWN_GAPS and the
+    accompanying report for the full honest list):
+    - `option`'s OI-buildup scoring stays at its honest "unavailable"
+      floor until a second real snapshot has actually been persisted
+      (i.e. from the second day this runs onward).
     - fetch_option_quotes' `oi` field mapping is unconfirmed against a
       real live option quote (only the index quote and instrument list
       were captured live).
-    No credentials configured still correctly produces "no_entry" (fails
-    closed), same as before this pass.
+    - Real AI enrichment (ai/provider.py::AnthropicProvider) is wired but
+      currently blocked on the configured Anthropic account having no
+      credit balance -- see V2_BUILD_REPORT.md's Brief 8 Part C.
+
+    A real Obsidian "Daily Research" journal entry is written after the
+    day completes (ObsidianExporter, fails closed on any vault write
+    failure -- never blocks returning this function's result); each real
+    trade close writes its own real "Trade Journal" entry independently
+    (Orchestrator._close_position). No credentials configured still
+    correctly produces "no_entry" (fails closed), same as before this
+    pass.
     """
     database = Database(settings.database_path)
     database.initialize()
@@ -219,7 +231,7 @@ def run_scheduled_day(settings: Settings) -> dict:
         clock=clock,
         sleeper=time.sleep,
     )
-    return {
+    summary = {
         "resumed_positions": len(resumed),
         "day_ran": day.ran,
         "day_reason": day.reason,
@@ -227,6 +239,23 @@ def run_scheduled_day(settings: Settings) -> dict:
         "trades_today": sum(1 for r in day.rounds if r.cycle.order),
         "order": day.cycle.order if day.cycle else None,
     }
+    # Real daily research journal entry, written as the day happens --
+    # was previously only reachable via the standalone `export-obsidian`
+    # CLI command (a fixed placeholder note on manual request). Each real
+    # trade close already writes its own real "Trade Journal" entry
+    # independently (Orchestrator._close_position). Fails closed exactly
+    # like every other integration here -- ObsidianExporter.export()
+    # already returns None on no vault configured or a real OSError; this
+    # broader except also covers anything else, and either way a vault
+    # write failure must never prevent this function from returning its
+    # real result.
+    try:
+        ObsidianExporter(settings.obsidian_vault_path).export(
+            "Daily Research", clock().date().isoformat(), summary
+        )
+    except Exception as exc:  # noqa: BLE001 - a vault write failure must never break the trading loop.
+        logger.warning("obsidian_daily_research_export_failed error=%s", exc)
+    return summary
 
 
 def paper_dry_run(settings: Settings) -> dict:

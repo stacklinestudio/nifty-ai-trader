@@ -37,6 +37,7 @@ from execution.position_persistence import position_state_from_dict, position_st
 from execution.position_supervisor import PositionState, TickResult
 from execution.position_supervisor import tick as supervise_tick
 from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
+from integrations.obsidian import ObsidianExporter
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.logger import configure_logger
@@ -142,6 +143,7 @@ class Orchestrator:
             settings.discord_webhook_url,
             webhooks_by_category=webhooks_by_category_from_settings(settings),
         )
+        self.obsidian = ObsidianExporter(settings.obsidian_vault_path)
         self._state: _CycleState | None = None
         # (direction, setup_type, entry_regime) of every stop-out closed
         # today, for the re-entry re-validation gate below. Cleared only by
@@ -171,6 +173,16 @@ class Orchestrator:
             self.discord.send_event(event)
         except Exception as exc:  # noqa: BLE001 - a notification bug must never break the trading loop.
             logger.warning("discord_event_dispatch_failed event_type=%s error=%s", kind, exc)
+        # Separate try/except from Discord's above, deliberately -- a
+        # Discord failure must not prevent Telegram from being attempted,
+        # and vice versa. Previously self.telegram was only ever reached
+        # from the crash-recovery CRITICAL path (see recover_open_
+        # positions below); a normal research/signal/entry/exit cycle
+        # never notified Telegram at all, only Discord.
+        try:
+            self.telegram.send_event(event)
+        except Exception as exc:  # noqa: BLE001 - a notification bug must never break the trading loop.
+            logger.warning("telegram_event_dispatch_failed event_type=%s error=%s", kind, exc)
 
     @staticmethod
     def _consensus(results: dict[str, AgentResult]) -> tuple[str, bool]:
@@ -548,6 +560,38 @@ class Orchestrator:
                 "stop_was_trailed": state.current_stop != state.thesis.stop,
             }
         )
+        # Real per-trade journal entry, written as the day happens -- was
+        # previously only reachable via the standalone `export-obsidian`
+        # CLI command (a single placeholder "Daily Research" note on
+        # manual request), never during a normal live day.
+        # ObsidianExporter.export() already fails closed on OSError
+        # internally (returns None, no vault configured or a real write
+        # failure); this broader except also catches anything else a bad
+        # `facts` value could raise, matching the same non-fatal
+        # try/except pattern Discord/Telegram already use in _event() --
+        # a vault write failure must never break the trading loop.
+        try:
+            self.obsidian.export(
+                "Trade Journal",
+                f"{now.date().isoformat()}-{state.thesis.symbol}-{order['order_id']}",
+                {
+                    "symbol": state.thesis.symbol,
+                    "direction": state.thesis.candidate.direction,
+                    "setup_type": state.thesis.candidate.setup_type,
+                    "entry": state.thesis.entry,
+                    "exit": order["fill_price"],
+                    "quantity": state.thesis.quantity,
+                    "pnl": pnl,
+                    "exit_reason": result.reason,
+                    "mae": state.mae,
+                    "mfe": state.mfe,
+                    "hold_seconds": hold_seconds,
+                    "entry_regime": state.entry_regime,
+                    "confidence": state.thesis.confidence,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - a vault write failure must never break the trading loop.
+            logger.warning("obsidian_trade_journal_export_failed order_id=%s error=%s", order["order_id"], exc)
 
     def run_supervised(
         self,
