@@ -7,10 +7,15 @@ from typing import Any
 
 from agents.base import BaseAgent
 from agents.contracts import AgentResult, TradeCandidate
+from ai.prompts import GLOBAL_SYNTHESIS
+from ai.router import AIRouter
 from config import IST
 from data.news import aggregate_sentiment
 from intelligence.market_regime import Regime, classify
+from monitoring.logger import configure_logger
 from strategy.regime_selector import weight_for
+
+logger = configure_logger(__name__)
 
 
 def _result(agent: str, confidence: float, evidence: tuple[str, ...], **data: Any) -> AgentResult:
@@ -18,7 +23,29 @@ def _result(agent: str, confidence: float, evidence: tuple[str, ...], **data: An
 
 
 class GlobalResearchAgent(BaseAgent):
+    """global_direction/confidence below are computed by ONE deterministic
+    formula (the real average of context["global_context"]'s numeric
+    values) and NOTHING else changes them -- ai_commentary (Brief 8 Part
+    C) is a purely additional, informational field, generated from the
+    SAME real facts, read by no other agent, RiskAgent, sizing, or order
+    logic anywhere in this codebase (see
+    tests/test_ai_safety.py::test_adversarial_ai_output_never_changes_
+    the_deterministic_signal for the adversarial proof). AI here
+    supplements the quantitative read; it never replaces or adjusts it.
+    """
+
     name = "global_research"
+    # Real synchronous AI HTTP calls can take longer than BaseAgent's
+    # default 3s budget; this only affects how long the OPTIONAL ai_
+    # commentary enrichment is allowed to take before BaseAgent.run()'s
+    # own post-hoc check would flag the whole result as timed-out -- the
+    # deterministic computation above is unaffected either way, and the
+    # ai_commentary try/except below already has its own tighter, real
+    # HTTP-level bound (ai/provider.py::ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
+    timeout_seconds = 20.0
+
+    def __init__(self, ai_router: AIRouter | None = None) -> None:
+        self.ai_router = ai_router or AIRouter()
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
         values = context.get("global_context", [])
@@ -33,14 +60,37 @@ class GlobalResearchAgent(BaseAgent):
                 risk_factors=["missing global context"],
             )
         score = sum(float(getattr(value, "value", 0) or 0) for value in available) / len(available)
+        global_direction = "BULLISH" if score > 0 else "BEARISH" if score < 0 else "NEUTRAL"
+        confidence = min(80, abs(score))
+
+        ai_commentary = self._synthesize(available)
+
         return _result(
             self.name,
-            min(80, abs(score)),
+            confidence,
             ("Available global context evaluated.",),
-            global_direction="BULLISH" if score > 0 else "BEARISH" if score < 0 else "NEUTRAL",
+            global_direction=global_direction,
             data_freshness="PROVIDED",
             risk_factors=[],
+            ai_commentary=ai_commentary,
         )
+
+    def _synthesize(self, available: list[Any]) -> str | None:
+        """Real AI synthesis over the same real facts already used above
+        -- never invents new data, never influences global_direction/
+        confidence (already computed before this is even called). Any
+        failure here (network, parsing, no provider configured) is
+        caught LOCALLY and returns None -- it must never escape to
+        BaseAgent.run()'s outer try/except, which would discard the
+        already-correct deterministic result above along with it.
+        """
+        try:
+            facts = {v.name: v.value for v in available}
+            analysis = self.ai_router.analyze(GLOBAL_SYNTHESIS, facts)
+            return analysis.summary or None
+        except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; its failure must never affect the real deterministic result above.
+            logger.warning("global_research_ai_synthesis_failed error=%s", exc)
+            return None
 
 
 class IndiaMarketAgent(BaseAgent):

@@ -27,6 +27,8 @@ from agents.trading_agents import (
     TradeBuilderAgent,
     TradeSupervisorAgent,
 )
+from ai.provider import build_ai_provider
+from ai.router import AIRouter
 from config import IST, Settings
 from events.bus import EventBus
 from events.contracts import Event, EventType
@@ -95,6 +97,7 @@ class Orchestrator:
         settings: Settings,
         database: Database | None = None,
         paper_broker: PaperBroker | None = None,
+        ai_router: AIRouter | None = None,
     ) -> None:
         self.settings = settings
         self.database = database or Database(settings.database_path)
@@ -104,8 +107,18 @@ class Orchestrator:
             settings.tick_size, settings.entry_slippage_ticks, settings.exit_slippage_ticks
         )
         self.limits = DailyLimits(settings.max_trades_per_day, settings.max_daily_loss)
+        # Brief 8 Part C: real AI enrichment, strictly synthesis/narrative
+        # -- see GlobalResearchAgent/PostTradeAgent's own docstrings for
+        # exactly which fields this can and cannot touch. Defaults to
+        # UnavailableProvider (build_ai_provider) whenever
+        # settings.ai_provider isn't explicitly "anthropic" with a real
+        # key configured -- identical behavior to every prior brief.
+        # Injectable (like database/paper_broker above) so
+        # tests/test_ai_safety.py can prove an adversarial provider
+        # cannot change a single real trade decision.
+        self.ai_router = ai_router or AIRouter(build_ai_provider(settings))
         self.research_agents = [
-            GlobalResearchAgent(),
+            GlobalResearchAgent(self.ai_router),
             IndiaMarketAgent(),
             NewsAgent(),
             TechnicalAgent(),
@@ -122,7 +135,7 @@ class Orchestrator:
         self.execution_agent = ExecutionAgent(self.paper_broker, settings)
         self.validator = IndependentTradeValidator()
         self.memory = MemoryStore(settings.database_path)
-        self.post_trade_agent = PostTradeAgent(self.memory)
+        self.post_trade_agent = PostTradeAgent(self.memory, self.ai_router)
         self.trade_supervisor_agent = TradeSupervisorAgent()
         self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
         self.discord = DiscordNotifier(

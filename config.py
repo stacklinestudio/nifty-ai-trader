@@ -59,7 +59,13 @@ class Settings:
     kite_api_key: str = os.getenv("KITE_API_KEY", "")
     kite_api_secret: str = os.getenv("KITE_API_SECRET", "")
     kite_access_token: str = os.getenv("KITE_ACCESS_TOKEN", "")
+    # Brief 8 Part C: stays "unavailable" until explicitly flipped by hand
+    # in .env.local on a fresh run -- never flipped programmatically here,
+    # and never while a live run is in progress (user's own explicit
+    # instruction).
     ai_provider: str = os.getenv("AI_PROVIDER", "unavailable")
+    ai_model: str = os.getenv("AI_MODEL", "claude-haiku-4-5-20251001")
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
     supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
     max_consecutive_tick_failures: int = int(os.getenv("MAX_CONSECUTIVE_TICK_FAILURES", "5"))

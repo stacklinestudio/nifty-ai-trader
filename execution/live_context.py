@@ -74,9 +74,11 @@ import pandas as pd
 from agents.research_agents import GlobalResearchAgent, NewsAgent
 from config import IST, Settings
 from data.calendar import NseCalendar
+from data.global_market import ContextValue
 from data.historical import KiteHistoricalData
 from data.instruments import OptionInstrument, download_kite_nifty_options
 from data.market_data import KiteMarketData, parse_kite_timestamp, validate_quote
+from data.news import NewsItem
 from data.option_chain import OptionQuote
 from intelligence.market_regime import Regime, classify
 from intelligence.oi_buildup import detect_buildup
@@ -868,6 +870,8 @@ def assemble_context(
     market_open: bool,
     settings: Settings,
     previous_option_quotes: list[OptionQuote] | None = None,
+    global_context: list[ContextValue] | None = None,
+    news_items: list[NewsItem] | None = None,
 ) -> dict[str, Any]:
     """Pure context assembly from already-fetched data -- no I/O, no Kite
     calls. Both build_live_context (fetches live) and
@@ -883,13 +887,22 @@ def assemble_context(
     supply a real one, retrieved from storage.database.Database's
     persisted snapshot (Part B); daily_backtest.py supplies the prior
     trading day's option_quotes_by_day entry when one exists.
+
+    global_context/news_items (Brief 8 Parts A/B): real external data,
+    fetched by the CALLER (main.py's context_provider for live, a
+    per-day lookup for backtest) and passed in here -- this function
+    itself does no yfinance/RSS I/O, keeping it Kite-independent and
+    consistent with how previous_option_quotes is threaded rather than
+    fetched here. Default to [] (not fabricated) when a caller has none,
+    which GlobalResearchAgent/NewsAgent already correctly read as
+    "unavailable."
     """
     previous_option_quotes = previous_option_quotes or []
     context: dict[str, Any] = {
         "market_open": market_open,
         "market_data_fresh": True,
-        "global_context": [],  # no live provider wired -- GlobalResearchAgent fails closed on this
-        "news_items": [],  # no live news source wired -- NewsAgent fails closed on this
+        "global_context": global_context or [],
+        "news_items": news_items or [],
         "spot": spot,
         "max_position_value": settings.max_position_value,
         "option_quotes": option_quotes,
@@ -913,6 +926,8 @@ def build_live_context(
     calendar: NseCalendar,
     now: datetime | None = None,
     previous_option_quotes: list[OptionQuote] | None = None,
+    global_context: list[ContextValue] | None = None,
+    news_items: list[NewsItem] | None = None,
 ) -> dict[str, Any]:
     """previous_option_quotes: the real prior-session option chain, when
     the caller has one (main.py retrieves it from
@@ -920,14 +935,21 @@ def build_live_context(
     this -- Brief 5 Part B). Defaults to None/[] so this function stays
     usable and correctly fail-closed on its own, e.g. in tests that don't
     care about OI-buildup scoring.
+
+    global_context/news_items (Brief 8): real data the caller already
+    fetched (main.py's context_provider, via YFinanceGlobalMarketProvider
+    and the real RSS fetch) -- this function does no yfinance/RSS I/O of
+    its own, only Kite. Defaults to None/[] so callers that don't supply
+    either (including every existing test) get the same fail-closed
+    empty-context behavior as before this parameter existed.
     """
     now = now or datetime.now(IST)
     market_open = calendar.is_market_open(now)
     not_fresh: dict[str, Any] = {
         "market_open": market_open,
         "market_data_fresh": False,
-        "global_context": [],
-        "news_items": [],
+        "global_context": global_context or [],
+        "news_items": news_items or [],
     }
 
     try:
@@ -954,5 +976,13 @@ def build_live_context(
     option_quotes = fetch_option_quotes(kite, universe) if universe else []
 
     return assemble_context(
-        candles, option_quotes, quote.ltp, now, market_open, settings, previous_option_quotes
+        candles,
+        option_quotes,
+        quote.ltp,
+        now,
+        market_open,
+        settings,
+        previous_option_quotes,
+        global_context,
+        news_items,
     )

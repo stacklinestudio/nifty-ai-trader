@@ -26,8 +26,10 @@ from backtest.simulator import Simulator
 from backtest.walk_forward import walk_forward
 from config import IST, Settings
 from data.calendar import NseCalendar
+from data.global_market import YFinanceGlobalMarketProvider
 from data.historical import validate_candles
 from data.market_data import KiteMarketData, validate_quote
+from data.rss_news import fetch_recent_news
 from execution.live_context import build_live_context
 from execution.process_lock import AlreadyRunningError, ProcessLock
 from execution.scheduler import resume_open_positions, run_trading_day
@@ -176,8 +178,28 @@ def run_scheduled_day(settings: Settings) -> dict:
         # database at the moment this cycle runs, not whenever
         # run_scheduled_day started.
         previous_option_quotes = database.latest_option_chain_snapshot()
+        # Real external data (Brief 8 Parts A/B) -- each independently
+        # fails closed: a yfinance or RSS failure here means an empty
+        # list, which GlobalResearchAgent/NewsAgent already correctly
+        # read as "unavailable," never a crash and never a guess.
+        try:
+            global_context = YFinanceGlobalMarketProvider().snapshot()
+        except Exception as exc:  # noqa: BLE001 - yfinance's own failure must not block the rest of this cycle.
+            logger.warning("global_market_snapshot_failed error=%s", exc)
+            global_context = []
+        try:
+            news_items = fetch_recent_news(orchestrator.ai_router)
+        except Exception as exc:  # noqa: BLE001 - an RSS failure must not block the rest of this cycle.
+            logger.warning("news_fetch_failed error=%s", exc)
+            news_items = []
         context = build_live_context(
-            settings, kite, calendar, clock(), previous_option_quotes=previous_option_quotes
+            settings,
+            kite,
+            calendar,
+            clock(),
+            previous_option_quotes=previous_option_quotes,
+            global_context=global_context,
+            news_items=news_items,
         )
         # Persist THIS cycle's chain so the next cycle (a fresh process,
         # per this deployment's own recommended "one process per trading

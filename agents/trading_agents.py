@@ -7,16 +7,21 @@ from typing import Any
 
 from agents.base import BaseAgent
 from agents.contracts import AgentResult, Decision, TradeCandidate, TradeThesis, Validation
+from ai.prompts import POST_TRADE_EXPLANATION
+from ai.router import AIRouter
 from config import IST, Settings
 from data.option_chain import OptionQuote
 from intelligence.oi_buildup import detect_buildup
 from learning.experiment_manager import Experiment, create_experiment
 from learning.memory import MemoryStore
 from learning.trade_memory import record_trade
+from monitoring.logger import configure_logger
 from risk.confidence_scaling import scale_quantity
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from strategy.option_selector import OptionSelector
+
+logger = configure_logger(__name__)
 
 
 def result(name: str, confidence: float, evidence: tuple[str, ...], **data: Any) -> AgentResult:
@@ -279,12 +284,25 @@ class PostTradeAgent(BaseAgent):
     MemoryStore and creates a CANDIDATE Experiment. Promotion still requires
     learning.promotion_engine.decide() to see historical, walk-forward, and
     out-of-sample evidence plus explicit human approval.
+
+    Runs strictly AFTER a trade has already closed (agents/orchestrator.py
+    ::_close_position calls review_trade only once the paper SELL order
+    has already filled) -- record_trade/create_experiment above use only
+    the real deterministic outcome facts already established by then.
+    ai_explanation (Brief 8 Part C) is generated from those SAME
+    already-recorded facts, strictly for human review of the trading log;
+    it is appended to this method's own return value only, after
+    record_trade/create_experiment have already run on the deterministic
+    facts alone -- it cannot retroactively affect a trade that has
+    already closed, and no other code anywhere reads it.
     """
 
     name = "post_trade"
+    timeout_seconds = 20.0  # see GlobalResearchAgent's identical comment on why
 
-    def __init__(self, memory: MemoryStore) -> None:
+    def __init__(self, memory: MemoryStore, ai_router: AIRouter | None = None) -> None:
         self.memory = memory
+        self.ai_router = ai_router or AIRouter()
 
     def analyze(self, context: dict[str, Any]) -> AgentResult:
         outcome = context.get("outcome", "NO_TRADE")
@@ -327,9 +345,45 @@ class PostTradeAgent(BaseAgent):
             Experiment(hypothesis, {"setup_type": setup_type, "entry_regime": entry_regime}, "v2"),
             datetime.now(IST),
         )
+        ai_explanation = self._explain(outcome, pnl, setup_type, exit_reason, mae, mfe, hold_seconds)
         return result(
             self.name,
             60,
             ("Closed-trade facts recorded; hypothesis is a candidate only, not a promotion.",),
             review={"outcome": outcome, "pnl": pnl, "mae": mae, "mfe": mfe, "learning_hypothesis": hypothesis},
+            ai_explanation=ai_explanation,
         )
+
+    def _explain(
+        self,
+        outcome: str,
+        pnl: float,
+        setup_type: str,
+        exit_reason: str,
+        mae: float,
+        mfe: float,
+        hold_seconds: float | None,
+    ) -> str | None:
+        """Real, plain-language explanation of an already-closed trade,
+        for human review only -- see this class's own docstring for why
+        that's structurally guaranteed, not just a convention. Any
+        failure (no provider configured, network, parsing) is caught
+        LOCALLY and returns None, same reasoning as GlobalResearchAgent's
+        identical pattern: must never escape to BaseAgent.run()'s outer
+        try/except and discard the already-recorded real trade facts.
+        """
+        try:
+            facts = {
+                "outcome": outcome,
+                "pnl": pnl,
+                "setup_type": setup_type,
+                "exit_reason": exit_reason,
+                "mae": mae,
+                "mfe": mfe,
+                "hold_seconds": hold_seconds,
+            }
+            analysis = self.ai_router.analyze(POST_TRADE_EXPLANATION, facts)
+            return analysis.summary or None
+        except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; failure must not affect the already-recorded real trade facts.
+            logger.warning("post_trade_ai_explanation_failed error=%s", exc)
+            return None
