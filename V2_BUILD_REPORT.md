@@ -2654,3 +2654,105 @@ investigation, real answer: not feasible for the elapsed window) and
 Part B (continued live-run tracking) stand exactly as reported in the
 section above. No new real trading day has occurred yet since that
 report (still the same real day, market closed).
+
+# Deep-Dive: The Real Mathematical Confidence Ceiling (2026-09-04, same day)
+
+Research/investigation only — no code changed. Computed with the real
+`SignalEngine.evaluate()`, not manual arithmetic (all 3 scenarios below
+are real, pasted command output).
+
+## The real ceiling isn't one number — it's two, and they tell different stories
+
+**(a) The formula's own nominal ceiling** (each input at its own
+declared 0-100 / -100..100 range): **100.0**. Not useful on its own — no
+real caller in this codebase can ever produce most of these inputs at
+their nominal maximum.
+
+**(b) The real, achievable ceiling for the 4 trend-favored setups**
+(`OPENING_RANGE_BREAKOUT`, `TREND_CONTINUATION`, `MOMENTUM_CONTINUATION`,
+`VWAP_BREAKOUT`) — each input at *its own real structural maximum*,
+confirmed by reading every scoring function directly:
+
+| Input | Real max | Where it's capped |
+|---|---|---|
+| `technical` | 75.0 | Binary 75.0/45.0 (`execution/live_context.py`) |
+| `opening` | 80.0 | ORB aligned=80.0; all 5 new setups via `_clamp_score`, max 80.0 |
+| `volume` | 100.0 | Genuinely uncapped — reachable at a real 2x volume ratio |
+| `option` | 75.0 | `_option_score`: 75.0 if aligned buildup, never higher |
+| `global_score` | 80.0 | = `GlobalResearchAgent`'s own confidence cap |
+| `news` | 40.0 | = `NewsAgent`'s own confidence cap (Brief 3 Part C, deliberate) |
+| `risk_penalty` | 0.0 (best case) | Binary 0.0/25.0 |
+
+```
+confidence = 81.25, direction = CALL
+margin over threshold 75: 6.25 (7.69% of the ceiling)
+```
+
+**This clears 75 — but not comfortably.** 6.25 points of real slack
+across all 7 inputs combined. `technical` dropping to its *only other
+real value* (45.0) costs 10.5 points by itself — more than the entire
+slack. `opening` dropping to 50.0 (ORB's neutral state) costs 7.5 —
+also more than the entire slack. **`technical` and `opening` must both
+be at their own real maximum simultaneously for confidence to have any
+chance of reaching 75 at all** — nothing else can compensate for a miss
+on either. The real 42-day backtest's observed maximum (53.8) is
+consistent with that precise a co-occurrence never happening in that
+window, not with the ceiling being unreachable.
+
+## (c) A real, structural bug found while computing this — not conservatism
+
+For the 2 range-favored setups (`VWAP_REJECTION`, `SUPPORT_RESISTANCE_REACTION`,
+wired in Brief 7's follow-up), `technical_score` is keyed to
+`trend_direction`:
+
+```python
+technical_score = 75.0 if (bullish and trend_direction == "CALL") or (
+    not bullish and trend_direction == "PUT"
+) else 45.0
+```
+
+`trend_direction` is **structurally `None`** for these two setups —
+`_select_setup` only tries them when `trend_direction is None` (that's
+the whole point: they fire on `RANGE`/`UNCERTAIN` regimes, where there's
+no trend). Neither comparison can ever be `True`, so `technical_score`
+is **unconditionally 45.0** for these two setups — never 75.0, no matter
+how strongly the setup's own real EMA/VWAP bullish read confirms its
+direction. Real ceiling for these two setups specifically, everything
+else at its own real max:
+
+```
+confidence = 70.75, direction = NO_TRADE
+vs threshold 75: -4.25
+```
+
+**`VWAP_REJECTION` and `SUPPORT_RESISTANCE_REACTION` can mathematically
+never produce a trade under the current formula, at any real input
+values.** This is a real, identifiable, fixable logic gap — not
+discipline, not conservatism, and not a `signal_threshold` problem. The
+`bullish` read itself is computed correctly and reused as intended; the
+final comparison just checks it against the wrong direction variable
+(`trend_direction` instead of the setup's own `direction`, which
+`_select_setup` already returns).
+
+## Honest recommendation: don't touch `signal_threshold` — fix the real bug instead
+
+- **For the 4 trend-favored setups**: the real ceiling (81.25) clears 75
+  with real, if thin, margin. Lowering the threshold isn't supported by
+  this data — it would weaken the deliberate selectivity for setups that
+  are already mathematically reachable at the current bar. The honest
+  reading of "real max ever seen was 53.8" is "the precise multi-input
+  alignment this needs hasn't occurred in 42 real days," not "the bar is
+  set wrong."
+- **For the 2 range-favored setups**: recalibrating `signal_threshold`
+  downward to accommodate them is the wrong lever — it would also lower
+  the bar for the other 4 setups, which isn't warranted by anything in
+  this data, and a threshold chosen to paper over a specific logic bug
+  is exactly the kind of change these ground rules exist to prevent. The
+  real fix is keying `technical_score` to the firing setup's own
+  `direction` (already available from `_select_setup`'s return value)
+  instead of `trend_direction` — that alone would raise these two
+  setups' real ceiling to the same 81.25 as the other four, making them
+  genuinely tradeable at the **current, unchanged** 75.
+- **Not implemented this pass** — reported for a decision, per the
+  brief's own explicit instruction ("I'll decide once I see the actual
+  math").
