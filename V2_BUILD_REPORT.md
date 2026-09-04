@@ -3272,3 +3272,119 @@ using a methodology that never touches `SignalEngine` at all.
 
 **Not recommended or changed here**, per the brief's explicit instruction:
 no threshold change, no new setup type. Reported for Prashu's decision.
+
+## Brief 10 follow-up: decoupling AI-synthesis cadence from the 60s scan interval (2026-09-05)
+
+Direct response to Part A's real ~$24/month worst-case projection: the
+cost driver wasn't per-call price (measured at ~$0.0017/call, tiny) — it
+was calling AI on every 60s entry scan for data (global market context,
+news) that doesn't meaningfully change that often, unlike price-based
+setup detection, which correctly does need every scan.
+
+**Added**: `Settings.ai_synthesis_refresh_seconds` (default 900s = 15
+min, independent of `entry_scan_interval_seconds`) and
+`ai/refresh_cache.py::RefreshingAIRouter` — a time-based cache keyed by
+`task` alone (not `task, facts`), so it reuses the last real result
+across scans within the refresh window even when this scan's facts
+differ slightly from last time's. `Orchestrator.synthesis_ai_router`
+wraps whatever `ai_router` ends up being (default-built or injected) and
+is what `GlobalResearchAgent` now holds; `main.py`'s news-classification
+call site (`fetch_recent_news`) was switched to it too — both of this
+session's real per-scan AI call sites are now throttled the same way.
+`PostTradeAgent` deliberately keeps the raw, un-throttled `ai_router` —
+each closed trade's own real facts are genuinely different from the last
+trade's, so reusing a cached explanation across trades would be wrong,
+not just wasteful.
+
+**A real bug found and fixed before this shipped**: the first version of
+`RefreshingAIRouter` wrapped an `AIRouter` (not the raw provider). A
+failing test caught it immediately —
+`test_refreshing_router_calls_the_real_provider_once_per_refresh_window_not_once_per_scan`
+called `.analyze()` with byte-identical facts across every simulated
+scan, and `provider.calls` came back `1`, not the expected `23`.
+`AIRouter`'s own cache is an exact `task+facts` match that never expires
+— stacked underneath the refresh timer, it silently defeated the timer
+whenever two scans' facts happened to be identical, collapsing "one real
+call per 15-minute window" into "one real call ever" for that task.
+Fixed by having `RefreshingAIRouter` wrap the raw `AIProvider` directly
+(`self.ai_router.provider`) and call `analyze()`/`validate()` itself,
+never routing through `AIRouter`'s conflicting cache at all.
+
+```
+$ pytest tests/test_ai_refresh_cache.py -q
+....                                                                     [100%]
+4 passed in 0.79s
+```
+
+`test_refreshing_router_calls_the_real_provider_once_per_refresh_window_not_once_per_scan`
+simulates a full real trading day (09:15–15:00, 345 real 60s-spaced
+scans, confirmed by asserting `scan_count == 345` before checking the
+real assertion) with a fully injectable clock — no real sleeping — and
+confirms the underlying provider was called exactly **23** times (one per
+15-minute window across the real 5h45m scan span), not 345.
+`test_refreshing_router_makes_a_real_new_call_once_the_window_elapses`
+confirms the boundary precisely (899s: still cached; 901s: real new
+call) and that changed facts within the window are still ignored — the
+throttle is time-based, not content-based, exactly as specified.
+`test_two_different_tasks_are_cached_independently` confirms
+`GLOBAL_SYNTHESIS` and `NEWS_CLASSIFICATION` don't reset each other's
+window since they share one `RefreshingAIRouter` instance.
+`test_orchestrator_wires_global_research_agent_to_the_throttled_router_not_the_raw_one`
+proves the real wiring: `GlobalResearchAgent.ai_router is
+orchestrator.synthesis_ai_router`, and `PostTradeAgent.ai_router is
+orchestrator.ai_router` (the raw one, unaffected).
+
+### Recomputed real cost projection
+
+Using the exact real measured floor rate from Part A ($0.0017/call,
+average of the two real captured direct calls) and the exact same real
+scan-window math (09:15→15:00 = 20,700s):
+
+| | Old (every scan) | New (every refresh window) |
+|---|---|---|
+| Scans/windows per day | 345 (60s interval) | 23 (900s refresh) |
+| Real AI calls/day (2 sites) | 690 | 46 |
+| Daily floor cost | $1.1754 | $0.0784 |
+| **Monthly (21 trading days)** | **≈$24.68** | **≈$1.65** |
+
+**Confirmed: comfortably under the $5/month expectation** — roughly a
+third of it, using the same floor-rate convention as the original
+projection (the unmeasured news-classification call is still likely
+somewhat pricier per call than the tiny global-market-values call this
+session actually measured; even at several times that floor rate, 46
+calls/day leaves generous headroom that 690 calls/day did not).
+
+```
+$ pytest -q
+282 passed in 13.66s
+$ ruff check .
+All checks passed!
+```
+
+### Part 5 — dry_run, replacing "manually zero every field"
+
+`Orchestrator(settings, dry_run=True)` builds genuinely unconfigured
+(no-op-by-construction) `TelegramNotifier()`/`DiscordNotifier("")`/
+`ObsidianExporter("")` regardless of what real-looking credentials
+`settings` carries — one explicit flag instead of remembering all 8
+notification/vault fields (`telegram_bot_token`, `telegram_chat_id`,
+`discord_webhook_url` and its 6 per-category variants,
+`obsidian_vault_path`) the way the incident script had to. Defaults to
+`False` — main.py's real live path and every existing test that doesn't
+pass it are completely unaffected. Deliberately does not touch AI
+provider selection (`settings.ai_provider` stays the explicit, separate
+mechanism it already was) — a script wanting real AI output with zero
+real notifications, exactly Part A's own use case, is fully supported.
+
+```
+$ pytest tests/test_orchestrator_dry_run.py -q
+....                                                                     [100%]
+4 passed in 0.92s
+```
+
+Verified beyond construction: `test_a_real_cycle_under_dry_run_runs_normally_and_touches_no_real_transport`
+replaces both notifiers' `transport` with a function that raises if ever
+called, then runs a real `run_cycle()` — confirms `dry_run` prevents a
+real transport call structurally (both `send_message`/`send_embed`
+short-circuit before `transport` on an unconfigured token/webhook), not
+just that the constructor looks right.
