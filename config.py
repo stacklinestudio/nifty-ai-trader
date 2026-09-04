@@ -66,6 +66,15 @@ class Settings:
     ai_provider: str = os.getenv("AI_PROVIDER", "unavailable")
     ai_model: str = os.getenv("AI_MODEL", "claude-haiku-4-5-20251001")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    # Brief 10: independent of entry_scan_interval_seconds -- global market
+    # conditions and news don't meaningfully change minute to minute, unlike
+    # price-based setup detection, which correctly does re-run every scan.
+    # ai/refresh_cache.py::RefreshingAIRouter uses this to reuse the last
+    # real AI synthesis/classification result across scans instead of
+    # making a real API call every single one (measured real per-scan-call
+    # cost, at the pre-fix cadence, projected to ~$24/month against a
+    # $5/month expectation -- see V2_BUILD_REPORT.md's Brief 10).
+    ai_synthesis_refresh_seconds: float = float(os.getenv("AI_SYNTHESIS_REFRESH_SECONDS", "900"))
     trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
     supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
     max_consecutive_tick_failures: int = int(os.getenv("MAX_CONSECUTIVE_TICK_FAILURES", "5"))

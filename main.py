@@ -201,7 +201,11 @@ def run_scheduled_day(settings: Settings) -> dict:
             logger.warning("global_market_snapshot_failed error=%s", exc)
             global_context = []
         try:
-            news_items = fetch_recent_news(orchestrator.ai_router)
+            # synthesis_ai_router (Brief 10), not the raw ai_router -- news
+            # classification is the other real per-scan AI call site this
+            # session's cost projection flagged; throttled to
+            # ai_synthesis_refresh_seconds same as GlobalResearchAgent's.
+            news_items = fetch_recent_news(orchestrator.synthesis_ai_router)
         except Exception as exc:  # noqa: BLE001 - an RSS failure must not block the rest of this cycle.
             logger.warning("news_fetch_failed error=%s", exc)
             news_items = []

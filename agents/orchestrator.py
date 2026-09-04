@@ -28,6 +28,7 @@ from agents.trading_agents import (
     TradeSupervisorAgent,
 )
 from ai.provider import build_ai_provider
+from ai.refresh_cache import RefreshingAIRouter
 from ai.router import AIRouter
 from config import IST, Settings
 from events.bus import EventBus
@@ -99,7 +100,21 @@ class Orchestrator:
         database: Database | None = None,
         paper_broker: PaperBroker | None = None,
         ai_router: AIRouter | None = None,
+        dry_run: bool = False,
     ) -> None:
+        """dry_run (Brief 10): the safe, explicit replacement for manually
+        zeroing every Settings notification/vault field one at a time in a
+        one-off investigation script -- a real incident this session, where
+        an unpatched `Orchestrator(Settings())` picked up this session's
+        real Discord/Telegram credentials from .env.local and sent a
+        synthetic test cycle as real notifications. dry_run=True builds
+        real, genuinely unconfigured (no-op-by-construction) Telegram/
+        Discord/Obsidian regardless of what settings carries -- one flag,
+        not eight fields to remember. Never touches ai_router/AI provider
+        selection (a separate, already-explicit mechanism via
+        settings.ai_provider) -- a script that wants real AI output but no
+        real notifications is exactly Brief 10 Part A's use case.
+        """
         self.settings = settings
         self.database = database or Database(settings.database_path)
         self.database.initialize()
@@ -118,8 +133,25 @@ class Orchestrator:
         # tests/test_ai_safety.py can prove an adversarial provider
         # cannot change a single real trade decision.
         self.ai_router = ai_router or AIRouter(build_ai_provider(settings))
+        # Brief 10: GlobalResearchAgent's synthesis (and, separately,
+        # data/rss_news.py's news classification via main.py's
+        # context_provider -- see orchestrator.synthesis_ai_router's use
+        # there) only actually calls the real provider once per
+        # ai_synthesis_refresh_seconds, not once per real entry scan --
+        # global market conditions/news don't meaningfully change minute to
+        # minute the way price-based setup detection correctly does. Wraps
+        # whatever self.ai_router ends up being (default-built or injected,
+        # e.g. tests/test_ai_safety.py's adversarial provider), so this is
+        # additive, not a behavior change for any test that calls run_cycle
+        # once. PostTradeAgent below deliberately keeps the raw,
+        # un-throttled self.ai_router -- each closed trade's own real facts
+        # are genuinely different from the last one's, so reusing a cached
+        # explanation across trades would be wrong, not just wasteful.
+        self.synthesis_ai_router = RefreshingAIRouter(
+            self.ai_router.provider, settings.ai_synthesis_refresh_seconds
+        )
         self.research_agents = [
-            GlobalResearchAgent(self.ai_router),
+            GlobalResearchAgent(self.synthesis_ai_router),
             IndiaMarketAgent(),
             NewsAgent(),
             TechnicalAgent(),
@@ -138,12 +170,17 @@ class Orchestrator:
         self.memory = MemoryStore(settings.database_path)
         self.post_trade_agent = PostTradeAgent(self.memory, self.ai_router)
         self.trade_supervisor_agent = TradeSupervisorAgent()
-        self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
-        self.discord = DiscordNotifier(
-            settings.discord_webhook_url,
-            webhooks_by_category=webhooks_by_category_from_settings(settings),
-        )
-        self.obsidian = ObsidianExporter(settings.obsidian_vault_path)
+        if dry_run:
+            self.telegram = TelegramNotifier()
+            self.discord = DiscordNotifier("")
+            self.obsidian = ObsidianExporter("")
+        else:
+            self.telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+            self.discord = DiscordNotifier(
+                settings.discord_webhook_url,
+                webhooks_by_category=webhooks_by_category_from_settings(settings),
+            )
+            self.obsidian = ObsidianExporter(settings.obsidian_vault_path)
         self._state: _CycleState | None = None
         # (direction, setup_type, entry_regime) of every stop-out closed
         # today, for the re-entry re-validation gate below. Cleared only by
