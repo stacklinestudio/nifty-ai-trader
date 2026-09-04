@@ -69,14 +69,17 @@ class Settings:
     trail_percent: float = float(os.getenv("TRAIL_PERCENT", "0.15"))
     supervision_poll_seconds: float = float(os.getenv("SUPERVISION_POLL_SECONDS", "10"))
     max_consecutive_tick_failures: int = int(os.getenv("MAX_CONSECUTIVE_TICK_FAILURES", "5"))
-    # Brief 6: periodic entry re-scanning. 240s (4 min) sits in the
-    # brief's own suggested 3-5 minute range -- comfortably inside Kite's
-    # documented 1 quote req/sec, 3 historical req/sec limits (enormous
-    # headroom at this cadence) and matches the timescale these setups
-    # actually develop on; deliberately not sub-minute (see
-    # execution/scheduler.py's run_trading_day docstring for the
-    # polling-vs-WebSocket tradeoff this pairs with).
-    entry_scan_interval_seconds: float = float(os.getenv("ENTRY_SCAN_INTERVAL_SECONDS", "240"))
+    # Brief 6 set this to 240s (4 min); Brief 9 tightened it to 60s (real
+    # math in execution/scheduler.py's module docstring -- 4 real Kite
+    # calls/cycle at 60s gives ~30x headroom under the 1 quote-req/sec
+    # ceiling on sustained average, ~180x under the 3 historical-req/sec
+    # ceiling, no documented daily cap). Deliberately not sub-minute:
+    # nothing meaningful changes on these setups' timescale below 1
+    # minute, and it adds real API/CPU load (instruments dump re-parsed
+    # every cycle) for no benefit. See execution/scheduler.py's
+    # run_trading_day docstring for the polling-vs-WebSocket tradeoff
+    # this still pairs with.
+    entry_scan_interval_seconds: float = float(os.getenv("ENTRY_SCAN_INTERVAL_SECONDS", "60"))
     # A full 15 minutes before forced_exit_time (15:15 default) so a fresh
     # position never opens with no realistic time to develop before
     # mandatory square-off. Only gates STARTING a new scan/entry -- an

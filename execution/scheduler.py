@@ -11,15 +11,50 @@ staying resident (call it in a loop) if there's a specific reason to.
 
 Brief 6: run_trading_day now periodically re-scans for a NEW entry through
 the day instead of evaluating exactly once near open -- polling, not
-Zerodha's WebSocket streaming API, deliberately. At a 3-5 minute interval
-(Settings.entry_scan_interval_seconds) this is nowhere near Kite's
-documented rate limits (1 quote req/sec, 3 historical req/sec, no daily
-cap -- enormous headroom), and it reuses the exact same, already-proven
-KiteMarketData.get_quote() path (timezone bug and all, already fixed and
-tested) rather than introducing a new persistent-connection/reconnect-logic
-surface while this feature is first being proven out. A future pass could
-reconsider WebSocket if scan frequency needs to drop meaningfully below a
-few minutes -- not needed at this cadence.
+Zerodha's WebSocket streaming API, deliberately, reusing the exact same,
+already-proven KiteMarketData.get_quote() path (timezone bug and all,
+already fixed and tested) rather than introducing a new persistent-
+connection/reconnect-logic surface while this feature is first being
+proven out.
+
+Brief 9 tightened the interval from 240s to 60s (Settings.entry_scan_
+interval_seconds) to reduce lag between a real setup starting to form and
+the system noticing it. Real math, not an assertion -- one full scan
+cycle (execution/live_context.py::build_live_context) makes exactly 4
+real Kite API calls: 1 quote (index spot, KiteMarketData.get_quote), 1
+historical (index candles, KiteHistoricalData.candles), 1 instruments
+(the NFO dump, download_kite_nifty_options), 1 more quote (the option-
+chain batch, fetch_option_quotes) -- confirmed by reading each call site,
+not estimated. At a 60s interval:
+- Quote-category: 2 calls/cycle / 60s = 0.033 req/sec sustained average
+  vs Kite's documented 1 req/sec ceiling -- ~30x headroom. The two quote
+  calls within one cycle are separated by the historical and instruments
+  calls in between (each a real network round-trip for a non-trivial
+  payload -- 10 days of minute candles, a 33k+-row instruments dump), so
+  in practice they land seconds apart, not back-to-back -- a reasoned
+  expectation from the real call sequence, not a guaranteed one given
+  real-world network timing variance.
+- Historical-category: 1 call/cycle / 60s = 0.0167 req/sec vs the
+  documented 3 req/sec ceiling -- ~180x headroom.
+- No documented daily cap exists, but for scale: a full scanning day
+  (9:15 open to the 15:00 entry_scan_cutoff_time, ~345 minutes, worst
+  case if no trade ever fires and scanning runs the whole window) is
+  ~345 cycles -- ~1,380 real Kite calls total across the day, a small
+  absolute number for a retail API client. Actual daily volume is
+  usually lower: a fill pauses entry scanning entirely until that
+  position closes (its own supervision polling is a separate, unchanged
+  cadence -- Settings.supervision_poll_seconds).
+- The instruments dump (NFO, ~33k rows) being re-fetched and re-parsed
+  every single cycle is real, non-trivial CPU/bandwidth work, unchanged
+  in kind by this brief (it happened every cycle at 240s too) but now
+  4x more frequent -- a real secondary cost, not a documented rate-limit
+  concern, worth stating plainly rather than only checking the formal
+  limits.
+
+Deliberately not sub-minute: nothing meaningful changes on these setups'
+timescale below 1 minute, and it would add real API/CPU load for no
+benefit. A future pass could reconsider WebSocket if scan frequency ever
+needed to drop meaningfully below this -- not needed at this cadence.
 """
 
 from __future__ import annotations

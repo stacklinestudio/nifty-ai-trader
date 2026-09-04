@@ -142,6 +142,41 @@ def test_scheduler_fills_and_supervises_to_a_real_close(tmp_path):
     assert factory_calls == ["NIFTY24CE"]
 
 
+def test_default_entry_scan_interval_is_60_seconds_and_reaches_the_real_sleeper(tmp_path):
+    """Brief 9: tightened from Brief 6's 240s default to 60s. Confirms
+    both halves: the real Settings default is actually 60 (nothing tested
+    this literal value before), and that value genuinely reaches the real
+    sleeper for the real "no candidate this scan" wait when the caller
+    doesn't override it -- not just that the Settings field holds 60."""
+    assert Settings().entry_scan_interval_seconds == 60.0
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    calendar = NseCalendar()
+    ticks = {"n": 0}
+    sleep_calls: list[float] = []
+
+    def clock():
+        ticks["n"] += 1
+        return market_open_time() + timedelta(seconds=60 * ticks["n"])
+
+    result = run_trading_day(
+        orchestrator,
+        calendar,
+        context_provider=dict,  # always empty -- no candidate ever, exercises the between-scan sleep
+        quote_source_factory=unavailable_quote_source_factory,
+        clock=clock,
+        sleeper=sleep_calls.append,
+        entry_scan_cutoff_time=time(10, 6),  # a few real scans of margin -- fast, deterministic
+        # entry_scan_interval_seconds deliberately NOT passed -- must come
+        # from the real Settings default.
+    )
+
+    assert result.reason == "scan_cutoff_reached"
+    assert sleep_calls  # at least one real between-scan wait happened
+    assert all(seconds == 60.0 for seconds in sleep_calls)
+
+
 def test_scan_loop_stops_immediately_when_daily_cap_is_hit_mid_day(tmp_path):
     """Brief 6 Part B.3: can_open() is checked first, every iteration --
     once the cap is hit, scanning stops entirely for the rest of the day,
