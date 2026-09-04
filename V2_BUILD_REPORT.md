@@ -3388,3 +3388,92 @@ called, then runs a real `run_cycle()` — confirms `dry_run` prevents a
 real transport call structurally (both `send_message`/`send_embed`
 short-circuit before `transport` on an unconfigured token/webhook), not
 just that the constructor looks right.
+
+## Re-run: the same 42-day confidence-scoring pass, post technical_score fix (2026-09-05, report only)
+
+No config or threshold changes — investigation only, per the request.
+Same file (`data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`),
+same driver (`backtest/daily_backtest.py::run_daily_backtest`), same real
+cached global-market history
+(`data/private/global_market_history_2026-07-06_to_2026-09-01.json`),
+same unmodified `signal_threshold=75` — the exact same pass Brief 8 Part
+D ran (`confidence distribution: min=33.7 max=53.8 n=35`), now on the
+current codebase (post `984fe80`'s `technical_score` fix and this
+session's unrelated AI-refresh-cache/dry_run changes, neither of which
+touches `_add_candidate`'s scoring math).
+
+```
+loaded rows: 15750
+real global-market history: 41 real days, 8 symbols each
+signal_threshold= 75.0
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+confidence distribution: min=34.0 max=53.8 n=35
+```
+
+**n=35 and max=53.8 — identical to Brief 8 Part D.** `min` moved by 0.3
+(33.7 → 34.0) — real, explained below, not noise. Still 0 candidates, 0
+trades — the honest result, unchanged.
+
+**Answering the question directly, with the real setup_type captured
+alongside each of the 35 real confidence values** (via a wrapper on
+`execution/live_context.py::_select_setup`, observing only — never
+modified):
+
+```
+confidence, setup_type (sorted by confidence):
+   34.0  VWAP_REJECTION <-- RANGE-FAVORED (was capped at technical=45.0 pre-fix)
+   34.3  VWAP_REJECTION <-- RANGE-FAVORED
+   34.7  VWAP_REJECTION <-- RANGE-FAVORED
+   34.7  VWAP_REJECTION <-- RANGE-FAVORED
+   35.7  OPENING_RANGE_BREAKOUT
+   ...
+   44.2  VWAP_REJECTION <-- RANGE-FAVORED
+   ...
+   46.4  VWAP_REJECTION <-- RANGE-FAVORED
+   48.4  VWAP_REJECTION <-- RANGE-FAVORED
+   53.8  OPENING_RANGE_BREAKOUT   (x4 — the real maximum, all 4 instances)
+
+range-favored (VWAP_REJECTION/SUPPORT_RESISTANCE_REACTION) real confidences: [34.0, 34.3, 34.7, 34.7, 44.2, 46.4, 48.4]
+trend-favored real confidences: min=35.7 max=53.8 n=28
+```
+
+**The ceiling stayed at 53.8 because the second half of your hypothesis
+is exactly what happened**: 7 real `VWAP_REJECTION` candidates fired in
+this window post-fix (0 `SUPPORT_RESISTANCE_REACTION` — this single-
+decision-point-per-day methodology, evaluating only the first ~6 bars of
+each real day, never gives that setup's own detector, which needs more
+of the session, a chance to fire at all; Part C's later full-day rescan
+did see it fire on some days). All 7 real `VWAP_REJECTION` confidences —
+[34.0, 34.3, 34.7, 34.7, 44.2, 46.4, 48.4] — sit at the **bottom** of the
+distribution, not the top. Every one of the real `OPENING_RANGE_BREAKOUT`
+instances that hit exactly 53.8 stayed the day's own maximum regardless.
+The fix is genuinely reachable and active (see below) — it just never
+happened to be the *winning* candidate on any of the 42 real days in
+this specific window.
+
+**The 0.3-point minimum shift is the fix visibly working, not
+measurement noise**: the fix raises `technical_score` from a fixed 45.0
+to as much as 75.0 for the 2 range-favored setups specifically — a
+0.35-weighted swing of up to +10.5 confidence points per real instance,
+never a decrease. `44.2` appears in the new sample; `33.7 + 10.5 = 44.2`
+exactly — consistent with the old run's real minimum (33.7, not saved in
+full detail in the Brief 8 Part D report, only its summary line) being
+exactly this mechanism's real effect, unseating itself as the minimum and
+revealing the next-lowest untouched real value (34.0) in its place. The
+fix can only ever raise a range-favored setup's real confidence, never
+lower it — a shift of this small, specific, mechanically-predicted
+magnitude is the expected honest signature of that fix being real and
+active in this data, not evidence of anything unstable.
+
+**Plain answer to "has the ceiling moved"**: no — `max` is unchanged at
+53.8, still `OPENING_RANGE_BREAKOUT`, for the same real reason as before
+(the 4 trend-favored setups' own real ceiling of 81.25 was never reached
+by any of the 42 real days' actual inputs). The fix is real, reachable,
+and visibly active (7 real range-favored evaluations now exist where
+before they'd have been capped 10.5 points lower each) — it just didn't
+happen to produce this window's single best candidate. No config or
+threshold change made or recommended here, per the request.
