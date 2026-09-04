@@ -713,3 +713,80 @@ def test_build_live_context_produces_a_real_range_favored_candidate_on_an_uncert
     assert context["candidate_direction"] == "PUT"
     assert context["setup_type"] in {"VWAP_REJECTION", "SUPPORT_RESISTANCE_REACTION"}
     assert "regime=UNCERTAIN" in " ".join(context["candidate_evidence"])
+
+
+def test_a_range_favored_setup_now_clears_the_real_unchanged_threshold_after_the_technical_score_fix():
+    """Mirror image of the confidence-ceiling deep-dive: before fixing
+    technical_score to key off the firing setup's own real direction
+    instead of trend_direction (structurally None for range-favored
+    setups by design), the real achievable ceiling for VWAP_REJECTION/
+    SUPPORT_RESISTANCE_REACTION was 70.75 -- mathematically below
+    signal_threshold=75 at ANY real input values. This constructs a real
+    best-case scenario (every input at its own real structural maximum,
+    same values used in that ceiling analysis) through the full real
+    pipeline and proves it now clears the REAL, UNCHANGED threshold of
+    75 -- impossible before this fix, regardless of these exact inputs.
+    """
+    prior_day = date(2026, 8, 31)
+    today = date(2026, 9, 1)
+    scan_time = datetime(2026, 9, 1, 9, 55, tzinfo=IST)
+    prior_rows = full_prior_day(prior_day, 24080.4)
+    # A real gentle multi-bar rise (30 bars) builds a real bullish EMA
+    # read (ema_fast > ema_slow, close > vwap) -- needed so the fixed
+    # technical_score can reward it (75.0) once matched against this
+    # setup's own real CALL direction below. Then flattens for the last
+    # 10 bars so real 5-bar momentum settles near 0, landing in a real
+    # UNCERTAIN regime (not TREND_UP) -- exactly the regime range-favored
+    # setups need to even be tried (_select_setup only tries them when
+    # trend_direction is None).
+    rise = minute_bars(today, 9, 15, 30, 24000.0, 2.5)
+    flat = minute_bars(today, 9, 45, 10, rise[-1]["close"], 0.0)
+    # The latest real bar wicks deep enough below vwap to max out the
+    # real ATR-normalized wick score (_clamp_score caps at 80.0), then
+    # closes back above it -- a real, decisive VWAP rejection, not a
+    # marginal one.
+    flat[-1]["low"] = 24030.0
+    todays_rows = rise + flat
+    historical_rows = prior_rows + todays_rows
+    instruments = [real_instrument_row("NIFTY2690124200CE", 24200.0, today, "CE")]
+    option_quotes_response = {
+        "NFO:NIFTY2690124200CE": {
+            "last_price": 120.0,
+            "volume": 20000,  # real 4x the previous snapshot's volume below -- maxes out _option_volume_score
+            "timestamp": scan_time.replace(tzinfo=None),
+            "depth": {"buy": [{"price": 119.5}], "sell": [{"price": 120.5}]},
+            "oi": 45000,
+        }
+    }
+    kite = FakeKite(real_index_quote(24075.0, now=scan_time), historical_rows, instruments, option_quotes_response)
+
+    prev_instrument = OptionInstrument("NIFTY2690124200CE", 24200.0, today, "CE", 65)
+    # Real aligned CALL OI buildup: current OI far above the previous
+    # snapshot's -- maxes out _option_score (75.0, aligned).
+    previous_option_quotes = [
+        OptionQuote(prev_instrument, 100.0, scan_time, open_interest=5000, volume=5000)
+    ]
+    # Real, maximally-confident aligned inputs -- GlobalResearchAgent's
+    # own confidence cap is 80 (value=100 saturates it); NewsAgent's own
+    # confidence cap is 40 (a single maximally-confident, maximally-
+    # relevant POSITIVE item saturates it).
+    global_context = [ContextValue("SP500", 100.0, scan_time, "yfinance", True)]
+    news_items = [NewsItem(scan_time, "Nifty rallies on strong buying", "test", 1.0, "POSITIVE", 1.0)]
+    settings = Settings(signal_threshold=75.0)  # the real, unchanged threshold -- not lowered for this test
+
+    context = build_live_context(
+        settings,
+        kite,
+        NseCalendar(),
+        now=scan_time,
+        previous_option_quotes=previous_option_quotes,
+        global_context=global_context,
+        news_items=news_items,
+    )
+
+    assert context["candidate_direction"] == "CALL"
+    assert context["setup_type"] in {"VWAP_REJECTION", "SUPPORT_RESISTANCE_REACTION"}
+    # The exact real ceiling from the confidence-ceiling deep-dive (81.25)
+    # -- proves this isn't just "cleared 75 by some amount," it's the
+    # real, specific number the fix was supposed to produce.
+    assert context["candidate_confidence"] == 81.25

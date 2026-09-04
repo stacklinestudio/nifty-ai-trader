@@ -762,13 +762,22 @@ def _add_candidate(
     setup_type, direction, setup_score, setup_evidence = setup
 
     # Same bullish/bearish read TechnicalAgent computes itself -- reused,
-    # not reinvented, for the "technical" sub-score. Keyed on the regime's
-    # own implied direction (trend_direction), not the specific setup's --
-    # this is a broader "does the wider trend confirm" read, independent
-    # of which setup fired.
+    # not reinvented, for the "technical" sub-score. Keyed on the firing
+    # setup's own real direction, not trend_direction -- trend_direction
+    # is structurally None for the 2 range-favored setups (VWAP_REJECTION,
+    # SUPPORT_RESISTANCE_REACTION only ever fire when it's None, that's
+    # the whole point), which meant technical_score could never be
+    # anything but its low value (45.0) for them, regardless of how
+    # strongly the real EMA/VWAP read actually confirmed the setup's own
+    # direction -- a real bug found while computing SignalEngine's real
+    # confidence ceiling, capping those two setups' ceiling at 70.75,
+    # mathematically below signal_threshold=75 always. For the other 4
+    # (trend-favored) setups, direction always equals trend_direction by
+    # construction of _select_setup, so this is a byte-identical no-op
+    # for them -- only the 2 range-favored setups' real behavior changes.
     bullish = features["ema_fast"] > features["ema_slow"] and features["close"] > features["vwap"]
-    technical_score = 75.0 if (bullish and trend_direction == "CALL") or (
-        not bullish and trend_direction == "PUT"
+    technical_score = 75.0 if (bullish and direction == "CALL") or (
+        not bullish and direction == "PUT"
     ) else 45.0
     volatility_ratio = features["atr"] / features["close"] if features["close"] else 0.0
     risk_penalty = 25.0 if volatility_ratio > 0.008 else 0.0
