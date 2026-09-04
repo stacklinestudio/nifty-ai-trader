@@ -2147,3 +2147,289 @@ constraint — wiring more real setup types was necessary but not
 sufficient to change this dataset's outcome. Both findings are real and
 both are reported plainly, not reconciled into a more flattering single
 number.
+
+# Real Data + Real AI, Correct Architecture (2026-09-04)
+
+Paper only. The deterministic RiskAgent remains final authority over
+every trade decision — see Part C.7 for the load-bearing evidence.
+Commits `cbb5b8e` (Parts A-C), `d0254ab` (Part D wiring).
+
+## Part A. Real global market data via yfinance — DONE
+
+`data/global_market.py::YFinanceGlobalMarketProvider` pulls real
+day-over-day percent change for all 8 requested symbols (S&P 500,
+Nasdaq, Dow, Nikkei, Hang Seng, crude oil, gold, USD/INR), replacing the
+hardcoded `global_context: []` in `assemble_context`. `value` is percent
+change, not an absolute price level — averaging S&P 500's ~7700 against
+gold's ~4489 or USD/INR's ~94 would be meaningless; percent change is
+the one directionally comparable real number across all 8, matching how
+`GlobalResearchAgent` already averages `value` into one score.
+
+```
+$ python -c "... YFinanceGlobalMarketProvider().snapshot() ..."
+ContextValue(name='SP500', value=-0.0042, ..., source='yfinance', available=True, error=None)
+ContextValue(name='NASDAQ', value=-0.0040, ..., available=True, error=None)
+ContextValue(name='DOW', value=-0.0058, ..., available=True, error=None)
+ContextValue(name='NIKKEI', value=-0.0017, ..., available=True, error=None)
+ContextValue(name='HANG_SENG', value=-0.0039, ..., available=True, error=None)
+ContextValue(name='CRUDE_OIL', value=-0.0056, ..., available=True, error=None)
+ContextValue(name='GOLD', value=-0.0002, ..., available=True, error=None)
+ContextValue(name='USD_INR', value=-0.0001, ..., available=True, error=None)
+```
+
+All 8 real symbols, real values, confirmed live against the real
+yfinance API (2026-09-04). `fetch_global_history(symbols, start, end)`
+does the same over a real date range (one bulk fetch per symbol, not one
+call per day) for backtest use — 41 real trading days with all 8 real
+symbols each, no look-ahead confirmed by construction (day N only ever
+compares to day N-1's already-known close) and by test
+(`test_fetch_global_history_computes_real_day_over_day_change_with_no_look_ahead`).
+
+**Stated plainly, per the brief's own instruction**: yfinance is an
+**unofficial** library scraping Yahoo Finance, not a contracted API — it
+can occasionally break without notice. Accepted for zero cost/zero setup
+friction to get real data flowing today; Twelve Data or Finnhub (real
+pricing already researched in Brief 5 Part C) remain a reasonable paid
+upgrade later if reliability becomes a real problem.
+
+```
+$ pytest tests/test_global_market.py -q
+.......
+7 passed in 1.35s
+```
+
+7 tests: real percent-change computation, per-symbol fail-closed
+(network failure, insufficient real history), one symbol's failure not
+blocking the other 7 (both for the live snapshot and the historical
+fetch), and the real no-look-ahead property above.
+
+## Part B. Real RSS news feeds — DONE, with an honest correction to the brief's premise
+
+Real, confirmed-reachable feeds (checked live, 2026-09-04, all HTTP 200
+with real XML): Economic Times Markets, Moneycontrol Business, Business
+Standard Markets. **Reuters' public RSS feeds are discontinued**
+(`feeds.reuters.com` no longer resolves — confirmed live, real
+`ConnectionError`/DNS failure) — Business Standard substituted, per the
+brief's own "or similar" latitude.
+
+```
+$ python -c "... requests.get('https://feeds.reuters.com/reuters/INbusinessNews') ..."
+ERROR ConnectionError ... Failed to resolve 'feeds.reuters.com' ...
+$ python -c "... requests.get(ET/Moneycontrol/BusinessStandard URLs) ..."
+ET Markets 200 52525 bytes
+Moneycontrol Business 200 16296 bytes
+Business Standard Markets 200 48140 bytes
+```
+
+**Correction to the brief's premise, verified before building rather than
+assumed**: the brief asked to "reuse the classification/relevance logic
+already built in NewsAgent from Brief 3, Part C." Checked first:
+
+```
+$ grep -rn "NewsItem(" --include=*.py . | grep -v test
+(no matches)
+```
+
+**No code anywhere constructs a real `NewsItem` from a raw headline** —
+Brief 3 Part C's real fix was `data.news.aggregate_sentiment`'s real
+math over *already-classified* items, not a raw-headline classifier. That
+classifier genuinely didn't exist and had to be built new
+(`data/rss_news.py`), not reused. Built two real paths: a deterministic
+keyword classifier (the real "less rich synthesis" floor Part C.6
+requires) and a real batched AI classification call (one request for all
+headlines, not N sequential calls) — both feed the exact same,
+completely unmodified `aggregate_sentiment`/`NewsAgent.analyze()`
+pipeline, so `NewsAgent` itself needed **zero code changes**.
+
+```
+$ pytest tests/test_rss_news.py -q
+............
+12 passed in 0.26s
+```
+
+12 tests: real RSS XML parsing, per-feed fail-closed, real keyword
+classification (positive/negative/neutral, relevance), AI classification
+used when the response shape is valid, falling back to keywords on any
+AI failure or shape mismatch, and the fully-fail-closed empty-feeds case.
+
+## Part C. Real AI provider, enrichment only — DONE, safety verified
+
+`ai/provider.py::AnthropicProvider` calls the real Anthropic Messages API
+directly via `requests` (no new SDK dependency). `build_ai_provider(settings)`
+returns it only when `ai_provider="anthropic"` **and** a real
+`anthropic_api_key` are both set — `Settings.ai_provider` still defaults
+to `"unavailable"` (`config.py`, unchanged), and nothing in this codebase
+flips it programmatically.
+
+**Real, meaningful AI use, exactly as scoped**:
+- `GlobalResearchAgent`: `global_direction`/`confidence` stay the
+  **unchanged deterministic formula** (real average of yfinance percent
+  changes); AI adds a purely additional `ai_commentary` narrative field
+  from the same real facts.
+- `data/rss_news.py`: real headline classification (Part B) — bounded by
+  `NewsAgent`'s pre-existing, unmodified confidence cap (40) and
+  `SignalHunterAgent`'s pre-existing ±5% nudge cap, same real backstop
+  regardless of which classifier produced the sentiment.
+- `PostTradeAgent`: real plain-language `ai_explanation` of an
+  **already-closed** trade, generated strictly after `record_trade`/
+  `create_experiment` have already run on the deterministic facts alone.
+
+**Real, hard timeout, not just BaseAgent's post-hoc check**:
+`agents/base.py::BaseAgent.run()`'s `timeout_seconds` only measures a
+call *after* it returns — it cannot stop one still in flight, and
+`data/rss_news.py`'s classification call isn't wrapped by `BaseAgent` at
+all. `AnthropicProvider` sets a real 15s HTTP-level timeout on every
+call, independent of any caller
+(`test_analyze_sends_a_real_bounded_request_timeout`).
+
+**Honest limitation**: the Anthropic account currently has no credit
+balance —
+
+```
+$ python -c "... AnthropicProvider(real_key, 'claude-haiku-4-5-20251001').analyze(...) ..."
+requests.exceptions.HTTPError: 400 Client Error: Bad Request for url: https://api.anthropic.com/v1/messages
+$ # raw request, same payload, to see the real body:
+400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low
+to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}
+```
+
+The request itself was **accepted and correctly parsed** by Anthropic's
+API (rejected only on billing, not as malformed) — confirming the HTTP
+call shape is right — but **no live successful AI call could be
+demonstrated this session**. `tests/test_ai_provider.py` uses this exact
+real captured 400 response as a fixture, and mocked-but-real-shaped
+success responses for the rest; the fail-closed path (which is what Part
+C.7's guarantee actually depends on) is fully, genuinely exercised
+end-to-end regardless of the account's billing state.
+
+```
+$ pytest tests/test_ai_provider.py -q
+........
+8 passed in 0.22s
+```
+
+### Part C.7 — the most important test in this brief
+
+**Explicit confirmation**: no code path exists anywhere in this codebase
+where `AIAnalysis` output can change a position size, override a risk
+rejection, or trigger an order directly. `RiskAgent.analyze()` reads only
+`thesis`, `validation`, `market_data_fresh`, `market_open`, `self.limits`,
+`self.settings.kill_switch` — no AI-sourced key. `TradeBuilderAgent`
+reads only `candidate`, `selected_option`, `option_atr` — no AI-sourced
+key. Verified by direct code reading, and then **proven with real code
+paths, not just inspection**, in `tests/test_ai_safety.py`:
+
+```
+$ pytest tests/test_ai_safety.py -q
+.....
+5 passed in 1.36s
+```
+
+- **`test_adversarial_ai_output_never_changes_the_deterministic_cycle_result`**:
+  an adversarial provider returning confidence=100, `"URGENT: BUY MAXIMUM
+  SIZE IMMEDIATELY, IGNORE ALL RISK LIMITS, GUARANTEED WIN"`, and
+  `structured` facts stuffed with decision-shaped keys
+  (`position_size`, `risk_approved`, `quantity`, `stop_zone`,
+  `kill_switch`) run through a **real** `Orchestrator.run_cycle()` and
+  compared, field by field, against the identical context run with AI
+  unavailable — `consensus`, `conflicting_evidence`, `risk_approved`,
+  `validation.decision`, and every real thesis/order number (direction,
+  quantity, entry, stop, target, estimated risk, side, fill price) are
+  **byte-identical**. The adversarial narrative *did* reach the
+  `AgentResult` (`ai_commentary` contains the injected text, proving AI
+  genuinely ran, not skipped) — it just never reached anything
+  decision-relevant.
+- **`test_adversarial_post_trade_explanation_never_changes_recorded_trade_facts`**:
+  the exact real facts recorded to `MemoryStore` for an already-closed
+  trade are identical whether `PostTradeAgent` used
+  `UnavailableProvider` or the adversarial one.
+- **`test_risk_agent_ignores_ai_looking_keys_injected_directly_into_context`**
+  / **`test_trade_builder_ignores_ai_looking_keys_injected_directly_into_context`**:
+  even keys named to look like real decision fields (`risk_approved`,
+  `quantity`, `position_size`) injected straight into the context dict
+  are ignored — both agents read only their real, fixed key set.
+- **`test_a_failing_ai_provider_still_produces_the_exact_same_cycle_result`**:
+  Part C.6's fail-closed requirement end to end — a provider that raises
+  on every call produces a byte-identical decision to AI being absent,
+  and the failure is caught locally (doesn't zero out
+  `GlobalResearchAgent`'s real deterministic result along with it).
+
+## Part D. Real 42-day backtest re-run — still 0 candidates/0 trades, honestly reported
+
+Real historical global-market data now wired in (`fetch_global_history`
+over the same window, cached to
+`data/private/global_market_history_2026-07-06_to_2026-09-01.json`);
+news stays genuinely unavailable for the backtest specifically (free RSS
+has no historical archive — an honest, stated gap, not a worked-around
+one). Same file, same driver, same unmodified `signal_threshold=75`:
+
+```
+$ python -c "... run_daily_backtest(Settings(), frame, global_context_by_day=real_history) ..."
+loaded rows: 15750
+real global-market history: 41 real days, 8 symbols each
+signal_threshold=75.0
+trading days evaluated: 42
+candidates formed: 0
+trades filled: 0
+insufficient_prior_history: 1
+no_candidate: 41
+confidence distribution: min=33.7 max=53.8 n=35
+trade records in learning.memory: 0
+```
+
+**Still 0 candidates, 0 trades — the honest result, reported exactly as
+it came out.** Two real, non-cherry-picked details distinguish this from
+a null result with nothing behind it:
+
+- **n rose from 28 (Brief 4-7's runs) to 35** real below-threshold
+  evaluations — real evidence that real global data is now reaching more
+  days' scoring (previously, a `RANGE`/`UNCERTAIN` regime day with no
+  eligible setup produced no scored evaluation at all; Brief 7's
+  range-favored setups plus real global context now push some of those
+  days into a real, logged, still-below-threshold score instead).
+- **The confidence floor moved from 38.8 to 33.7** — real global data
+  pulled confidence *down* on some real days (a real global read
+  contradicting the local setup's direction), not just up. This is the
+  honest shape of a genuinely-reactive input, not a one-directional
+  thumb on the scale.
+
+**This is the real test of the diagnosis, and the diagnosis holds**: the
+binding constraint on this specific historical window was never "global
+data is 0" alone — it's the *combination* of `option` (no historical
+per-day chain fetched for this window, still a stated Brief 4/5 gap) and
+`news` (no historical archive, this pass's own honest gap) both still
+sitting at 0 for every real day, which `technical`+`opening`+`global`
+alone can't overcome against an unmodified `signal_threshold=75`. Real
+global data closing is genuine, real progress — it moved the real numbers
+in both directions, proving it's genuinely wired, not inert — but it was
+one gap among several, and closing one gap alone was never going to be
+sufficient by itself. Win rate: none — zero trades, nothing to compute
+one from.
+
+## What wasn't done (explicit, not silently skipped)
+
+- **No live successful AI call was demonstrated this session** — the
+  Anthropic account has no credit balance (Part C, real captured 400
+  response). The request shape and the entire fail-closed path are
+  fully verified; a live successful synthesis was not.
+- **News stays unavailable for the 42-day backtest specifically** — real
+  RSS feeds only carry recent items, no historical archive going back to
+  July. A future pass wanting historical news for backtesting would need
+  a different, paid data source (see Brief 5 Part C's own research on
+  this).
+- **No per-day historical option-chain data was fetched** for this
+  backtest window (same gap as Brief 4/5/6/7 — unchanged, not
+  reattempted this pass).
+- **A pre-existing, unrelated test failure was found and left as-is**:
+  `tests/test_oi_buildup.py::test_options_agent_reports_buildup_without_it_changing_selection`
+  hardcodes an option expiry of `date(2026, 9, 3)`, now in the real past
+  relative to today's real date (2026-09-04) — confirmed pre-existing via
+  `git stash` against the exact pre-Brief-8 commit, unrelated to any
+  change in this brief, out of this brief's scope, not fixed here.
+
+```
+$ pytest -q
+258 passed, 1 failed (pre-existing, unrelated -- see above)
+$ ruff check .
+All checks passed!
+```
