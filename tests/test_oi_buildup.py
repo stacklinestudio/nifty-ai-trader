@@ -1,15 +1,23 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime, timedelta
 
 from config import IST
 from data.instruments import OptionInstrument
 from data.option_chain import OptionQuote
 from intelligence.oi_buildup import detect_buildup
 
+# A hardcoded expiry date here previously went stale once the real wall
+# clock passed it (test_options_agent_reports_buildup_without_it_changing_
+# selection failed once today > 2026-09-03, since OptionsAgent -- unlike
+# detect_buildup -- checks expiry against real now()). Always a few real
+# days out, same safe pattern as tests/test_scheduler.py's
+# filled_cycle_context, so this can never go stale again.
+_EXPIRY = datetime.now(IST).date() + timedelta(days=3)
+
 
 def quote(strike: float, option_type: str, oi: int) -> OptionQuote:
-    instrument = OptionInstrument("NIFTY24CE", strike, date(2026, 9, 3), option_type, 75)
+    instrument = OptionInstrument("NIFTY24CE", strike, _EXPIRY, option_type, 75)
     return OptionQuote(instrument, 100, datetime.now(IST), open_interest=oi)
 
 
@@ -78,7 +86,7 @@ def test_options_agent_reports_buildup_without_it_changing_selection():
     )
     current = [
         OptionQuote(
-            OptionInstrument("NIFTY24CE", 22000, date(2026, 9, 3), "CE", 75),
+            OptionInstrument("NIFTY24CE", 22000, _EXPIRY, "CE", 75),
             100,
             datetime.now(IST),
             99.5,

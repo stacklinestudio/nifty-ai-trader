@@ -80,7 +80,15 @@ def test_quote_source_factory_pattern_supervises_the_option_not_the_index(tmp_pa
     # taking the same trade again after this one closes.
     settings = Settings(database_path=tmp_path / "paper.db", max_trades_per_day=1)
     orchestrator = Orchestrator(settings)
-    now = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+    # A fixed, guaranteed-real-trading-day datetime (the same Monday
+    # tests/test_scheduler.py::market_open_time() uses) -- run_trading_day
+    # derives "today" from clock() (seeded from `now` below) when `today`
+    # isn't passed explicitly, so a real wall-clock `now()` here made this
+    # test's pass/fail depend on which real weekday it happened to run on
+    # (it failed outright on a real Saturday). FakeKite.quote() below
+    # deliberately keeps its own real datetime.now(IST) for the quote
+    # timestamp -- that one must stay real wall-clock (see its docstring).
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=IST)
     kite = FakeKite()
 
     def quote_source_factory(symbol: str):
@@ -121,7 +129,12 @@ def test_resume_open_positions_also_uses_the_options_symbol_not_the_index(tmp_pa
     db_path = tmp_path / "paper.db"
     settings = Settings(database_path=db_path)
     first_run = Orchestrator(settings)
-    now = datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
+    # Fixed for consistency with the test above -- this test doesn't call
+    # run_trading_day (resume_open_positions has no calendar check), so it
+    # wasn't actually broken by a real wall-clock date, but pinning it
+    # removes the same class of latent risk and matches the one real
+    # pattern this file should use throughout.
+    now = datetime(2026, 8, 24, 10, 0, tzinfo=IST)
     cycle = first_run.run_cycle(_filled_cycle_context(now))
     assert cycle.order is not None
     first_run.open_position(cycle, now=now)
@@ -148,7 +161,21 @@ def _dummy_settings():
 
 
 def _filled_cycle_context(now: datetime) -> dict:
-    instrument = OptionInstrument("NIFTY24CE", 22000, now.date() + timedelta(days=3), "CE", 25)
+    # Expiry deliberately NOT derived from the simulated `now` above --
+    # strategy/option_selector.py filters candidates on
+    # `instrument.expiry >= datetime.now(IST).date()`, the REAL wall
+    # clock, not any simulated test time. When `now` is a fixed past date
+    # (as it is in this file, pinned to a guaranteed real trading day),
+    # `now.date() + timedelta(days=3)` can be long expired by the time this
+    # runs, silently filtering the option out of `ranked` and producing
+    # "no complete trade thesis" instead of a fill -- which then made
+    # run_trading_day's entry-scan loop run for the rest of the simulated
+    # day (up to ~18000 iterations) instead of filling on the first scan.
+    # Real current date + a few days, same safe pattern as
+    # tests/test_scheduler.py::filled_cycle_context, keeps this valid
+    # regardless of which simulated `now` the calendar/clock use.
+    expiry = datetime.now(IST).date() + timedelta(days=3)
+    instrument = OptionInstrument("NIFTY24CE", 22000, expiry, "CE", 25)
     quote = OptionQuote(instrument, 10, now, 9.75, 10.25, 1000)
     return {
         "candidate_direction": "CALL",
