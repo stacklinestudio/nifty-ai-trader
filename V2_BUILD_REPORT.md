@@ -3477,3 +3477,226 @@ and visibly active (7 real range-favored evaluations now exist where
 before they'd have been capped 10.5 points lower each) — it just didn't
 happen to produce this window's single best candidate. No config or
 threshold change made or recommended here, per the request.
+
+## Brief 12: Score Attribution, Counterfactual Engine, Threshold-Calibration Diagnostic (2026-09-05)
+
+No config or threshold changes, per the brief's own ground rule —
+measurement infrastructure only. Commits: TBD (this section written
+before the commit; see the commit log for the final hash).
+
+### Part A — Score attribution: was (b), now structured and persisted
+
+**Audit result, checked rather than assumed**: `storage/models.py::SignalRecord`
+and `storage/database.py::Database.save_signal`/the `signals` table
+already existed in the schema — but a full-codebase grep for
+`SignalRecord(` found **zero real call sites**. `save_signal` was dead
+code; the per-component breakdown (`volume=0.0(index_candle_volume(...))`
+etc.) existed **only** as the log line in
+`execution/live_context.py::_add_candidate` — confirmed case **(b)**,
+exactly as the brief suspected.
+
+**Fix**: `_add_candidate` now sets `context["score_attribution"]`
+unconditionally, right after `SignalEngine.evaluate()` runs — before the
+confidence-threshold check, so every real evaluation is captured, not
+just ones that become a trade. Contains all 7 real component
+scores/reasons, `regime`, `confidence`, `threshold`, `cleared_threshold`,
+and the setup's own evidence string — the exact same real values
+`SignalEngine` just used, nothing recomputed. `assemble_context` stays
+I/O-free (its own documented design) — `Orchestrator.run_cycle` (which
+already owns a `Database` connection) reads this key when present and
+persists it via the now-real `Database.save_signal`, non-fatally. Reuses
+the existing `signals` table and `SignalRecord` dataclass exactly as
+designed — no new table, no new store. Added `Database.recent_signals()`
+to read it back.
+
+```
+$ pytest tests/test_score_attribution.py -q
+....                                                                     [100%]
+4 passed in 0.91s
+```
+
+Two tests independently **reconstruct** `SignalEngine`'s own confidence
+from the attribution record's own captured component values (a fresh
+`SignalEngine(...).evaluate(...)` call using only what was persisted) and
+assert byte-identical equality — proving this is the same real
+computation, not a plausible-looking re-derivation. A third proves
+`Orchestrator.run_cycle` actually persists it to a real SQLite file and
+reads it back correctly; a fourth proves a context that never went
+through the live-context pipeline (most existing tests' hand-built
+dicts) persists nothing and does not raise.
+
+### Part B — Counterfactual Engine: real index-price research, clearly labeled
+
+New module `research/counterfactual.py`. For a rejected candidate,
+`evaluate_counterfactual()` computes real entry/stop/target using the
+**exact same real zone functions** `_add_candidate` already uses on its
+cleared-threshold path (`_atr_zones`/`opening_range`) — applied here to
+a rejected candidate too, since that path previously only ran after the
+confidence gate. Walks forward through real subsequent same-day index
+candles (no overnight hold, honoring this system's own real forced-exit
+discipline) using a direction-aware version of
+`backtest/simulator.py::Simulator.exit_price`'s real, already-tested
+conservative same-bar-ordering logic — generalized because the original
+only handles a CALL-shaped trade (stop below entry); a PUT-shaped
+rejected candidate needs the mirrored comparison.
+
+**The labeling requirement is structural, not just prose**:
+`CounterfactualRecord.label` is a **read-only property**
+(`COUNTERFACTUAL_LABEL = "COUNTERFACTUAL -- INDEX-PRICE PROXY, NOT REAL
+OPTION P&L"`), not a constructor field — a caller cannot construct a
+record with a different or missing label; passing `label=` to the
+constructor raises `TypeError` (tested). Present in `describe()`,
+`to_dict()`, and the dedicated `counterfactual_records` table's own
+`label` column (in addition to inside the stored JSON payload) — checked
+independently at every one of those output surfaces.
+
+```
+$ pytest tests/test_counterfactual.py -q
+.......                                                                  [100%]
+7 passed in 0.98s
+```
+
+Real, not fabricated: one test runs the engine directly against the real
+42-day NIFTY minute dataset (the same file used throughout this project)
+and confirms the real exit price is drawn from real candle highs/lows
+(or a real `SESSION_END` close), never invented. Two direction-aware
+outcome tests use small, clearly-labeled-as-constructed (not claimed as
+real market data) deterministic price paths specifically to prove the
+CALL/PUT mirrored stop/target logic is correct — a PUT rejected
+candidate correctly hits its stop (not its target) when price *rises*,
+proving the generalization beyond `Simulator.exit_price`'s CALL-only
+assumption actually works, not just compiles. Storage: a dedicated
+`counterfactual_records` table, structurally separate from `trades` and
+never touching `learning.memory` — proven via a real round-trip
+(`save_counterfactual` → `recent_counterfactuals`) that the label
+survives serialization.
+
+### Part C — Score-bucket diagnostic report, real 42-day numbers
+
+New `reports/score_diagnostic.py::generate_report`. Replays the real,
+unmodified `assemble_context` (Part A's own source) at real intraday
+decision points every 5 minutes through each of the 42 real days
+(mirroring this system's own real re-scan cadence, not the single-
+opening-bars-only view `backtest/daily_backtest.py` uses) — no
+look-ahead. For every real rejected candidate, runs Part B's
+counterfactual engine against that same day's real remaining price.
+
+```
+$ pytest tests/test_score_diagnostic_report.py -q
+...                                                                      [100%]
+3 passed in 41.4s
+```
+
+Tests check real internal consistency (bucket counts sum to the real
+total, rejected + actual = candidates, counterfactual buckets sum to
+rejected, every summary line carries the required label) rather than
+hardcoded values, so they stay valid as the real underlying data or code
+naturally evolves — run on an 6-8 day real slice to keep the suite fast;
+the full 42-day run below was executed manually for this report.
+
+**Real, full 42-day result** (751.6s real runtime; `signal_threshold=75`
+unchanged):
+
+```
+sessions (real trading days scanned): 42
+candidates (real structural setups scored): 1756
+actual trades (cleared signal_threshold): 0
+rejected candidates: 1756
+score distribution by bucket:
+  <40: 222 (12.6%)
+  40-49: 1156 (65.8%)
+  50-59: 378 (21.5%)
+  60-69: 0 (0.0%)
+  70-79: 0 (0.0%)
+  80+: 0 (0.0%)
+median score: 46.7  mean score: 46.5
+top rejection reasons:
+  confidence_gated: 1756
+most restrictive component (real points lost vs. its own real ceiling), by frequency:
+  volume_score: 1749
+  opening_score: 7
+[COUNTERFACTUAL -- INDEX-PRICE PROXY, NOT REAL OPTION P&L] rejected-but-counterfactually-profitable: 598/1756 (index-proxy only, never real option P&L)
+[COUNTERFACTUAL -- INDEX-PRICE PROXY, NOT REAL OPTION P&L] rejected-and-correctly-avoided (index-proxy): 1158/1756
+```
+
+`candidates=1756` matches Brief 10 Part C's independently-computed raw
+scan count on this same dataset exactly — real cross-check, not a
+coincidence, and not re-derived from that prior work (this pass replays
+`assemble_context` fresh via Part A's new attribution key).
+
+**Most restrictive component, real and stark**: `volume_score` is the
+single biggest real point-loss driver on **99.6%** of all 1756 real
+evaluations (1749/1756) — not close. This is this window's own known,
+already-documented real gap (no historical option-chain snapshot exists
+for this backtest window, so `_combined_volume_score` structurally falls
+back to `index_candle_volume(no_prior_option_snapshot)`, scoring 0.0
+every time) showing up quantitatively, for the first time, as a real
+number rather than a qualitative observation.
+
+**Counterfactual, with the required caveat restated even here**: 598/1756
+(34.1%) of rejected candidates were counterfactually profitable
+(**index-price proxy only, never real option P&L**) — the underlying
+moved favorably after roughly a third of this system's real rejections.
+This is real signal worth having, but read it against **Section 18's own
+decision matrix, honestly, not selectively**: 65.9% of rejections were
+correctly avoided even on this generous index-only measure (no theta
+decay, no spread, no slippage, no strike-selection risk — a real option
+position would have needed to overcome all of those in addition to the
+index simply drifting the right way to actually profit). A 34%
+index-favorable rate is not the same claim as "34% of these would have
+been profitable option trades."
+
+**Honest methodological caveat, stated plainly**: 1756 is a real count of
+real evaluations, not 1756 independent trading opportunities — the same
+setup on the same day re-detects every 5 minutes as price continues in
+the same regime, so this number is correlated/repetitive within a
+session (matching how Brief 10 Part C's day-level candidate framing and
+the AI-judgment experiment's later per-day deduplication both already
+had to account for). Reported here at full, real, un-deduplicated
+granularity because a diagnostic *distribution* report is meant to show
+the real shape of every real evaluation the live system would actually
+make at its real 60s-equivalent-cadence-mirroring scan interval — not to
+claim 1756 independent samples.
+
+### Does 42 days (real + counterfactual) support a threshold conclusion yet?
+
+**No — stated plainly, per Section 18's own principle** ("evidence is
+limited to 42 days — do not promote a major change yet"). Concretely,
+from this pass's own real numbers:
+
+- **Zero real trades** in the entire window — every one of the 1756 real
+  evaluations is confidence-gated, so there is no real trade-outcome
+  distribution to calibrate against at all, only the index-price-proxy
+  counterfactual.
+- **One dominant, structural, already-known data gap** (`volume_score`
+  stuck at 0.0 on 99.6% of evaluations, due to no historical option-chain
+  snapshot for this specific backtest window) is driving almost the
+  entire real score distribution — the 42-day sample cannot separate
+  "signal_threshold is miscalibrated" from "this window's option-data gap
+  structurally caps every real score," because the gap is present on
+  essentially every single evaluation. A future window with real
+  persisted option-chain history (the live path already persists this
+  going forward, per an earlier brief) would be needed before that
+  question is even askable of the data.
+- **One historical window, not independent samples**: 42 real calendar
+  days from one specific 2026-07 to 2026-09 stretch of one index is one
+  real market regime sample, not 42 independent ones — and, per the
+  point above, 1756 is a correlated view of that same one window, not
+  1756 independent trials either.
+- The 34.1% counterfactual-profitable rate is a real, useful data point
+  for Prashu's own judgment, but per its own stated caveat, it measures
+  the index, not the option economics that would actually be traded —
+  a necessary, not sufficient, condition for "this setup was worth
+  taking."
+
+This report's job was to build the infrastructure so that question can
+eventually be answered with real evidence, per-bucket, as more real (or
+option-data-complete) windows accumulate — not to answer it now. No
+threshold change made or recommended.
+
+```
+$ pytest -q
+296 passed in 50.65s
+$ ruff check .
+All checks passed!
+```
