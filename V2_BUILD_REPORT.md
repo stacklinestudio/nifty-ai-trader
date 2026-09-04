@@ -3028,3 +3028,247 @@ instance this project has hit of the same bug class this week:
 Worth a dedicated pass at some point: a shared "pin to a guaranteed real
 trading day, not wall-clock now()" test helper would prevent this class of
 failure from recurring a fourth time.
+
+## Brief 10: AI confirmation, the wall-clock bug pattern closed out, and an independent base-rate check (2026-09-05)
+
+### Part A — Real AI confirmation, now that credits exist
+
+Real Anthropic credits were funded and `AI_PROVIDER=anthropic` flipped in
+`.env.local` (by Prashu, per the brief — not done by this session).
+Confirmed end to end against the real API, not a fixture:
+
+```
+settings.ai_provider = 'anthropic'
+settings.anthropic_api_key configured = True
+settings.ai_model = 'claude-haiku-4-5-20251001'
+build_ai_provider(settings) returned = AnthropicProvider
+
+--- Step 1: one direct AnthropicProvider.analyze() call ---
+HTTP status: 200
+real token usage: {"input_tokens": 271, ..., "output_tokens": 280, "service_tier": "standard"}
+AIAnalysis.summary: 'Global markets show modest positive sentiment with S&P 500 up 0.4%, ...'
+AIAnalysis.confidence: 65.0
+AIAnalysis.validate() passed (real schema validation, same path AIRouter.analyze uses)
+
+--- Step 2/3: real cycle, UnavailableProvider (baseline) vs. REAL AnthropicProvider ---
+real AnthropicProvider (api.anthropic.com) was actually called 1 time(s) during this real cycle
+baseline fingerprint == real-AI fingerprint: True
+real ai_commentary reached AgentResult: 'Minimal positive moves in both equities and gold suggest a cautiously constructive environment...'
+global_direction identical: True
+global confidence identical: True
+```
+
+The real, funded-credit run reproduces Brief 8's fingerprint-match proof —
+previously only demonstrated against the fake adversarial provider — with
+genuine Anthropic output in the loop this time: a real successful 200
+response, real schema-valid `AIAnalysis`, real narrative reaching
+`GlobalResearchAgent`'s `ai_commentary` field, and the exact same
+deterministic cycle decision (consensus, thesis, order) either way. AI
+enrichment's safety boundary holds with a real provider, not just a mock.
+
+**A real side effect caught and corrected during this check, disclosed
+plainly**: the first verification script constructed `Orchestrator(Settings())`
+using the real `.env.local`-loaded environment, which also carries this
+session's real configured Discord/Telegram webhook credentials (wired
+into every `_event()` in an earlier brief) — an unpatched `Orchestrator`
+built that way sends real notifications for whatever cycle it runs,
+synthetic test data included. The baseline and first real-AI cycle run in
+that initial script likely sent a small number of real test-shaped
+messages (fake `NIFTY24CE` candidate) to the real configured Discord/
+Telegram channels before this was caught. Corrected immediately by
+explicitly zeroing every notification field on `Settings` for the rest of
+this investigation (`telegram_bot_token`, `discord_webhook_url`, and its
+6 per-category variants) — the numbers quoted above are from the
+corrected, notification-free run. Nothing else in this session's Discord/
+Telegram wiring changed; this was a hazard specific to constructing a
+plain `Orchestrator(Settings())` inside a script that has already loaded
+real credentials via `.env.local`, worth remembering for any future
+one-off investigation script that touches a real `Orchestrator`.
+
+**Real token usage and cost — the requested data point against the
+$5/month expectation**:
+
+Per Anthropic's current published pricing (`platform.claude.com/docs/en/about-claude/pricing`,
+checked live this session), Claude Haiku 4.5 is $1/MTok input, $5/MTok
+output. Two real, measured direct calls this session:
+
+| Call | Input tokens | Output tokens | Real cost |
+|---|---|---|---|
+| Run 1 (before the notification fix) | 271 | 293 | $0.001736 |
+| Run 2 (after the fix, the numbers quoted above) | 271 | 280 | $0.001671 |
+
+Average ≈ **$0.0017/call**. That alone is nowhere near $5/month. But this
+is not the only real per-scan AI call in the live path: `GlobalResearchAgent`'s
+synthesis call fires on **every** entry scan, not once a day —
+`_add_candidate`/`run_cycle`'s research stage runs unconditionally each
+scan — and `main.py::run_scheduled_day`'s `context_provider` also makes a
+**second**, separate real AI call every scan for news classification
+(`data/rss_news.py::_classify_headlines_with_ai`, a real batched call over
+that scan's fetched headlines — not measured this session, and likely
+*more* tokens than the tiny global-market call above since it carries
+headline text, not four numbers).
+
+Real cadence, from `config.py`'s own defaults: `entry_scan_interval_seconds=60`,
+`entry_scan_cutoff_time=15:00`, market open 09:15 — a scanning window of
+~5h45m that, if no candidate ever fills (the honest current state per
+Part C below and Brief 8 Part D), runs close to its full ~345 scans
+before `scan_cutoff_reached`. At 2 real AI calls/scan × ~345 scans/day ×
+the measured $0.0017/call floor (the news call is likely pricier, not
+cheaper): **≈$1.17/day floor, ≈$24/month across ~21 trading days** — a
+real, worst-case-but-currently-realistic projection that is **well above**
+the $5/month expectation, not because any single call is expensive, but
+because of scan frequency × 2 call sites/scan. This is a real number
+Prashu should see before relying on the $5/month figure; not something
+this pass was asked to fix or recommend a fix for.
+
+### Part B — The wall-clock-date-drift bug, closed out (not just the 2 known ones)
+
+Grepped the full suite for `datetime.now()`/`date.today()` combined with
+trading-day/calendar logic (22 files use real `datetime.now()` at all;
+narrowed to the 12 that also touch `run_trading_day`/`NseCalendar`/expiry
+logic). Every one of those 12 was read by hand. Two were real bugs
+(the two named in the last report); the rest use `datetime.now(IST)` only
+for things that must legitimately stay wall-clock-real (a live quote's
+own freshness timestamp, an option expiry set to "a few real days from
+whenever this runs" — both already correct, not drift-fragile).
+
+Both real bugs fixed, commit `9414b36`:
+
+- **`tests/test_oi_buildup.py`**: `quote()`'s option instrument used a
+  hardcoded `date(2026, 9, 3)` expiry, now in the real past —
+  `OptionsAgent` (unlike `detect_buildup`) filters on real expiry
+  (`strategy/option_selector.py`'s `expiry >= datetime.now(IST).date()`),
+  so the one test that actually runs `OptionsAgent` broke once that date
+  passed. Fixed to `datetime.now(IST).date() + timedelta(days=3)`, the
+  same always-future-safe pattern already used elsewhere.
+- **`tests/test_supervision_quote_symbol.py`**: two tests derived "today"
+  from real `datetime.now(IST)` with no trading-day guarantee — failed
+  outright on a real Saturday. Pinned to a fixed, guaranteed trading
+  Monday (`datetime(2026, 8, 24, 10, 0, tzinfo=IST)`, the same constant
+  `tests/test_scheduler.py::market_open_time()` already uses).
+
+**Fixing that pin surfaced a second, deeper real bug the first one had
+been masking**: the fixture's option expiry was *also* derived from that
+same simulated `now` (`now.date() + timedelta(days=3)`). Pinned to a real
+past date, that expiry itself went stale relative to *real* wall-clock
+time — and `strategy/option_selector.py` filters candidate options on the
+real clock, not any simulated one, exactly the same real check that broke
+`test_oi_buildup.py`. The option silently dropped out of `ranked`,
+`TradeBuilderAgent` produced "no complete trade thesis" instead of a fill,
+and — because nothing ever filled — `run_trading_day`'s entry-scan loop
+ran for the rest of the simulated day instead of stopping after one round:
+at the test's 1-simulated-second-per-clock-tick resolution, that's up to
+~18,000 real iterations of a real `Orchestrator.run_cycle()` (each firing
+several real `Database.save_event()` writes) before `scan_cutoff_reached`.
+
+That looked, at first, exactly like a hung/deadlocked database: `pytest`
+ran for minutes with no output, and a stack-trace watchdog
+(`faulthandler.dump_traceback()` sampled every 10s) kept landing inside
+`storage/database.py::save_event`. Real time was genuinely being spent
+there — nothing was stuck — it was just being called ~18,000 times
+instead of once. Confirmed by isolating the test alone (no concurrent
+background jobs): it completed in 589 real seconds and failed with
+`reason='scan_cutoff_reached'` (expected `'daily_limit_reached'`) and an
+explicit `REJECT`/`'no complete trade thesis'` validation — the real
+mechanism, not a guess. Fixed by deriving the fixture's expiry from the
+real wall clock instead of the simulated `now` (matching
+`test_scheduler.py`'s own fixture, which never had this problem because
+it never derives expiry from a simulated time to begin with):
+
+```
+$ pytest tests/test_supervision_quote_symbol.py -q
+...                                                                      [100%]
+3 passed in 1.05s
+```
+
+**No production code changed for Part B** — both were real bugs in test
+construction (a stale hardcoded date; a fixture deriving a real-clock-
+checked value from a simulated clock), not in the system being tested.
+Stated plainly per the brief's own requirement.
+
+```
+$ pytest -q
+274 passed in 13.20s
+$ ruff check .
+All checks passed!
+```
+
+274/274 — every previously-known failure (the two above, both closed;
+the earlier `test_supervision_quote_symbol.py` Saturday failure from the
+last report was the same bug already fixed here) is gone, nothing new
+introduced.
+
+### Part C — Independent base-rate investigation
+
+**Methodology, deliberately independent of this system's own scoring**:
+real daily OHLC resampled from the same real 42-day NIFTY minute dataset
+already used for the Brief 8 backtest re-run
+(`data/private/nifty_index_minute_2026-07-06_to_2026-09-01.csv`), a real
+trailing ATR(14) of *daily* true range (using only the 14 real days
+strictly before each labeled day — no look-ahead; the first 14 of the 42
+days are honestly excluded, not padded with a fabricated value), and a
+day labeled "genuinely tradeable" when its real intraday range exceeds a
+multiple of that trailing ATR — a standard, independent "expansion day"
+definition, using neither `SignalEngine`, nor regime classification, nor
+any of this system's own confidence math. Sensitivity checked at three
+thresholds:
+
+```
+multiplier=1.0: 8/28 real days labeled genuinely tradeable
+multiplier=1.2: 6/28 real days labeled genuinely tradeable
+multiplier=1.5: 1/28 real days labeled genuinely tradeable
+(14 days excluded throughout, no 14-day trailing history yet)
+```
+
+multiplier=1.2 (a real day's range noticeably exceeding its own recent
+normal, a reasonable middle setting) used as the primary label below.
+
+**Structural setup-type coverage**, independent of confidence: the real,
+unmodified `execution/live_context.py::_select_setup` dispatcher (the
+actual production code that decides which of the 6 real setup types —
+note: the brief said 5, the code has 6 —
+`OPENING_RANGE_BREAKOUT`/`TREND_CONTINUATION`/`MOMENTUM_CONTINUATION`/
+`VWAP_BREAKOUT`/`VWAP_REJECTION`/`SUPPORT_RESISTANCE_REACTION` — applies,
+before `SignalEngine`'s confidence gate is ever reached) was replayed at
+real intraday decision points every 5 minutes through each of the 42
+days (not just the opening bars — trend-favored setups are, by design,
+expected to develop later in the session), using only no-look-ahead
+candle slices. Wrapped via monkeypatch purely to *observe* which
+setup_type/direction it returned each call — the dispatcher itself was
+never modified.
+
+**Cross-reference (multiplier=1.2, 28 labeled days)**:
+
+```
+Genuinely tradeable days: 6
+  (a) zero structural setup eligibility all day: 0 -> []
+  (b) setup fired structurally but no real candidate (confidence-gated): 6 -> [2026-08-03, 2026-08-04, 2026-08-25, 2026-08-26, 2026-08-27, 2026-09-01]
+  (c) real candidate_direction reached: 0 -> []
+```
+
+**Real, unambiguous answer: (a), not (b) and not "both"**. Every single
+one of the 28 labeled real days — every quiet one and every genuinely
+tradeable one — had at least one of the 6 real setup types structurally
+fire (0 days with zero eligibility). Setup-type coverage is not the
+bottleneck; the real data does not support "the system is missing a real
+pattern shape it has no detector for." All 6 genuinely tradeable days did
+have a real structural setup (mostly `TREND_CONTINUATION`/
+`MOMENTUM_CONTINUATION`/`VWAP_BREAKOUT`/`OPENING_RANGE_BREAKOUT`, several
+firing more than one) — every one was blocked by `SignalEngine`'s
+confidence math, not a missing detector. This independently reproduces,
+via a completely different, outside methodology, the same conclusion the
+confidence-ceiling analysis earlier in this report already reached: with
+`volume`/`option` structurally at their honest "unavailable" floor (0) in
+this historical replay (no real option chain or global/news data exists
+for these 42 days — the same honest gap `backtest/daily_backtest.py`
+already documents) and `global`/`news` at their fixed no-data baseline,
+the observed best-case confidences in this replay topped out at 53.8 —
+mathematically short of `signal_threshold=75` regardless of how cleanly
+the real price action matched a real setup. Consistent with, not new
+information beyond, Brief 8 Part D's "0 candidates/0 trades" finding on
+this same dataset — this pass adds the independent confirmation that the
+zero-candidate outcome is a confidence-math ceiling, not a detection gap,
+using a methodology that never touches `SignalEngine` at all.
+
+**Not recommended or changed here**, per the brief's explicit instruction:
+no threshold change, no new setup type. Reported for Prashu's decision.
