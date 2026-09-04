@@ -2901,3 +2901,130 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief: Telegram and Obsidian wired into the real live day (2026-09-05)
+
+Audit of every integration's construction against whether it's actually
+*reached* during a normal live day (not just via a standalone CLI command)
+found two real gaps, both now fixed, commit `d02f6ee`.
+
+### Gap 1: Telegram was constructed but never notified
+
+`self.telegram` was built in `Orchestrator.__init__`, but the only call
+site (`self.telegram.send_message`) was in the crash-recovery CRITICAL
+path. A normal research/signal/entry/exit cycle called `_event()`, which
+notified Discord only. Telegram silently never fired for anything but a
+crash.
+
+Fix: added `TelegramNotifier.send_event()` (mirrors
+`DiscordNotifier.send_event`'s formatting — Telegram has no per-category
+routing, so every event goes to the single configured chat), and dispatch
+it from `Orchestrator._event()` in its own independent `try/except`,
+separate from Discord's, so a real failure in either can never block the
+other.
+
+### Gap 2: Obsidian was CLI-only
+
+`ObsidianExporter` was only invoked by the standalone `export-obsidian`
+command (a single fixed placeholder note, on manual request). It never
+wrote anything during a real live day.
+
+Fix, two real write points:
+- `Orchestrator._close_position()` writes a real per-trade "Trade Journal"
+  entry, reusing the same real outcome facts already assembled for
+  `review_trade` (symbol, direction, entry/exit, pnl, exit reason, MAE/MFE,
+  hold time, regime, confidence).
+- `main.py::run_scheduled_day` writes a real "Daily Research" entry after
+  the day completes, from the real day's summary dict (resumed positions,
+  whether the day ran, scan count, trades taken, last order).
+
+Both call sites wrap `ObsidianExporter.export()` in a broad
+`try/except Exception`, in addition to its own internal `OSError`
+handling — a real vault write failure can never break the trading loop.
+The manual `export-obsidian` command is untouched and still works.
+
+### Also fixed: stale docstring
+
+`run_scheduled_day`'s docstring still said "no live global-market or news
+provider is wired in yet" — true as of Brief 5, false since Brief 8
+(`YFinanceGlobalMarketProvider` and `data/rss_news.py` were both wired in).
+Corrected, and the "known gaps" list trimmed to what's actually still open
+(OI-buildup's second-snapshot requirement, the unconfirmed `oi` field
+mapping, and AI enrichment blocked on Anthropic account credit).
+
+### Real command output proving both integrations now fire during a normal cycle
+
+```
+$ pytest tests/test_notifications.py -q
+2 passed in 4.44s
+```
+
+`test_a_normal_cycle_event_reaches_both_discord_and_telegram` runs a real
+`Orchestrator.run_cycle(...)` (a minimal, empty-context cycle — enough to
+publish the real unconditional `SYSTEM_STARTED`/`MARKET_PREP_STARTED`
+events) with both notifiers pointed at recording fake transports, and
+asserts both actually received calls — previously Telegram's call list was
+always empty for a normal cycle; this is the exact gap being closed.
+`test_one_notifiers_real_failure_does_not_block_the_other` injects a real
+`ConnectionError` into Discord's transport and confirms Telegram still
+receives the event and the cycle doesn't raise.
+
+```
+$ pytest tests/test_obsidian_wiring.py -q
+4 passed in 1.10s
+```
+
+`test_a_real_trade_close_writes_a_real_trade_journal_entry` runs a real
+fill-to-`TAKE_PROFIT`-close cycle against a real `tmp_path` vault and
+asserts a real `.md` file exists under
+`NIFTY AI Trader/Trade Journal/` containing the symbol, exit reason, and
+pnl. `test_a_completed_day_writes_a_real_daily_research_entry` calls the
+real `main.run_scheduled_day`, with `run_trading_day`/
+`resume_open_positions` monkeypatched to a fast deterministic result
+(unmodified, they'd depend on today's real weekday and, on a real trading
+day, a real waiting loop — see the note below), and asserts a real
+`.md` file exists under `NIFTY AI Trader/Daily Research/`.
+`test_no_vault_configured_is_fail_closed_not_a_crash` and
+`test_a_real_vault_write_failure_does_not_break_the_trading_loop` (a real
+file placed where `ObsidianExporter` expects a directory, forcing a real
+`OSError`) both confirm the trade still closes correctly either way.
+
+```
+$ pytest -q
+272 passed, 2 failed (both pre-existing, unrelated -- see below)
+$ ruff check .
+All checks passed!
+```
+
+### What wasn't done / honestly out of scope
+
+- No test exercises the real, unmodified `main.run_scheduled_day` against
+  a real live-market waiting loop — that would require either running on
+  an actual trading day at actual market hours, or adding a clock/calendar
+  injection point to `run_scheduled_day` itself, which wasn't asked for
+  here. The daily-research-export test instead monkeypatches
+  `run_trading_day`/`resume_open_positions` to isolate exactly the export
+  wiring being verified.
+
+### Third occurrence of the same wall-clock-date-drift bug class
+
+Running the full suite after this work's changes surfaced a **new**
+pre-existing failure, unrelated to this brief:
+`tests/test_supervision_quote_symbol.py::test_quote_source_factory_pattern_supervises_the_option_not_the_index`
+uses `datetime.now(IST)` as "today" with no guarantee it's a real trading
+day. Today (2026-09-05) is a real Saturday, so `run_trading_day` correctly
+returns `not_a_trading_day` and the test's assumption fails. Confirmed
+pre-existing and unrelated via `git stash && pytest tests/test_supervision_quote_symbol.py -q && git stash pop`
+— identical failure on the clean base commit, before any change in this
+brief. Not fixed here (out of scope for this task). This is the **third**
+instance this project has hit of the same bug class this week:
+1. `tests/test_oi_buildup.py` — a hardcoded option expiry date now in the
+   real past.
+2. An earlier `demo_trade.py` bug — `datetime.now(IST)` used directly for
+   supervision caused a real immediate `FORCED_EXIT` outside market hours.
+3. This one — `datetime.now(IST)` used as "today" with no trading-day
+   guarantee.
+
+Worth a dedicated pass at some point: a shared "pin to a guaranteed real
+trading day, not wall-clock now()" test helper would prevent this class of
+failure from recurring a fourth time.
