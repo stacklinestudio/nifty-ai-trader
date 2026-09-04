@@ -30,6 +30,7 @@ from data.global_market import YFinanceGlobalMarketProvider
 from data.historical import validate_candles
 from data.market_data import KiteMarketData, validate_quote
 from data.rss_news import fetch_recent_news
+from demo.demo_trade import run_demo_trade
 from execution.live_context import build_live_context
 from execution.process_lock import AlreadyRunningError, ProcessLock
 from execution.scheduler import resume_open_positions, run_trading_day
@@ -257,6 +258,7 @@ def main() -> int:
         "notifications",
         "export-obsidian",
         "run",
+        "demo-trade",
     ):
         sub.add_parser(name)
     args = parser.parse_args()
@@ -332,6 +334,12 @@ def main() -> int:
             return 0
         finally:
             lock.release()
+    if args.command == "demo-trade":
+        # Deliberately builds its own fully isolated Settings internally
+        # (demo/demo_trade.py::_demo_settings) -- never touches the real
+        # `settings` object built above, or anything it points at.
+        run_demo_trade()
+        return 0
     print(
         "Download instruments through an authenticated official Kite SDK session; no credentials were found."
     )
