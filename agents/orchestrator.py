@@ -45,6 +45,7 @@ from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from storage.database import Database
+from storage.models import SignalRecord
 
 logger = configure_logger(__name__)
 
@@ -245,6 +246,28 @@ class Orchestrator:
         self.settings.validate()
         state = _CycleState(context=dict(supplied_context or {}))
         self._state = state
+        # Brief 12 Part A: persist this cycle's real score attribution
+        # (execution/live_context.py::_add_candidate sets this key
+        # unconditionally, before its own confidence-threshold check) --
+        # every real evaluation, not just ones that become a trade.
+        # live_context.py stays I/O-free by its own design; this is the
+        # one real place that both sees supplied_context and already owns
+        # a Database connection. Absent for a supplied_context that never
+        # went through the live-context pipeline (e.g. most tests'
+        # hand-built dicts) -- nothing to persist, not an error.
+        attribution = state.context.get("score_attribution")
+        if attribution is not None:
+            try:
+                self.database.save_signal(
+                    SignalRecord(
+                        timestamp=datetime.fromisoformat(attribution["now"]),
+                        direction=attribution["direction"],
+                        confidence=attribution["confidence"],
+                        features=attribution,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - a persistence bug must never break the trading loop.
+                logger.warning("score_attribution_persist_failed error=%s", exc)
         self._event(EventType.SYSTEM_STARTED, {"trading_mode": self.settings.trading_mode})
         self._event(EventType.MARKET_PREP_STARTED, {"workflow": "research"})
 

@@ -811,6 +811,36 @@ def _add_candidate(
         # candidate at all on a RANGE/UNCERTAIN regime.
         override_direction=direction,
     )
+    # Brief 12 Part A: structured, queryable record of the same real 7
+    # inputs SignalEngine just scored -- previously this existed only as
+    # the log line below (or, on the cleared-threshold path, as free-text
+    # strings inside candidate_evidence), neither of which a later report
+    # could aggregate. Set unconditionally, before the threshold check, so
+    # every real evaluation is captured -- not just ones that become a
+    # trade. The caller (agents/orchestrator.py::Orchestrator.run_cycle)
+    # persists this via Database.save_signal when present; this function
+    # itself stays I/O-free, per its own docstring.
+    context["score_attribution"] = {
+        "now": now.isoformat(),
+        "setup_type": setup_type,
+        "direction": direction,
+        "regime": regime.value,
+        "confidence": signal.confidence,
+        "threshold": signal_threshold,
+        "cleared_threshold": signal.direction in {"CALL", "PUT"},
+        "technical_score": technical_score,
+        "opening_score": setup_score,
+        "volume_score": volume_score,
+        "volume_reason": volume_reason,
+        "option_score": option_score,
+        "option_reason": option_reason,
+        "global_score": global_score,
+        "global_direction": global_direction,
+        "news_score": news_score,
+        "news_direction": news_direction,
+        "risk_penalty": risk_penalty,
+        "setup_evidence": setup_evidence,
+    }
     if signal.direction not in {"CALL", "PUT"}:
         # SignalEngine itself vetoed -- a real computed signal that didn't
         # clear signal_threshold, not "nothing happened." All 7 inputs are

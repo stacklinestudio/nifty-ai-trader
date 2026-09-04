@@ -28,6 +28,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS strategy_runs (id INTEGER PRIMARY KEY, timestamp TEXT, run_type TEXT, payload TEXT);
                 CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT NOT NULL, event_type TEXT NOT NULL, input_summary TEXT NOT NULL, output_summary TEXT NOT NULL, confidence REAL, source TEXT, strategy_version TEXT);
                 CREATE TABLE IF NOT EXISTS open_positions (order_id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, state_json TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS counterfactual_records (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, setup_type TEXT NOT NULL, direction TEXT NOT NULL, rejection_reason TEXT NOT NULL, exit_reason TEXT NOT NULL, profitable INTEGER NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL);
             """)
 
     def save_signal(self, signal: SignalRecord) -> None:
@@ -41,6 +42,28 @@ class Database:
                     json.dumps(signal.serializable(), default=str),
                 ),
             )
+
+    def recent_signals(self, limit: int = 1000) -> list[dict]:
+        """Brief 12 Part A: real, queryable score-attribution history --
+        previously each candidate's 7-input breakdown existed only as a
+        log line, never aggregable after the fact (see
+        reports/score_diagnostic.py, which reads this). `payload` is the
+        full serialized SignalRecord (see save_signal); `features` -- the
+        7-input attribution dict Orchestrator.run_cycle passes in --
+        flattened up to the top level for convenience, real column values
+        (timestamp/direction/confidence) taking precedence over anything
+        with the same key inside `features`.
+        """
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM signals ORDER BY timestamp"
+            ).fetchall()
+        results = []
+        for (payload,) in rows[-limit:]:
+            record = json.loads(payload)
+            features = record.pop("features", {}) or {}
+            results.append({**features, **record})
+        return results
 
     def save_trade(self, trade: Trade) -> None:
         with sqlite3.connect(self.path) as conn:
@@ -149,3 +172,43 @@ class Database:
                 (OPTION_CHAIN_SNAPSHOT_SOURCE,),
             ).fetchone()
         return quotes_from_json(row[0]) if row else []
+
+    def save_counterfactual(self, record) -> None:
+        """Brief 12 Part B: structurally separate from `trades` (real paper
+        trades) and never touches learning.memory -- a dedicated table, own
+        reader below, own real `label` column stamped on every row in
+        addition to the same label always present inside `payload`. See
+        research/counterfactual.py::CounterfactualRecord -- `label` is a
+        read-only property there, not a field a caller can override.
+
+        `record` deliberately untyped here (duck-typed on
+        .timestamp/.setup_type/.direction/.rejection_reason/.exit_reason/
+        .profitable/.label/.to_dict()) -- research.counterfactual imports
+        execution.live_context, which transitively imports
+        agents.orchestrator, which imports this module; a top-level (or
+        even TYPE_CHECKING-only) import of CounterfactualRecord here would
+        be circular.
+        """
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO counterfactual_records"
+                "(timestamp,setup_type,direction,rejection_reason,exit_reason,profitable,label,payload)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    record.timestamp.isoformat(),
+                    record.setup_type,
+                    record.direction,
+                    record.rejection_reason,
+                    record.exit_reason,
+                    int(record.profitable),
+                    record.label,
+                    json.dumps(record.to_dict(), default=str),
+                ),
+            )
+
+    def recent_counterfactuals(self, limit: int = 10000) -> list[dict]:
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM counterfactual_records ORDER BY timestamp"
+            ).fetchall()
+        return [json.loads(payload) for (payload,) in rows[-limit:]]
