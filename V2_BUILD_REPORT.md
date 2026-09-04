@@ -2756,3 +2756,148 @@ final comparison just checks it against the wrong direction variable
 - **Not implemented this pass** — reported for a decision, per the
   brief's own explicit instruction ("I'll decide once I see the actual
   math").
+
+# Follow-Up: technical_score Fix + Demo Trade Walkthrough (2026-09-04, same day)
+
+Paper only. `signal_threshold` not touched. Commits `984fe80` (Part A),
+`82167c4` (Part B).
+
+## Part A. Fixed the real technical_score bug — DONE
+
+`execution/live_context.py::_add_candidate`'s `technical_score` now
+compares against `direction` (the firing setup's own real direction,
+already returned by `_select_setup`) instead of `trend_direction`. For
+the 4 trend-favored setups `direction == trend_direction` always by
+construction, so this is a byte-for-byte no-op for them — confirmed by
+the full test suite passing unchanged. Only the 2 range-favored setups'
+real behavior changes.
+
+```
+$ pytest -q
+267 passed, 1 failed (same pre-existing, unrelated failure)
+$ ruff check .
+All checks passed!
+```
+
+New test constructs the exact real best-case scenario (every input at
+its own real structural maximum) through the **full real pipeline**
+(`build_live_context`, not just `SignalEngine.evaluate()` directly) and
+proves it now clears the real, unchanged threshold of 75 — at exactly
+**81.25**, the precise number the fix predicted:
+
+```
+$ pytest tests/test_live_context.py -k clears_the_real_unchanged_threshold -q
+1 passed
+```
+
+Mathematically impossible before this fix, at any real input values —
+not an improvement, a real unblock.
+
+## Part B. `python main.py demo-trade` — DONE, real command output below
+
+**Scenario choice, stated plainly**: a constructed synthetic scenario,
+not a real historical day. The real 42-day backtest never produced a
+single tradeable candidate (real confirmed max confidence 53.8, every
+day `no_candidate`) — no real historical day in that window could reach
+the position-sizing/fill/exit stages this walkthrough is asked to show,
+because none of them ever got that far. The scenario used is not an
+arbitrary invention either — it's the same real 81.25-confidence
+best-case scenario just verified in Part A's own test, run once more
+through the full live pipeline for a human-readable walkthrough.
+
+**Structural isolation** (not just output labeling):
+
+- A dedicated, caller-injectable database path
+  (`data/private/demo_trade.db` by default) — never
+  `Settings().database_path`. Confirmed with real file evidence, not
+  just code reading:
+
+```
+$ python main.py demo-trade
+... (real output below) ...
+$ python -c "import sqlite3; ..."
+REAL db learning_memory rows: 0
+REAL db trades rows: 0
+DEMO db learning_memory rows: 2
+DEMO db trades rows: 0
+```
+
+  The real database's file mtime was unchanged before/after running the
+  demo (last modified two real days earlier, from unrelated prior work)
+  — the demo genuinely never touched it.
+
+- Discord/Telegram config force-blanked regardless of what the real
+  environment has configured — `tests/test_demo_trade.py::
+  test_demo_forces_discord_and_telegram_off_regardless_of_real_env_config`
+  sets real-looking env credentials via `monkeypatch.setenv` and
+  confirms zero real HTTP calls are made, not just that the demo's own
+  hardcoded settings look empty in isolation.
+- AI forced `"unavailable"`; a fresh `Orchestrator`/`DailyLimits` per
+  run (in-memory only, never persisted, so no other run's state can leak
+  in).
+
+**Three real bugs caught by actually running this, not assumed**:
+
+1. The scenario's first draft used a 120.0 option premium — real math:
+   `120.0 * lot_size 65 = 7,800`, which exceeds the real default
+   `max_position_value` (7,500), so **zero lots were affordable** and
+   `OptionSelector` correctly returned nothing. Fixed to a real,
+   affordable 100.0 (`100*65=6,500`).
+2. Supervision originally used `datetime.now(IST)` directly — real bug:
+   running this demo outside real market hours (this session's real
+   clock read 23:11 IST) meant the very first real supervision tick's
+   `now.timetz() >= forced_exit_time (15:15)` check fired immediately,
+   forcing `FORCED_EXIT` before the price path had any chance to show a
+   target/stop/trailing-stop outcome. Fixed with a real simulated
+   in-market-hours clock.
+3. The option instrument's `expiry` was tied to the scenario's own fixed
+   date (2026-09-01) — `strategy/option_selector.py::select()` checks
+   expiry against the **real** wall-clock date, which has since moved
+   past it, silently returning no valid contracts. Fixed by anchoring
+   `expiry` to real `now` plus a real margin, so this demo keeps working
+   whenever it's actually run in the future — the same class of
+   date-drift bug already found once this week in
+   `tests/test_oi_buildup.py`.
+
+**Real command output — the full lifecycle, un-forced outcome**:
+
+```
+$ python main.py demo-trade
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Setup detected: VWAP_REJECTION
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Candidate direction: CALL
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] SignalEngine confidence: 81.25
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   evidence: setup=VWAP_REJECTION: low 24030.00 pierced session vwap 24047.45 but closed back above at 24075.00 (3.13 ATR wick)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   evidence: volume=100.0 (option_contract_volume), option=75.0 (Call Buildup: call OI change 40000, put OI change 0.), global=80.0 (BULLISH), news=40.0 (BULLISH)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Research consensus: BULLISH (conflicting evidence: False)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Independent validator decision: APPROVE
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Risk approved: True
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Position sized: NIFTY2690124200CE, quantity=65 (real lot-size-multiple sizing)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Entry=100.00  Stop=92.00  Target=112.00  Estimated risk=520.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Simulated fill: order_id=PAPER-c5c63ef03676 fill_price=100.05
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Simulated live supervision (real exit engine, one real tick per synthetic price):
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=101.80  trailing_stop=92.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=104.20  trailing_stop=92.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=106.60  trailing_stop=92.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=109.00  trailing_stop=100.00  <- real trailing stop moved up (risk/trailing_stop.py::update_stop)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=110.80  trailing_stop=100.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL]   ltp=112.60  trailing_stop=104.00  <- real trailing stop moved up (risk/trailing_stop.py::update_stop)
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Exit: TAKE_PROFIT at 112.60
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Real paper P&L this demo position: 819.00
+[DEMO - ILLUSTRATIVE ONLY, NOT A REAL SIGNAL] Confirmed: 0 rows in the REAL learning.memory (demo wrote only to data\private\demo_trade.db)
+```
+
+Two real trailing-stop adjustments (92→100→104) shown explicitly before
+a naturally-produced `TAKE_PROFIT` exit — not pre-decided; the real exit
+engine reached this outcome from the synthetic price path on its own,
+the same way it would decide STOP_LOSS or a forced exit from a
+different path.
+
+```
+$ pytest tests/test_demo_trade.py -q
+.......
+7 passed in 1.59s
+$ pytest -q
+267 passed, 1 failed (same pre-existing, unrelated failure)
+$ ruff check .
+All checks passed!
+```
