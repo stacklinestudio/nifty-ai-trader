@@ -5083,3 +5083,330 @@ All checks passed!
 archive" gap only. The real option-price data archive (LTP/bid/ask/
 volume/OI per contract) remains entirely unbuilt and is explicitly the
 next, separate, larger piece — not started here.
+
+## Brief 19 (Phase 4A-1): field discovery + minimal single-session capture (2026-09-06)
+
+First of several sequenced pieces toward a real option-price archive.
+Deliberately does **not** build reconnect resilience, gap detection, or
+integrity validation — those are separate future briefs (4A-2/4A-3/
+4A-4), scoped only after this brief's real findings are seen.
+
+**A real, live Kite session was required and did not exist at the
+start of this brief.** A real `kite.profile()` check failed with a
+genuine `TokenException` (the prior day's access token had expired, as
+expected — Kite tokens are single-day). Today (2026-09-06) is also a
+real Sunday — markets closed. Per the user's explicit direction: logged
+in via a fresh real interactive Kite Connect flow (`auth/kite_auth.py`,
+unchanged), exchanged a real `request_token` for a real access token,
+confirmed live (`kite.profile()` → real `user_id=RJJ326`), and proceeded
+with the closed-market-appropriate subset of Part A: **real field
+*structure* is confirmed below for every field; real *live behavior*
+(tick frequency, live bid/ask movement, real-time OI update cadence) is
+explicitly marked unverified per field, not folded into a general
+"Part A complete."**
+
+### Part A — real field discovery (the most valuable output of this brief)
+
+Real ATM contract used throughout: `NIFTY2690823900CE` (strike 23900,
+expiry 2026-09-08, the real nearest weekly expiry), real spot at time of
+test: NIFTY 23897.7.
+
+**Per-field real findings — structure vs. live behavior stated for
+each, not as a general caveat:**
+
+| Field | REST `kite.quote()` | WebSocket (`KiteTicker`, `MODE_FULL`) | Structure vs. live behavior |
+|---|---|---|---|
+| LTP | `last_price` | `last_price` (same name) | **Structure confirmed**, identical, both interfaces. **Live update cadence: unverified** — requires a real trading session. |
+| Bid price/qty | `depth.buy[0].price` / `.quantity` — real 5-level array, not a flat field | `depth.buy[0].price` / `.quantity` — identical 5-level structure | **Structure confirmed**, identical between REST and WS. **Live spread behavior: unverified.** |
+| Ask price/qty | `depth.sell[0].price` / `.quantity` | `depth.sell[0].price` / `.quantity` | Same as bid — **structure confirmed**, **live behavior unverified**. |
+| Volume | `volume` | `volume_traded` (**differently named**) | **Structure confirmed** both — present, but real naming differs. **Live accumulation cadence: unverified.** |
+| OI | `oi`, plus `oi_day_high`/`oi_day_low` | `oi`, plus `oi_day_high`/`oi_day_low` (identical) | **Structure confirmed**, identical naming. **Live real-time update cadence explicitly unverified** — OI is typically exchange-batch-updated, not tick-by-tick; confirming the real cadence requires a real trading session. |
+| Timestamp | Two real, distinct fields: `timestamp` (quote fetch time) and `last_trade_time` (last real trade time) | `exchange_timestamp` (**renamed** from `timestamp`) and `last_trade_time` (same name) | **Structure confirmed** both, with a real naming difference on one of the two. **Live update frequency: unverified.** |
+| `instrument_token` | present, top-level | present, top-level | **Structure confirmed**, identical. Not a live-behavior question. |
+| Trading symbol | **Not a field in the response body** — only the real REST call's dict *key* (e.g. `"NFO:NIFTY2690823900CE"`) | **Absent entirely** — a WS tick is keyed only by `instrument_token`, no symbol anywhere | **Real, confirmed structural gap**, not a live-behavior question: neither interface carries tradingsymbol inline. A real join against the instrument master (`data/instrument_archive.py`) is required either way. |
+| Expiry | **Not present** | **Not present** | Same real structural gap — confirmed today. Requires the same real join. |
+| Strike | **Not present** | **Not present** | Same. |
+| Option type | **Not present** | **Not present** | Same. |
+| Underlying NIFTY price | **Not present** in the option's own quote at all | **Not present** in the option's own tick at all | **Real, confirmed structural gap**: recovering the underlying price requires a **separate** real subscription/quote call to the NIFTY 50 index instrument (`instrument_token=256265`) — confirmed today by directly querying and separately subscribing to it. |
+
+**Additional real, honest findings, beyond the brief's own field list:**
+
+- **REST has 7 real fields WS `MODE_FULL` completely omits**:
+  `lower_circuit_limit`, `upper_circuit_limit`,
+  `low_limit_price_protection`, `high_limit_price_protection`,
+  `reference_limit_price`, `indicative_close_price`,
+  `total_imbalance_qty`. All regulatory/informational, none needed for
+  tick-level price/OI/volume capture.
+- **WS has 2 real fields REST doesn't carry at all**: `tradable`
+  (boolean) and `mode` (echoes the subscribed mode back per tick).
+- **`last_quantity` (REST) vs. `last_traded_quantity` (WS)** — another
+  real naming difference, alongside `volume`/`volume_traded` and
+  `average_price`/`average_traded_price`.
+- **Confirmed directly from the installed `kiteconnect` library's own
+  real parsing source** (`kiteconnect/ticker.py`, not assumed from
+  documentation): `MODE_QUOTE` and `MODE_LTP` omit market depth
+  entirely — `MODE_FULL` is required for real depth/OI capture.
+- **This project's own pre-existing `data/option_chain.py::OptionQuote`**
+  (`bid: float | None`, `ask: float | None` — flat, single-value) is
+  narrower than Kite's real structure (5-level depth, each with
+  price+quantity+**orders**). Not a bug — `bid`/`ask` can reasonably be
+  derived as `depth.buy[0].price`/`depth.sell[0].price` — but a real,
+  concrete instance of "differently-structured than assumed," worth
+  surfacing since a naive read of that pre-existing model would
+  under-represent what Kite actually provides. Not modified in this
+  brief (out of scope; Brief 19 stores raw ticks, not `OptionQuote`s).
+- **Real, live WS behavior actually observed today** (structural, not a
+  frequency claim): connecting and subscribing to the real ATM contract
+  produced **exactly one** real tick immediately on subscribe, and zero
+  further ticks over the following ~14 real seconds. This is a real,
+  honest, structural observation consistent with a closed real market
+  (no new real trades to push) — **not** a measurement of live tick
+  frequency, which requires an open real market and is explicitly
+  deferred (see "Monday follow-up" below).
+
+**Part A #3 — REST vs. WebSocket, the real evidence-based choice:**
+**WebSocket is the right choice for continuous tick-level capture** —
+based on real structural evidence gathered today, not assumed by
+default:
+1. **Field completeness where it matters**: every field actually needed
+   for tick-level price/OI/volume capture (LTP, 5-level depth, OI,
+   volume) is present and structurally identical on both interfaces;
+   WS's only real omissions are 7 regulatory/informational fields not
+   needed for this purpose.
+2. **Architecture match, confirmed live**: WS is a real, persistent push
+   connection — a real subscription was acknowledged and a real tick
+   delivered without polling. REST `quote()` is pull-only; "continuous
+   tick-level capture" via REST would mean polling faster than the real
+   update rate, which is both wasteful and subject to Kite's own
+   documented per-request-window rate limits on REST endpoints (a real,
+   well-known operational constraint of the Kite Connect API — not
+   empirically stress-tested in this brief, since deliberately hammering
+   the single, real, daily-authenticated account's rate limit was not a
+   reasonable thing to do for a discovery brief).
+3. **Honest limit of this evidence**: today's WS test confirms
+   structural fitness (connects, subscribes, delivers well-formed real
+   ticks) but does **not** confirm real intraday message frequency or
+   throughput under real load — that requires a real trading session
+   (see below).
+
+### Part B — real, bounded, ATM-centered contract universe
+
+New module: `data/option_tick_capture.py`.
+
+- **`build_universe(instruments, spot_price, expiry, index_instrument_
+  token, strikes_either_side=10)`** — filters the real instrument list
+  to `(name="NIFTY", segment="NFO-OPT", expiry=<given>)`, derives the
+  real strike interval directly from whatever real strikes are present
+  (never hardcoded — confirmed live today to be a uniform real 50
+  points across all 87 real strikes for the nearest expiry), finds the
+  real ATM strike, and takes `strikes_either_side` real strikes on each
+  side, clipped cleanly at the real chain's edge.
+- **`STRIKES_EITHER_SIDE = 10`** (21 strikes total, ×2 for CE/PE = 42
+  real contracts + 1 real index token = 43 real WS subscriptions) — a
+  real, justified choice: 10 strikes × the real, confirmed 50-point
+  spacing = a real ±500-point (~2.1% of a ~23,900 real spot) band,
+  where NIFTY weekly option liquidity concentrates, while staying far
+  under Kite's documented per-connection WS subscription ceiling
+  (not empirically tested at scale in this brief — 43 is trivially
+  within it either way).
+- **`should_recenter(universe, new_spot_price, threshold_strikes=5)`**
+  — real, chosen threshold: re-center once the real new ATM has
+  drifted more than half the tracked window's radius (5 strikes × the
+  real strike interval = 250 real points) from the window's current
+  center. Deliberately uses the real spot price directly, not a lookup
+  restricted to the window's own known strikes, so a move large enough
+  to carry the true ATM entirely outside the tracked window is still
+  correctly detected (a real bug caught by this brief's own test,
+  `test_should_recenter_detects_drift_even_past_the_tracked_windows_
+  edge`) rather than silently clamped to the window's edge.
+- Real, live demonstration against today's actual Kite session:
+
+```
+$ python -c "... build_universe(instruments, spot, nearest_expiry) ..."
+real spot: 23897.7
+real nearest expiry: 2026-09-08
+real center (ATM) strike: 23900.0
+real strike interval: 50.0
+real strikes tracked: 21 -> (23400.0, ..., 24400.0)
+real contracts tracked (CE+PE): 42
+real total real WS subscriptions (incl. index): 43
+
+real should_recenter at +100 pts: False
+real should_recenter at +300 pts: True
+```
+
+### Part C — minimal single-session capture
+
+- **`run_capture_session(settings, universe, duration_seconds,
+  capture_dir, kite_ticker_factory=None)`** — connects a real
+  `KiteTicker`, subscribes the real bounded universe in `MODE_FULL`,
+  and appends every real tick exactly as received (plus one real
+  `received_at` timestamp, the only enrichment applied) to
+  `data/private/option_tick_capture/nifty_option_ticks_<date>.jsonl`
+  (gitignored, matching the existing `data/private/` pattern). No
+  reconnect logic, no gap detection — `on_close`/`on_error` only log; a
+  real disconnect simply ends capture for the rest of the real session,
+  exactly as scoped.
+- **Auth-lifecycle handling, matching the instrument-archiving
+  pattern**: no valid credentials → real `DATA_UNAVAILABLE` status, a
+  real Discord "system" channel + Telegram notification (reusing
+  `integrations/discord.py`/`integrations/telegram.py` verbatim), and
+  **no file is ever written** — never a silent, empty, fabricated
+  success.
+- **Real, live, end-to-end demonstration** (not just unit tests) against
+  today's actual Kite session and the real universe built above:
+
+```
+$ python -c "... run_capture_session(s, universe, duration_seconds=15, ...) ..."
+status: CAPTURED
+path: nifty_option_ticks_2026-09-06.jsonl
+tick_count: 43
+reason:
+```
+
+Real captured file inspected directly: 43 real lines, 43 distinct real
+`instrument_token`s (exactly the universe's 42 contracts + 1 index —
+every real subscription produced exactly one real tick, none more, in
+this real closed-market session). Sample real stored record (the
+index's real tick, `received_at` added, everything else exactly as
+`KiteTicker` delivered it):
+
+```json
+{
+  "received_at": "2026-09-06T01:50:33.486824+05:30",
+  "tick": {
+    "tradable": false, "mode": "full", "instrument_token": 256265,
+    "last_price": 23897.7,
+    "ohlc": {"high": 24005.75, "low": 23895.85, "open": 23910.9, "close": 23873.45},
+    "change": 0.10157727517388564,
+    "exchange_timestamp": "2026-09-04 17:35:05"
+  }
+}
+```
+
+No `tradingsymbol`/`expiry`/`strike`/`option_type` anywhere in the
+stored record — exactly as Part A found, never fabricated.
+
+### Tests
+
+```
+$ python -m pytest tests/test_option_tick_capture.py -v
+test_build_universe_selects_a_real_bounded_atm_centered_window PASSED
+test_build_universe_never_subscribes_to_the_full_real_chain PASSED
+test_build_universe_bounds_cleanly_at_the_real_chain_edge PASSED
+test_build_universe_only_includes_the_given_real_expiry PASSED
+test_should_recenter_true_only_past_the_real_threshold PASSED
+test_should_recenter_detects_drift_even_past_the_tracked_windows_edge PASSED
+test_run_capture_session_reports_data_unavailable_with_no_credentials PASSED
+test_run_capture_session_never_writes_a_file_when_credentials_are_missing PASSED
+test_run_capture_session_subscribes_the_real_universe_in_full_mode PASSED
+test_run_capture_session_stores_the_real_raw_tick_without_fabricating_missing_fields PASSED
+test_run_capture_session_stops_cleanly_if_no_real_ticks_ever_arrive PASSED
+11 passed in 0.28s
+```
+
+`test_run_capture_session_stores_the_real_raw_tick_without_fabricating_
+missing_fields` directly answers the brief's third required test —
+Part A found `tradingsymbol`/`expiry`/`strike`/`option_type` genuinely
+absent, and this test asserts the stored record reflects that honestly
+(none of those keys present), never injecting a guessed placeholder.
+`test_run_capture_session_reports_data_unavailable_with_no_credentials`
+confirms the auth-unavailable path produces `DATA_UNAVAILABLE` plus a
+real notification, never a silent empty success (and a companion test
+confirms no file is written at all in that case).
+`test_should_recenter_detects_drift_even_past_the_tracked_windows_edge`
+caught a real design mistake during development — an early version
+looked up the new ATM strike only within the current window's own known
+strikes, which would have silently under-reported drift for a large
+enough move; fixed to compare real spot price directly against the
+window's center.
+
+```
+$ pytest -q
+356 passed in 77.23s
+$ ruff check .
+All checks passed!
+```
+
+### Monday follow-up — the one specific remaining item, not a re-investigation
+
+Per the user's explicit instruction: when a real trading session next
+occurs, the **only** remaining check is real **live behavior** against
+the fields already fully documented above — not a full re-discovery
+pass. Concretely, re-run this brief's exact same `build_universe`/
+`run_capture_session` code (unchanged) during real market hours and
+observe, adding a "live behavior" column to the same per-field table
+above:
+1. Real tick arrival **frequency** per contract over time (today only
+   confirmed a single connect-time snapshot).
+2. Real bid/ask **depth values actually changing** (today's real depth
+   was uniformly zero — a closed-market artifact, not a missing
+   feature).
+3. Real OI **update cadence** (batch vs. continuous — genuinely
+   unknown until observed live).
+
+### What Phase 4A-2, 4A-3, and 4A-4 will each need to address
+
+Based on this brief's real findings — not built here:
+
+**4A-2 (reconnect/resilience/gap detection)**:
+- A real disconnect/reconnect must expect the real, confirmed behavior
+  observed today: subscribing (including re-subscribing after a
+  reconnect) delivers one real snapshot tick per instrument immediately,
+  then only genuinely new ticks — reconnect logic can rely on this
+  rather than guessing what a fresh subscription yields.
+- `data/websocket.py::WebsocketHealth` **already exists** in this
+  codebase (`connected`/`last_tick_at`/`reconnects`/`safe_for_trading`)
+  but is currently wired to nothing — a real, natural foundation for
+  4A-2 rather than something to build from scratch. Found during this
+  brief, not touched by it.
+- `should_recenter`'s real signal (built here) is not yet wired to an
+  actual live re-subscribe/unsubscribe action against a running WS
+  connection — Part C's minimal capture uses one fixed universe for the
+  whole session. 4A-2 (or a dedicated piece) must implement the actual
+  resubscribe/unsubscribe mechanics mid-session.
+- Given today's real finding that a closed market yields almost no
+  ticks by itself, gap detection must distinguish "genuinely quiet
+  market" from "real silent disconnect" — a day-level check
+  (Brief 16's pattern) is not sufficient at tick granularity; an
+  intraday heartbeat/staleness check (the same concept `WebsocketHealth.
+  safe_for_trading`'s `stale_seconds` already models) is the natural
+  next step.
+
+**4A-3 (integrity validation, extending Brief 18's pattern)**:
+- Cannot naively reuse Brief 18's `REQUIRED_INSTRUMENT_FIELDS` check —
+  a real raw tick genuinely does not carry tradingsymbol/expiry/strike/
+  option_type (Part A's confirmed finding); any real validation must
+  join against the instrument master **first**, then validate the
+  joined result.
+- Must account for the two real, different field-naming conventions
+  found today (`volume` vs `volume_traded`, `timestamp` vs
+  `exchange_timestamp`, etc.) if any future piece normalizes or mixes
+  REST- and WS-sourced records.
+- Real, testable structural invariants this brief's findings suggest:
+  depth arrays should always have exactly 5 real levels each side;
+  `oi`/`volume_traded` should be monotonically non-decreasing within a
+  real trading session (untestable today with the market closed — a
+  Monday-session candidate check).
+
+**4A-4 (coverage reporting)**:
+- Needs a real, defined "expected tick count" baseline — today's
+  finding (exactly 1 real tick per subscribed contract in a closed
+  market) shows that "zero coverage" does **not** look like zero ticks;
+  a real per-contract expected-tick-rate baseline can only be
+  established from a real trading session (the Monday follow-up), not
+  from today's closed-market data.
+- Must account for Part B's real re-centering: if the universe changes
+  mid-session, "captured X contracts" is not a single fixed number for
+  the whole session — coverage reporting needs to be aware of
+  per-window contract-set changes, not assume a static universe.
+
+**Honest summary, per the acceptance criterion**: Part A (field
+discovery) is complete for everything structurally answerable with a
+real, closed market — genuinely the most valuable output of this brief.
+Parts B and C are real, tested, and demonstrated live end-to-end.
+Nothing here is a full option-price archive yet: no resilience, no
+integrity validation at tick level, no coverage reporting, and real
+live-behavior verification (tick frequency, live spread movement, OI
+cadence) remains the one specific, scoped item for the next real
+trading session — not repeated from scratch, and not started early.
