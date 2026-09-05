@@ -3896,3 +3896,125 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 13 follow-up: found a real correctness gap while investigating the 16-hour replay, not just a performance one (2026-09-05)
+
+### Part 1 — Does the replay path recompute over full accumulated history?
+
+**Confirmed: yes.** `backtest/daily_backtest.py::_decision_time_candles`
+and `reports/score_diagnostic.py::generate_report` both built `prior =
+candles[candles.index.date < trading_day]` — every real day strictly
+before the one being evaluated, unbounded, growing across the whole
+replay window (up to 246 real days of 1-minute bars by the end of the
+12-month run).
+
+### Part 2 — Does this match or differ from the real live path? Real, critical finding
+
+**It differs — and it's a real correctness gap, not just performance,**
+found by reading `execution/live_context.py::build_live_context` (the
+actual live code path) directly:
+
+```python
+candles = KiteHistoricalData(kite).candles(
+    NIFTY_INDEX_TOKEN, now - timedelta(days=10), now, interval="minute"
+)
+```
+
+The **live path has always fetched only a bounded 10-calendar-day
+window** from Kite for technical-feature computation — a live process
+run fresh each morning can never see more real history than that anyway
+(this project's own documented deployment model). The replay/backtest
+path fed the *entire* accumulated history into the exact same
+`feature_frame` (EMA/RSI/ATR/VWAP) computation instead. Reported
+honestly, as asked, regardless of which way this would have come out:
+**the replay path was testing a computation the live path can never
+actually perform.**
+
+**Empirically confirmed before touching any code** — 15 real sample
+points across the real 12-month dataset (21 to 246 days of accumulated
+history each):
+
+```
+decision_time: 2026-08-31 09:35:00+05:30
+full_history rows: 90831 (244 real days)      bounded_10d rows: 2251 (7 real days)
+component      full-history        bounded-10d         abs diff       relative diff
+ema_fast            24055.3357          24055.3357         0.000000     0.0000%
+ema_slow            24067.5343          24067.5343         0.000000     0.0000%
+atr                    11.0107             11.0107         0.000000     0.0000%
+regime MATCHES: True   bullish read MATCHES: True
+
+... (14 more real sample points, spanning 2025-10-06 through 2026-09-02)
+max relative diff observed across all real sample points: 0.000000%
+```
+
+**Every single real sample point matched to 0.000000% relative
+difference.** Mechanistically explained, not just observed: `RSI`/`ATR`
+are already `rolling(14)` — bounded by construction regardless of how
+much extra history is fed in — and `EMA`'s exponential decay makes
+anything beyond roughly a real trading week's worth of 1-minute bars
+(thousands of bars, at `span=9`/`span=21`) contribute a weight below
+float64 precision. **The unbounded replay computation was pure wasted
+work, not extra correctness** — but it was still a real, if practically
+harmless, divergence between what was tested and what the live system
+can ever actually run, worth closing regardless of the performance win.
+
+### Part 3 — Fix: bound the replay path to match live, with a real safety test
+
+Extracted `execution/live_context.py::TECHNICAL_FEATURE_WINDOW_DAYS = 10`
+as the single shared constant both `build_live_context` (live) and
+`_decision_time_candles`/`generate_report` (replay/backtest) now import
+— they cannot silently diverge again. The "is there any real prior day
+at all" existence check (only ever relevant for the dataset's very first
+day) stays unbounded on purpose; only the window actually fed into
+`feature_frame` is bounded.
+
+```
+$ pytest tests/test_technical_feature_window.py -v
+test_bounded_window_matches_full_history_within_tight_tolerance[20-10] PASSED
+test_bounded_window_matches_full_history_within_tight_tolerance[25-100] PASSED
+test_bounded_window_matches_full_history_within_tight_tolerance[30-200] PASSED
+test_bounded_window_matches_full_history_within_tight_tolerance[38-50] PASSED
+4 passed in 1.79s
+```
+
+Real permanent regression test, run against the real 42-day dataset (a
+separate, independent real dataset from the 15-sample-point exploration
+above) at 4 real sample points, asserting `pytest.approx(..., rel=1e-4)`
+— a real, tight numerical tolerance, not exact-match luck — plus the
+real downstream bullish/bearish read and `classify()` regime must agree
+exactly.
+
+### Part 4 — Real before/after speedup, same 12-month replay
+
+```
+before (unbounded, full accumulated history):  57636.0s (~16.0 hours)
+after  (bounded to TECHNICAL_FEATURE_WINDOW_DAYS): 368.0s (~6.1 minutes)
+```
+
+**156.6x real speedup.** Real output, both runs, identical down to every
+number:
+
+| | Before (16.0h) | After (6.1min) |
+|---|---|---|
+| candidates | 3464 | 3464 |
+| score buckets (<40/40-49/50-59) | 373/2206/885 | 373/2206/885 |
+| median / mean | 47.3 / 47.0 | 47.3 / 47.0 |
+| most restrictive (`volume_score`) | 3449/3464 | 3449/3464 |
+| counterfactual profitable | 1223/3464 | 1223/3464 |
+
+**Byte-identical real output at 156.6x the real speed** — the fix
+changed nothing about correctness, only cost, exactly as the empirical
+verification predicted before any code was touched.
+
+### Part 5 — Multiprocessing: not needed
+
+Per the brief's own instruction, not reached for — the algorithmic fix
+alone brought a 12-month, 3464-candidate real replay down to ~6 minutes.
+No further optimization pursued.
+
+```
+$ pytest -q
+305 passed in 57.11s
+$ ruff check .
+All checks passed!
+```
