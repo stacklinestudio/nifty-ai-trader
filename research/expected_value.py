@@ -133,6 +133,43 @@ def real_slippage(settings: Settings, quantity: int = REAL_LOT_SIZE) -> float:
     return (entry_adverse + exit_adverse) * quantity
 
 
+def recompute_ev(
+    win_rate: float, avg_win_r: float, avg_loss_r: float, costs_r: float, slippage_r: float
+) -> float:
+    """The pure arithmetic core of the EV formula, factored out so
+    Brief 15's decomposition and AvgWin sensitivity sweep reuse the exact
+    same computation compute_ev() itself uses for tier 2 -- never a
+    separate, potentially-inconsistent calculation."""
+    return win_rate * avg_win_r - (1 - win_rate) * avg_loss_r - costs_r - slippage_r
+
+
+@dataclass(frozen=True)
+class EVDecomposition:
+    """Brief 15 Part A: the same four real terms recompute_ev() sums,
+    reported as separate line items -- win_contribution + loss_contribution
+    - costs - slippage always equals the estimate's own real ev_r exactly
+    (tests/test_ev_decomposition.py proves this), so this is a real
+    breakdown of the same number, never a second, divergent calculation.
+    """
+
+    win_contribution: float  # win_rate * avg_win_r
+    loss_contribution: float  # (1 - win_rate) * avg_loss_r -- a real cost, reported positive; subtracted in total
+    costs: float
+    slippage: float
+
+    @property
+    def total(self) -> float:
+        return self.win_contribution - self.loss_contribution - self.costs - self.slippage
+
+    def dominant_driver(self) -> str:
+        """The single term contributing the most real negative drag --
+        loss_contribution and costs/slippage are real drags by
+        construction; win_contribution is the only real positive term, so
+        it's excluded from "which term is dragging this down"."""
+        drags = {"loss_contribution": self.loss_contribution, "costs": self.costs, "slippage": self.slippage}
+        return max(drags, key=drags.get)
+
+
 @dataclass(frozen=True)
 class EVEstimate:
     setup_type: str
@@ -146,6 +183,21 @@ class EVEstimate:
     slippage_r: float
     ev_r: float | None
     one_r_rupees: float
+
+    def decomposition(self) -> EVDecomposition | None:
+        """Only meaningful for tier 2 (COUNTERFACTUAL_PROXY) -- tier 1's
+        ev_r comes directly from a real stored trade pnl (already a
+        single net real number, not decomposable into these four terms
+        without re-deriving a real per-trade cost/slippage breakdown this
+        module doesn't have); tier 3 has no real ev_r to decompose."""
+        if self.ev_source != COUNTERFACTUAL_SOURCE:
+            return None
+        return EVDecomposition(
+            win_contribution=self.win_rate * self.avg_win_r,
+            loss_contribution=(1 - self.win_rate) * self.avg_loss_r,
+            costs=self.costs_r,
+            slippage=self.slippage_r,
+        )
 
     def describe(self) -> str:
         if self.ev_r is None:
@@ -201,12 +253,7 @@ def compute_ev(
     if len(matching) >= MIN_COUNTERFACTUAL_SAMPLES:
         wins = sum(1 for r in matching if r.profitable)
         win_rate = wins / len(matching)
-        ev_r = (
-            win_rate * REWARD_RISK_RATIO
-            - (1 - win_rate) * AVG_LOSS_R
-            - costs_r
-            - slippage_r
-        )
+        ev_r = recompute_ev(win_rate, REWARD_RISK_RATIO, AVG_LOSS_R, costs_r, slippage_r)
         return EVEstimate(
             setup_type, regime, COUNTERFACTUAL_SOURCE, len(matching),
             win_rate, REWARD_RISK_RATIO, AVG_LOSS_R, costs_r, slippage_r, ev_r, one_r,
