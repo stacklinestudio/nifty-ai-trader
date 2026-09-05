@@ -109,6 +109,10 @@ class Settings:
     discord_webhook_system: str = os.getenv("DISCORD_WEBHOOK_SYSTEM", "")
     discord_webhook_daily_report: str = os.getenv("DISCORD_WEBHOOK_DAILY_REPORT", "")
     obsidian_vault_path: str = os.getenv("OBSIDIAN_VAULT_PATH", "")
+    # Brief 25: local-network-only read-only live position status page.
+    # Never exposed beyond the local network by anything in this
+    # codebase -- no port forwarding, no tunnel, no cloud hosting.
+    live_status_port: int = int(os.getenv("LIVE_STATUS_PORT", "8765"))
 
     def validate(self) -> None:
         if self.trading_mode not in {"paper", "live"}:

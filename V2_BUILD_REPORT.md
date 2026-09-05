@@ -6257,3 +6257,170 @@ file) are left in place as real evidence, not cleaned up. Also
 transparent: each run sent one real Telegram notification (the gate
 result), matching `check_notifications`'/`_notify_gate_result`'s
 already-established real behavior — expected, not a bug.
+
+## Brief 25: live, read-only trade-monitoring web page (2026-09-06)
+
+A small local web server for the CURRENT real open position's live
+state, linked from the existing entry notification. Read-only, local-
+network-only, by design and by construction.
+
+### Stack choice, stated and justified
+
+New module `monitoring/live_status_server.py` uses Python's own
+standard library `http.server` (`ThreadingHTTPServer`) — **not**
+Flask/FastAPI. This project's stack currently has zero web frameworks
+(confirmed: neither is in `requirements.txt` nor installed); adding one
+just for a single, tiny, read-only status page would be a much larger
+real addition than the page itself. The stdlib is the real, already-
+available "simplest thing given the current stack," read literally.
+
+### Real data source — and a real gap it exposed
+
+`current_position_view` reads the exact same real `storage.database.
+Database::open_positions` table `Orchestrator` already maintains for
+crash recovery — never a new data source. Building this surfaced a
+real, pre-existing gap: that row was only ever written **once**, at
+`open_position()` time (`Orchestrator.__init__`'s own `save_open_
+position` call) — it went stale immediately, since nothing ever
+re-persisted it as the position was ticked. Fixed: `Orchestrator.
+supervise_once` now re-persists the real, current `PositionState` (via
+the same, already-existing `save_open_position`) on every real observed
+tick, so real LTP/trailed-stop are genuinely current wherever this table
+is read — not just for this new page.
+
+### The page
+
+`render_page` is a pure function (no I/O) — entry, current LTP, current
+stop (explicitly labeled when it's been trailed off the original entry
+stop), target, quantity, unrealized P&L (labeled "before real exit
+costs," never overclaiming precision it doesn't have), MAE/MFE,
+opened-at and last-real-quote-at timestamps. Auto-refreshes via a plain
+`<meta http-equiv="refresh" content="7">` — no JS needed, the real
+simplest mechanism given the page needs none for anything else. No
+open position → "No open position," plainly, never stale data from the
+last real trade (confirmed by a real end-to-end test below).
+
+**Read-only by construction, not convention**: the handler class
+defines no `do_POST`/`do_PUT`/`do_DELETE` anywhere — `BaseHTTPRequest
+Handler`'s own default response for any of those is a real HTTP 501,
+confirmed against a real running server, not asserted from documentation.
+
+**Scope boundary, explicit**: the server binds `0.0.0.0` (every real
+local network interface, so a real device on the same real local
+network can reach it) — nothing in this module forwards a port, opens a
+tunnel, or does any cloud hosting. Reachability beyond the local network
+requires a deliberate, separate router/firewall action outside this
+code entirely, and real authentication before that would ever be a good
+idea — not attempted here.
+
+### Wired in
+
+- `Settings.live_status_port` (new, default 8765) — one small,
+  infrastructure-only config field, matching how every other
+  integration in this project (Discord, Telegram, Obsidian) is
+  configured.
+- `main.py::run_scheduled_day` starts the real server once per real day
+  (its own, separate `Database(settings.database_path)` connection —
+  reads the same real SQLite file, no shared in-memory object needed).
+  A real bind failure (e.g. the port already in use) is logged and
+  never blocks the real trading day from starting.
+- `python main.py live-status` — a new, standalone CLI command for
+  manual/dev use (foreground, blocking, `Ctrl+C` to stop).
+- `Orchestrator._on_risk_decision`'s real `PAPER_FILL` event now
+  includes `"live_status_url"` in its existing `output_summary` dict —
+  since `_event()` already serializes that dict into both the Discord
+  and Telegram notification text via `send_event`, this is the minimal,
+  additive way to put a real link in the existing entry notification
+  without a new notification code path.
+
+### A real, live-discovered circular import, found and fixed
+
+Manually running `python main.py live-status` worked — but a direct,
+isolated `python -c "from monitoring.live_status_server import
+live_status_url"` failed with a real `ImportError`:
+
+```
+ImportError: cannot import name 'position_state_from_dict' from partially
+initialized module 'execution.position_persistence' (most likely due to
+a circular import)
+```
+
+Real cause: `monitoring.live_status_server` importing `execution.
+position_persistence` at module level pulled in `agents.contracts`,
+and `agents/__init__.py` eagerly imports `agents.orchestrator` — which
+now itself imports `monitoring.live_status_server` (for `live_status_
+url`). `python main.py ...` only ever worked by chance, because
+`main.py`'s own import list happens to import `agents.orchestrator`
+before `monitoring.live_status_server`. Fixed by deferring the
+`position_state_from_dict` import to inside `current_position_view`
+(the only place it's needed) — confirmed afterward with three different
+real import orders, plus a real, isolated `subprocess.run` regression
+test (`test_monitoring_live_status_server_imports_standalone_without_
+agents_orchestrator_first`) so no future test-suite import-cache
+ordering could hide it again.
+
+### Tests
+
+```
+$ python -m pytest tests/test_live_status_server.py -v
+test_current_position_view_reports_no_open_position_plainly PASSED
+test_current_position_view_reflects_the_real_open_position_row PASSED
+test_render_page_says_no_open_position_plainly_never_stale_data PASSED
+test_render_page_shows_the_real_open_position_fields PASSED
+test_render_page_never_offers_any_control PASSED
+test_live_status_handler_defines_no_write_methods PASSED
+test_real_server_shows_no_open_position_when_nothing_is_open PASSED
+test_real_server_reflects_a_real_entry_a_real_trailing_stop_update_and_a_real_exit PASSED
+test_real_server_is_read_only_a_post_is_rejected PASSED
+test_real_server_returns_404_for_an_unknown_path PASSED
+test_real_local_ip_returns_a_real_looking_local_address_never_raises PASSED
+test_live_status_url_uses_the_real_configured_port PASSED
+test_a_real_paper_fill_event_includes_a_real_live_status_link PASSED
+test_supervise_once_keeps_the_real_persisted_position_state_current PASSED
+test_monitoring_live_status_server_imports_standalone_without_agents_orchestrator_first PASSED
+15 passed in 4.90s
+```
+
+The required test, `test_real_server_reflects_a_real_entry_a_real_
+trailing_stop_update_and_a_real_exit`, runs an actual `ThreadingHTTP
+Server` against a real tmp_path database and makes real HTTP GET
+requests: (1) opens a real position, confirms the real entry/stop
+appear; (2) calls the real `PositionState.observe()` trailing-stop math
+with a favorable price move, re-persists, and confirms the *new* real
+stop (not the original) appears along with a "trailed" label; (3) calls
+the real `close_open_position`, and confirms the page reverts to "No
+open position" with no leftover symbol from the just-closed trade.
+`test_real_server_is_read_only_a_post_is_rejected` confirms a real POST
+gets a real 501. `test_supervise_once_keeps_the_real_persisted_
+position_state_current` and `test_a_real_paper_fill_event_includes_a_
+real_live_status_link` cover the two real orchestrator-side changes.
+
+```
+$ pytest -q
+426 passed in 91.00s
+$ ruff check .
+All checks passed!
+```
+
+### Real, live demonstration
+
+```
+$ python main.py live-status
+Live position status page: http://<real local IP>:8765/live
+Local network only -- never exposed beyond it. Ctrl+C to stop.
+
+$ curl -s http://127.0.0.1:8765/live | head -5
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="refresh" content="7">
+...
+<h1>No open position</h1><p>Nothing is currently open...</p>
+
+$ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8765/live
+501
+```
+
+Real, honest, and consistent: no real position is open right now, the
+page says so plainly, and a real write attempt is genuinely rejected —
+not merely documented as rejected.

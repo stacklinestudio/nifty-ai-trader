@@ -41,6 +41,11 @@ from integrations.obsidian import ObsidianExporter
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.health import check_health, system_health
+from monitoring.live_status_server import (
+    build_live_status_server,
+    live_status_url,
+    run_live_status_server_in_background,
+)
 from monitoring.logger import configure_logger
 from monitoring.system_health_gate import run_system_health_gate
 from risk.risk_manager import RiskManager
@@ -229,6 +234,17 @@ def run_scheduled_day(settings: Settings) -> dict:
     """
     database = Database(settings.database_path)
     database.initialize()
+    # Brief 25: the real, local, read-only live position status page --
+    # started once per real day, reads the same real open_positions
+    # table this Orchestrator maintains (opens its own real, separate
+    # Database(settings.database_path) connection, not this one, so it
+    # never needs to share an in-memory object with the trading loop).
+    # A real bind failure (e.g. the configured port already in use) must
+    # never prevent the real trading day from starting.
+    try:
+        run_live_status_server_in_background(Database(settings.database_path), settings.live_status_port)
+    except OSError as exc:
+        logger.warning("live_status_server_start_failed error=%s", exc)
     orchestrator = Orchestrator(settings, database)
     calendar = NseCalendar()
     kite = build_kite_session(settings)
@@ -517,6 +533,7 @@ def main() -> int:
         "export-obsidian",
         "run",
         "start-day",
+        "live-status",
         "demo-trade",
     ):
         sub.add_parser(name)
@@ -627,6 +644,24 @@ def main() -> int:
             return 0
         finally:
             lock.release()
+    if args.command == "live-status":
+        # Brief 25: manual/dev entry point -- runs the real, local,
+        # read-only live position status page in the foreground
+        # (blocking). The real daily path (run_scheduled_day above)
+        # already starts this automatically in the background; this
+        # command exists for standalone use (e.g. checking the page
+        # without a full real trading day running).
+        database = Database(settings.database_path)
+        database.initialize()
+        url = live_status_url(settings)
+        print(f"Live position status page: {url}")
+        print("Local network only -- never exposed beyond it. Ctrl+C to stop.")
+        server = build_live_status_server(database, settings.live_status_port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            server.shutdown()
+        return 0
     if args.command == "demo-trade":
         # Deliberately builds its own fully isolated Settings internally
         # (demo/demo_trade.py::_demo_settings) -- never touches the real

@@ -41,6 +41,7 @@ from integrations.discord import DiscordNotifier, webhooks_by_category_from_sett
 from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
+from monitoring.live_status_server import live_status_url
 from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
@@ -424,7 +425,17 @@ class Orchestrator:
             )
             self._event(
                 EventType.PAPER_FILL,
-                {"order_id": order["order_id"], "fill_price": order["fill_price"]},
+                {
+                    "order_id": order["order_id"],
+                    "fill_price": order["fill_price"],
+                    # Brief 25: a real link to the local, read-only live
+                    # position status page -- the real machine's local
+                    # network address (never a public URL), so it only
+                    # resolves for a device already on the same real
+                    # local network. real_local_ip() itself never raises
+                    # (falls back to 127.0.0.1 on any real socket error).
+                    "live_status_url": live_status_url(self.settings),
+                },
                 100,
                 execution.agent,
             )
@@ -571,6 +582,20 @@ class Orchestrator:
             regime_context,
             self.settings.trail_percent,
         )
+        if ltp is not None and state.entry_order_id:
+            # Brief 25: previously save_open_position was only ever
+            # called once, at open_position() time -- the persisted row
+            # went stale immediately (real crash recovery still worked,
+            # since it only needs entry/stop/target, but nothing could
+            # read a real, current LTP/trailed-stop from storage). Kept
+            # fresh on every real observed tick so the live status page
+            # (and any future reader) sees genuinely current state, not
+            # a snapshot from whenever the position opened. Harmless on
+            # an exit tick too -- _close_position's own close_open_
+            # position() call below deletes the row moments later.
+            self.database.save_open_position(
+                state.entry_order_id, state.opened_at.isoformat(), position_state_to_dict(state)
+            )
         if result.notify_stale:
             logger.warning("stale_price_during_open_position symbol=%s", state.thesis.symbol)
             self._event(
