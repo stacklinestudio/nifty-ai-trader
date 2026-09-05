@@ -19,6 +19,7 @@ from execution.position_persistence import position_state_to_dict
 from execution.position_supervisor import PositionState
 from monitoring.live_status_server import (
     build_live_status_server,
+    build_mock_demo_position,
     current_position_view,
     live_status_url,
     real_local_ip,
@@ -360,3 +361,206 @@ def test_monitoring_live_status_server_imports_standalone_without_agents_orchest
     )
 
     assert result.returncode == 0, result.stderr
+
+
+# --- Brief 26: demo/mock live status data, structurally isolated -------
+
+
+def test_build_mock_demo_position_is_clearly_synthetic():
+    view = build_mock_demo_position()
+
+    assert view["open"] is True
+    assert view["is_demo"] is True
+    assert view["symbol"].startswith("DEMO-")
+    assert view["setup_type"] == "DEMO_SETUP"
+
+
+def test_database_demo_position_round_trips_and_is_a_real_singleton(tmp_path):
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    now = datetime.now(IST)
+
+    assert database.demo_position() is None  # honest: nothing written yet
+
+    view = build_mock_demo_position(now)
+    database.save_demo_position(view, now)
+    assert database.demo_position() == view
+
+    # A real singleton -- saving again overwrites, never accumulates a
+    # second row.
+    other_view = build_mock_demo_position(now)
+    other_view["symbol"] = "DEMO-DIFFERENT"
+    database.save_demo_position(other_view, now)
+    assert database.demo_position()["symbol"] == "DEMO-DIFFERENT"
+
+    database.clear_demo_position()
+    assert database.demo_position() is None
+
+
+def test_database_demo_position_table_is_wholly_separate_from_open_positions(tmp_path):
+    """Structural isolation, the required property: writing a demo
+    position must never touch the real open_positions table at all."""
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+
+    database.save_demo_position(build_mock_demo_position(), datetime.now(IST))
+
+    assert database.open_positions() == []  # completely untouched
+
+
+def test_current_position_view_falls_back_to_demo_when_nothing_real_is_open(tmp_path):
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    demo_view = build_mock_demo_position()
+    database.save_demo_position(demo_view, datetime.now(IST))
+
+    view = current_position_view(database)
+
+    assert view == demo_view
+
+
+def test_current_position_view_prefers_a_real_open_position_over_demo_data(tmp_path):
+    """The required safeguard: a real open position always takes
+    priority, so lingering demo data can never mask or be confused with
+    a real one."""
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    database.save_demo_position(build_mock_demo_position(), datetime.now(IST))
+    thesis = _real_thesis(entry=100.0, stop=95.0, target=115.0, quantity=65)
+    _open_real_position(database, thesis)
+
+    view = current_position_view(database)
+
+    assert view["is_demo"] is False
+    assert view["symbol"] == "NIFTY26SEP24000CE"
+
+
+def test_render_page_shows_the_demo_banner_prominently_for_demo_data():
+    view = build_mock_demo_position()
+
+    html = render_page(view)
+
+    assert "DEMO DATA" in html
+    assert "NOT A REAL POSITION" in html
+    assert "DEMO" in html  # in the <title> too
+    assert html.count("DEMO DATA") >= 2  # top and bottom of the page, not just once
+
+
+def test_render_page_never_shows_the_demo_banner_for_a_real_position():
+    """Checks the real, VISIBLE banner text is absent -- not the mere
+    substring "DEMO", which also appears (harmlessly) inside the static
+    `.demo-banner` CSS class selector present in every page's <style>
+    block regardless of is_demo, since that class must exist for
+    whenever the banner IS shown."""
+    view = {
+        "open": True, "is_demo": False, "symbol": "REAL-NIFTY24CE", "direction": "CALL", "setup_type": "Y",
+        "entry": 1.0, "current_ltp": 1.0, "current_stop": 1.0, "original_stop": 1.0, "stop_was_trailed": False,
+        "target": 1.0, "quantity": 1, "unrealized_pnl": 0.0, "opened_at": "x", "last_quote_at": "x",
+        "mae": 0.0, "mfe": 0.0,
+    }
+
+    html = render_page(view)
+
+    assert "DEMO DATA" not in html
+    assert "NOT A REAL POSITION" not in html
+    assert "demo-banner\">" not in html  # the banner <div> itself is never emitted
+
+
+def test_render_page_never_shows_the_demo_banner_when_nothing_is_open():
+    html = render_page({"open": False})
+
+    assert "DEMO DATA" not in html
+    assert "NOT A REAL POSITION" not in html
+    assert "demo-banner\">" not in html
+
+
+def test_real_server_shows_the_demo_banner_across_multiple_real_refreshes(live_server):
+    """Requirement #3: the mock page auto-refreshes and correctly shows
+    the demo label at all times, including after a refresh -- proven
+    with real, repeated HTTP GETs against an actual running server."""
+    server, database = live_server
+    database.save_demo_position(build_mock_demo_position(), datetime.now(IST))
+
+    for _ in range(3):  # simulates several real auto-refresh cycles
+        status, body = _get(server)
+        assert status == 200
+        assert "DEMO DATA" in body
+        assert "NOT A REAL POSITION" in body
+
+
+def test_real_server_demo_data_never_masks_a_real_position_that_opens_later(live_server):
+    server, database = live_server
+    database.save_demo_position(build_mock_demo_position(), datetime.now(IST))
+    status, body = _get(server)
+    assert "DEMO DATA" in body
+
+    thesis = _real_thesis(entry=100.0, stop=95.0, target=115.0, quantity=65)
+    _open_real_position(database, thesis)
+
+    status, body = _get(server)
+    assert status == 200
+    assert "DEMO DATA" not in body
+    assert "NIFTY26SEP24000CE" in body
+
+
+# --- python main.py demo-live-link --------------------------------------
+
+
+def test_demo_live_link_never_touches_real_open_positions(tmp_path, monkeypatch):
+    """The required test: the demo command never touches real position
+    state."""
+    import main
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+
+    class _RecordingNotifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send_event(self, event):
+            return True
+
+    monkeypatch.setattr(main, "DiscordNotifier", _RecordingNotifier)
+    monkeypatch.setattr(main, "TelegramNotifier", _RecordingNotifier)
+
+    result = main.demo_live_link(settings, database=database)
+
+    assert database.open_positions() == []  # never touched
+    assert database.demo_position() is not None
+    assert database.demo_position()["is_demo"] is True
+    assert result["discord_sent"] is True
+    assert result["telegram_sent"] is True
+
+
+def test_demo_live_link_sends_a_real_notification_with_the_real_working_link(tmp_path, monkeypatch):
+
+    import main
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    sent_messages = []
+
+    class _RecordingNotifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send_event(self, event):
+            sent_messages.append(event)
+            return True
+
+    monkeypatch.setattr(main, "DiscordNotifier", _RecordingNotifier)
+    monkeypatch.setattr(main, "TelegramNotifier", _RecordingNotifier)
+
+    result = main.demo_live_link(settings, database=database)
+
+    # Sent via the exact real Event/send_event path PAPER_FILL itself uses.
+    assert len(sent_messages) == 2  # Discord + Telegram
+    for event in sent_messages:
+        assert event.event_type.value == "PAPER_FILL"
+        assert event.output_summary["live_status_url"] == result["live_status_url"]
+        assert "DEMO" in event.output_summary["note"]
+    assert result["live_status_url"].startswith("http://")
+    assert result["live_status_url"].endswith(f":{settings.live_status_port}/live")

@@ -6424,3 +6424,111 @@ $ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8765/live
 Real, honest, and consistent: no real position is open right now, the
 page says so plainly, and a real write attempt is genuinely rejected —
 not merely documented as rejected.
+
+## Brief 26: demo/test mode for the live-status link (2026-09-06)
+
+`python main.py demo-live-link` — writes a clearly synthetic mock
+position and sends a real Discord/Telegram message with the real,
+working live-status link, so delivery and rendering can be verified
+end to end without waiting for (or risking) a real trade.
+
+### Structural isolation — a new, dedicated mechanism, not a repurposed one
+
+Reusing the two cited real patterns precisely, not just their spirit:
+
+- Like `demo/demo_trade.py`, the mock state is never written to real
+  position-supervision storage — a wholly separate real SQLite table,
+  `demo_live_position` (`storage/database.py`, schema enforces a real
+  singleton via `CHECK (id = 1)`), never `open_positions`. `recover_
+  open_positions` and every real supervision code path never reads
+  from it — confirmed by a real test asserting `open_positions()`
+  stays `[]` after writing a demo state.
+- Like `learning/experiment_manager.py`'s distinct `memory_type=
+  "experiment"` tag, the demo state carries its own real, structural
+  flag (`is_demo: True`) baked into the view dict itself — never a
+  string match on the symbol or any other incidental field.
+- Unlike `demo_trade.py` (which deliberately forces Discord/Telegram
+  off), this command's entire point is a **real** working notification
+  — it uses `settings` exactly as configured, matching `python main.py
+  notifications`'s own real test-send behavior.
+
+**Real precedence, built in as a safeguard**: `current_position_view`
+checks for a real open position *first* — demo data is only ever shown
+in place of "no open position," and can never mask or be confused with
+a real one, even if a `demo-live-link` run is left forgotten. Proven by
+a real end-to-end test: writing demo data, confirming the banner shows,
+then opening a real position and confirming the demo banner disappears
+in favor of the real trade.
+
+### The DEMO banner
+
+`render_page` checks the real `is_demo` flag and renders a large, red,
+impossible-to-miss banner ("DEMO DATA — NOT A REAL POSITION") both above
+and below the position details, plus in the page `<title>` — present on
+every real render, including every real auto-refresh (server-rendered
+fresh each request; there is no client-side state to lose between
+refreshes). The exact same real notification formatting `PAPER_FILL`
+itself uses (`Event`/`send_event`, not a separately hand-rolled
+message) carries an explicit `"DEMO DATA, NOT A REAL TRADE"` note too.
+
+### Tests
+
+```
+$ python -m pytest tests/test_live_status_server.py -v
+... (27 total, 12 new for this brief)
+test_build_mock_demo_position_is_clearly_synthetic PASSED
+test_database_demo_position_round_trips_and_is_a_real_singleton PASSED
+test_database_demo_position_table_is_wholly_separate_from_open_positions PASSED
+test_current_position_view_falls_back_to_demo_when_nothing_real_is_open PASSED
+test_current_position_view_prefers_a_real_open_position_over_demo_data PASSED
+test_render_page_shows_the_demo_banner_prominently_for_demo_data PASSED
+test_render_page_never_shows_the_demo_banner_for_a_real_position PASSED
+test_render_page_never_shows_the_demo_banner_when_nothing_is_open PASSED
+test_real_server_shows_the_demo_banner_across_multiple_real_refreshes PASSED
+test_real_server_demo_data_never_masks_a_real_position_that_opens_later PASSED
+test_demo_live_link_never_touches_real_open_positions PASSED
+test_demo_live_link_sends_a_real_notification_with_the_real_working_link PASSED
+27 passed in 6.07s
+```
+
+The required test, `test_demo_live_link_never_touches_real_open_
+positions`, asserts `database.open_positions() == []` after running the
+real command — structural proof, not an inference from reading the
+code. `test_render_page_never_shows_the_demo_banner_for_a_real_position`/
+`..._when_nothing_is_open` caught a real bug in my own first test
+attempt: asserting the bare substring `"DEMO"` is absent from the whole
+page failed, because the static `.demo-banner` CSS class *selector*
+(needed structurally so the class exists for whenever the banner IS
+shown) is always present in every page's `<style>` block — fixed to
+check the real, *visible* banner text specifically, not an incidental
+CSS class name.
+
+```
+$ pytest -q
+438 passed in 84.89s
+$ ruff check .
+All checks passed!
+```
+
+### Real, live demonstration
+
+```
+$ python main.py demo-live-link
+Demo position written (DEMO DATA, not a real trade): DEMO-NIFTY00000CE
+Live status page: http://192.168.1.2:8765/live
+Discord sent: True  Telegram sent: True
+
+$ python main.py live-status &
+$ curl -s http://127.0.0.1:8765/live | head -20
+<title>NIFTY AI Trader -- Live Position (DEMO DATA)</title>
+...
+<div class="demo-banner">DEMO DATA &mdash; NOT A REAL POSITION</div>
+<h1>DEMO-NIFTY00000CE &mdash; CALL (DEMO_SETUP)</h1>
+```
+
+Real, both channels genuinely sent (Discord and Telegram are both
+really configured in this environment) — two real notifications
+actually landed, exactly as requested. The real demo state was cleared
+from the real production database (`Database.clear_demo_position()`)
+immediately after capturing this evidence, so it doesn't linger
+indefinitely on the real page.

@@ -29,6 +29,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT NOT NULL, event_type TEXT NOT NULL, input_summary TEXT NOT NULL, output_summary TEXT NOT NULL, confidence REAL, source TEXT, strategy_version TEXT);
                 CREATE TABLE IF NOT EXISTS open_positions (order_id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, state_json TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS counterfactual_records (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, setup_type TEXT NOT NULL, direction TEXT NOT NULL, rejection_reason TEXT NOT NULL, exit_reason TEXT NOT NULL, profitable INTEGER NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS demo_live_position (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL, saved_at TEXT NOT NULL);
             """)
 
     def save_signal(self, signal: SignalRecord) -> None:
@@ -140,6 +141,29 @@ class Database:
     def close_open_position(self, order_id: str) -> None:
         with sqlite3.connect(self.path) as conn:
             conn.execute("DELETE FROM open_positions WHERE order_id = ?", (order_id,))
+
+    def save_demo_position(self, payload: dict, saved_at: datetime) -> None:
+        """Brief 26: a wholly separate real table from `open_positions` --
+        never read by `recover_open_positions` or any real position-
+        supervision code path, so a demo/mock state can never be mistaken
+        for, or interfere with, a real open position. A real singleton
+        (CHECK (id = 1) in the schema): only ever one demo state at a
+        time, always overwritten, never accumulating rows."""
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO demo_live_position(id, payload, saved_at) VALUES(1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, saved_at = excluded.saved_at",
+                (json.dumps(payload, default=str), saved_at.isoformat()),
+            )
+
+    def demo_position(self) -> dict | None:
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute("SELECT payload FROM demo_live_position WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else None
+
+    def clear_demo_position(self) -> None:
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DELETE FROM demo_live_position WHERE id = 1")
 
     def save_option_chain_snapshot(self, timestamp: datetime, quotes: list[OptionQuote]) -> None:
         """Persists the option chain fetched this cycle so the NEXT cycle

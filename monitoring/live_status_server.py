@@ -69,11 +69,49 @@ def live_status_url(settings: Settings, ip: str | None = None) -> str:
     return f"http://{ip or real_local_ip()}:{settings.live_status_port}{LIVE_PATH}"
 
 
+def build_mock_demo_position(now: datetime | None = None) -> dict[str, Any]:
+    """Brief 26: a clearly synthetic position view -- round, obviously
+    fake numbers and a symbol literally prefixed "DEMO-", never derived
+    from any real trade -- for `python main.py demo-live-link` to write
+    via `Database.save_demo_position` (a wholly separate real table,
+    never `open_positions`). `is_demo=True` is the real, structural flag
+    `render_page` checks to show the DEMO banner; it is never left to a
+    string match on the symbol or any other incidental field."""
+    timestamp = (now or datetime.now(IST)).isoformat()
+    entry, current_ltp, quantity = 100.0, 108.5, 65
+    return {
+        "open": True,
+        "is_demo": True,
+        "symbol": "DEMO-NIFTY00000CE",
+        "direction": "CALL",
+        "setup_type": "DEMO_SETUP",
+        "entry": entry,
+        "current_ltp": current_ltp,
+        "current_stop": 96.0,
+        "original_stop": 95.0,
+        "stop_was_trailed": True,
+        "target": 130.0,
+        "quantity": quantity,
+        "unrealized_pnl": (current_ltp - entry) * quantity,
+        "opened_at": timestamp,
+        "last_quote_at": timestamp,
+        "mae": 0.0,
+        "mfe": 8.5,
+    }
+
+
 def current_position_view(database: Database) -> dict[str, Any]:
     """The real, current open-position state, read directly from the
     real, already-existing `open_positions` table -- no new data
-    source. `{"open": False}` plainly whenever nothing real is open,
-    never stale data from the last real trade.
+    source. `{"open": False}` plainly whenever nothing real is open and
+    no real demo state exists, never stale data from the last real
+    trade.
+
+    Brief 26: a real open position ALWAYS takes priority over demo/mock
+    data -- checked first, and if present, demo state is never even
+    read. This means lingering demo data (e.g. a forgotten `demo-live-
+    link` run) can never mask or be confused with a real position; at
+    worst it fills in for the "no open position" case until cleared.
 
     `position_state_from_dict` is imported here, not at module level --
     it pulls in execution.position_persistence -> agents.contracts, and
@@ -89,29 +127,33 @@ def current_position_view(database: Database) -> dict[str, Any]:
     from execution.position_persistence import position_state_from_dict
 
     rows = database.open_positions()
-    if not rows:
-        return {"open": False}
-    row = rows[-1]  # this project holds at most one real open position at a time
-    state = position_state_from_dict(row["state"])
-    unrealized_pnl = (state.last_valid_ltp - state.thesis.entry) * state.thesis.quantity
-    return {
-        "open": True,
-        "symbol": state.thesis.symbol,
-        "direction": state.thesis.candidate.direction,
-        "setup_type": state.thesis.candidate.setup_type,
-        "entry": state.thesis.entry,
-        "current_ltp": state.last_valid_ltp,
-        "current_stop": state.current_stop,
-        "original_stop": state.thesis.stop,
-        "stop_was_trailed": state.current_stop != state.thesis.stop,
-        "target": state.thesis.target,
-        "quantity": state.thesis.quantity,
-        "unrealized_pnl": unrealized_pnl,
-        "opened_at": state.opened_at.isoformat(),
-        "last_quote_at": state.last_quote_at.isoformat(),
-        "mae": state.mae,
-        "mfe": state.mfe,
-    }
+    if rows:
+        row = rows[-1]  # this project holds at most one real open position at a time
+        state = position_state_from_dict(row["state"])
+        unrealized_pnl = (state.last_valid_ltp - state.thesis.entry) * state.thesis.quantity
+        return {
+            "open": True,
+            "is_demo": False,
+            "symbol": state.thesis.symbol,
+            "direction": state.thesis.candidate.direction,
+            "setup_type": state.thesis.candidate.setup_type,
+            "entry": state.thesis.entry,
+            "current_ltp": state.last_valid_ltp,
+            "current_stop": state.current_stop,
+            "original_stop": state.thesis.stop,
+            "stop_was_trailed": state.current_stop != state.thesis.stop,
+            "target": state.thesis.target,
+            "quantity": state.thesis.quantity,
+            "unrealized_pnl": unrealized_pnl,
+            "opened_at": state.opened_at.isoformat(),
+            "last_quote_at": state.last_quote_at.isoformat(),
+            "mae": state.mae,
+            "mfe": state.mfe,
+        }
+    demo = database.demo_position()
+    if demo is not None:
+        return demo  # already real-shaped, with is_demo=True baked in by _mock_demo_position
+    return {"open": False}
 
 
 def render_page(view: dict[str, Any], refresh_seconds: int = REFRESH_SECONDS, now: datetime | None = None) -> str:
@@ -120,6 +162,10 @@ def render_page(view: dict[str, Any], refresh_seconds: int = REFRESH_SECONDS, no
     server. Auto-refreshes via a plain `<meta http-equiv="refresh">` --
     the real, simplest mechanism given zero JS is already needed for
     anything else on this page."""
+    is_demo = bool(view.get("is_demo"))
+    demo_banner = (
+        '<div class="demo-banner">DEMO DATA &mdash; NOT A REAL POSITION</div>' if is_demo else ""
+    )
     if not view.get("open"):
         body = (
             "<h1>No open position</h1>"
@@ -130,7 +176,10 @@ def render_page(view: dict[str, Any], refresh_seconds: int = REFRESH_SECONDS, no
         pnl = view["unrealized_pnl"]
         pnl_class = "profit" if pnl >= 0 else "loss"
         trailed_note = " (trailed from entry stop)" if view["stop_was_trailed"] else ""
+        quote_label = "Last quote at" if is_demo else "Last real quote at"
+        pnl_label = "Unrealized P&amp;L (demo, not real)" if is_demo else "Unrealized P&amp;L (before real exit costs)"
         body = f"""
+{demo_banner}
 <h1>{view['symbol']} &mdash; {view['direction']} ({view['setup_type']})</h1>
 <table>
 <tr><td>Entry</td><td>{view['entry']:.2f}</td></tr>
@@ -139,19 +188,24 @@ def render_page(view: dict[str, Any], refresh_seconds: int = REFRESH_SECONDS, no
 <tr><td>Original stop</td><td>{view['original_stop']:.2f}</td></tr>
 <tr><td>Target</td><td>{view['target']:.2f}</td></tr>
 <tr><td>Quantity</td><td>{view['quantity']}</td></tr>
-<tr><td>Unrealized P&amp;L (before real exit costs)</td><td class="{pnl_class}">{pnl:+.2f}</td></tr>
+<tr><td>{pnl_label}</td><td class="{pnl_class}">{pnl:+.2f}</td></tr>
 <tr><td>MAE / MFE</td><td>{view['mae']:.2f} / {view['mfe']:.2f}</td></tr>
 <tr><td>Opened at</td><td>{view['opened_at']}</td></tr>
-<tr><td>Last real quote at</td><td>{view['last_quote_at']}</td></tr>
+<tr><td>{quote_label}</td><td>{view['last_quote_at']}</td></tr>
 </table>
+{demo_banner}
 """
     timestamp = (now or datetime.now(IST)).isoformat(timespec="seconds")
+    title = "NIFTY AI Trader -- Live Position (DEMO DATA)" if is_demo else "NIFTY AI Trader -- Live Position"
+    footer_demo_note = (
+        " This is DEMO DATA, not a real position -- see python main.py demo-live-link." if is_demo else ""
+    )
     return f"""<!doctype html>
 <html>
 <head>
 <meta http-equiv="refresh" content="{refresh_seconds}">
 <meta charset="utf-8">
-<title>NIFTY AI Trader -- Live Position</title>
+<title>{title}</title>
 <style>
 body {{ font-family: system-ui, sans-serif; padding: 2em; background: #fafafa; color: #111; }}
 table {{ border-collapse: collapse; margin-top: 1em; }}
@@ -160,12 +214,17 @@ td:first-child {{ color: #555; }}
 .profit {{ color: #0a7a2a; font-weight: bold; }}
 .loss {{ color: #b30000; font-weight: bold; }}
 .footer {{ margin-top: 2em; color: #888; font-size: 0.9em; }}
+.demo-banner {{
+  background: #b30000; color: #fff; font-weight: bold; font-size: 1.3em;
+  padding: 12px 20px; margin: 0 0 1em 0; text-align: center; letter-spacing: 0.05em;
+  border: 3px solid #7a0000;
+}}
 </style>
 </head>
 <body>
 {body}
 <p class="footer">Read-only, viewing only -- no controls here.
-Auto-refreshes every {refresh_seconds}s. Rendered at {timestamp}.</p>
+Auto-refreshes every {refresh_seconds}s. Rendered at {timestamp}.{footer_demo_note}</p>
 </body>
 </html>"""
 

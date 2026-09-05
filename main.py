@@ -33,6 +33,7 @@ from data.instrument_archive import real_archive_status, real_gap_check_status, 
 from data.market_data import KiteMarketData, validate_quote
 from data.rss_news import fetch_recent_news
 from demo.demo_trade import run_demo_trade
+from events.contracts import Event, EventType
 from execution.live_context import build_live_context
 from execution.process_lock import AlreadyRunningError, ProcessLock
 from execution.scheduler import resume_open_positions, run_trading_day
@@ -43,6 +44,7 @@ from learning.memory import MemoryStore
 from monitoring.health import check_health, system_health
 from monitoring.live_status_server import (
     build_live_status_server,
+    build_mock_demo_position,
     live_status_url,
     run_live_status_server_in_background,
 )
@@ -394,6 +396,71 @@ def _start_option_tick_capture_in_background(settings: Settings) -> threading.Th
     return thread
 
 
+def demo_live_link(settings: Settings, database: Database | None = None) -> dict:
+    """`python main.py demo-live-link`: writes a clearly-labeled,
+    structurally-separate DEMO position state the live status page can
+    render, and sends a real Discord/Telegram message with the real,
+    working link -- the same way `python main.py notifications` already
+    test-sends, so delivery and rendering can be verified end to end
+    without waiting for (or risking) a real trade.
+
+    Structural isolation, matching the pattern already used for the
+    AI-judgment experiment (`learning/experiment_manager.py`'s distinct
+    `memory_type="experiment"` tag, never conflated with a real trade
+    record) and demo-trade (`demo/demo_trade.py`'s wholly separate
+    database): the mock state is written via `Database.save_demo_
+    position`, a real, separate SQLite table (`demo_live_position`)
+    `recover_open_positions` and every real position-supervision code
+    path never reads from -- never `open_positions`, never
+    `save_open_position`. `monitoring.live_status_server.current_
+    position_view` always checks for a real open position FIRST; demo
+    data can only ever appear in place of "no open position," never
+    mask or be confused with a real one.
+
+    `database` is injectable purely for tests (an isolated tmp_path
+    database) -- production callers never pass it; the real Discord/
+    Telegram sends always use `settings` as configured, unlike demo-
+    trade, which deliberately forces notifications off. This command's
+    entire point is a REAL, working notification.
+    """
+    database = database or Database(settings.database_path)
+    database.initialize()
+    now = datetime.datetime.now(IST)
+    mock_view = build_mock_demo_position(now)
+    database.save_demo_position(mock_view, now)
+
+    url = live_status_url(settings)
+    # The exact same real formatting the real PAPER_FILL entry
+    # notification uses (agents/orchestrator.py::_on_risk_decision) --
+    # a real Event run through the same real send_event() Discord/
+    # Telegram already use for every other real event, not a
+    # separately hand-rolled message string.
+    event = Event(
+        EventType.PAPER_FILL,
+        "demo_live_link",
+        now,
+        output_summary={
+            "order_id": "DEMO-ORDER",
+            "fill_price": mock_view["entry"],
+            "live_status_url": url,
+            "note": "DEMO DATA, NOT A REAL TRADE -- sent by python main.py demo-live-link",
+        },
+        confidence=100,
+    )
+    discord = DiscordNotifier(
+        settings.discord_webhook_url, webhooks_by_category=webhooks_by_category_from_settings(settings)
+    )
+    telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+    discord_sent = discord.send_event(event)
+    telegram_sent = telegram.send_event(event)
+    return {
+        "mock_view": mock_view,
+        "live_status_url": url,
+        "discord_sent": discord_sent,
+        "telegram_sent": telegram_sent,
+    }
+
+
 def start_day(
     settings: Settings,
     gate=None,
@@ -534,6 +601,7 @@ def main() -> int:
         "run",
         "start-day",
         "live-status",
+        "demo-live-link",
         "demo-trade",
     ):
         sub.add_parser(name)
@@ -661,6 +729,17 @@ def main() -> int:
             server.serve_forever()
         except KeyboardInterrupt:
             server.shutdown()
+        return 0
+    if args.command == "demo-live-link":
+        # Brief 26: writes a clearly-labeled DEMO position (never the
+        # real open_positions table) and sends a real Discord/Telegram
+        # notification with the real, working live-status link -- for
+        # verifying end-to-end delivery/rendering without a real trade.
+        result = demo_live_link(settings)
+        print(f"Demo position written (DEMO DATA, not a real trade): {result['mock_view']['symbol']}")
+        print(f"Live status page: {result['live_status_url']}")
+        print(f"Discord sent: {result['discord_sent']}  Telegram sent: {result['telegram_sent']}")
+        print("(If neither channel is configured, this correctly reports False -- same as `notifications`.)")
         return 0
     if args.command == "demo-trade":
         # Deliberately builds its own fully isolated Settings internally
