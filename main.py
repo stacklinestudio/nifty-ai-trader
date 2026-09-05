@@ -383,15 +383,22 @@ def main() -> int:
         # itself does: no valid session today (missing credentials, or a
         # real API failure -- most often an expired access token) prints
         # the same message a genuinely-unconfigured environment would,
-        # never a crash, never a fabricated archive file.
+        # never a crash, never a fabricated archive file. Brief 18: a real
+        # session can also succeed and still return None -- the file got
+        # written but failed post-write content validation -- so this
+        # message no longer claims "no valid session" as the only real
+        # explanation; the real reason either way is in the Discord
+        # "system" channel notification run_daily_archive already sent.
         path = run_daily_archive(settings)
         if path:
             print(f"Archived real NFO instruments to {path}")
         else:
             print(
-                "Download instruments through an authenticated official Kite SDK session; "
-                "no valid session found (missing credentials, or today's access token has "
-                "expired/not yet been refreshed)."
+                "No trustworthy real NFO instrument archive was produced for today -- either no "
+                "valid Kite session exists (missing credentials, or today's access token has "
+                "expired/not yet been refreshed), or a real session succeeded but the written file "
+                "failed post-write validation. See the Discord \"system\" channel notification for "
+                "the specific real reason."
             )
         return 0
     print(

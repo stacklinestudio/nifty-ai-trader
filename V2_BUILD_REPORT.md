@@ -4899,3 +4899,187 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 18: real archive content validation, not just existence (2026-09-06)
+
+Closes the gap flagged directly: a successful write (Brief 17) proved
+nothing about whether the archived content was actually usable. Data-
+integrity validation only — no config or trade-decision change. The
+real option-price archive (LTP/bid/ask/volume/OI per contract) remains
+entirely unbuilt; explicitly the next, separate, larger piece, not
+started here.
+
+### Part A — real validation, applied right after a successful write
+
+`data/instrument_archive.py::validate_archive(path, day, calendar,
+recent_validated_counts) -> ArchiveValidationResult` runs five real
+checks, each returning a specific real reason on failure:
+
+1. **Valid JSON** — `json.loads`, caught explicitly.
+2. **Required fields** — `REQUIRED_INSTRUMENT_FIELDS = (tradingsymbol,
+   strike, expiry, instrument_type, lot_size, instrument_token,
+   segment)`, checked on *every* record. Includes `instrument_type`
+   beyond the brief's own illustrative list — confirmed by reading
+   `data/instruments.py:28`, `parse_kite_instruments` accesses it via
+   `row["instrument_type"]`, a real `KeyError` risk, not the tolerant
+   `.get()` used for `instrument_token`/`name`/`segment`.
+3. **Segment/exchange genuinely NFO** — checks the real `exchange` field
+   equals `"NFO"` for every record. Worth stating plainly: real Kite
+   rows never carry the literal value `"NFO"` in their `segment` field
+   (verified against the one real archived file: `segment` is always
+   `"NFO-OPT"` or `"NFO-FUT"`, `exchange` is the field always exactly
+   `"NFO"`) — the brief's own wording ("segment is genuinely 'NFO'") is
+   checked against the real field that can actually carry that literal
+   value, not a wrong field that never could.
+4. **Real, justified minimum count** — two real, non-arbitrary checks
+   rather than one hardcoded guess:
+   - **Absolute floor**: at least 1 real `(name=="NIFTY",
+     segment=="NFO-OPT")` record. Not a round number — it's the
+     archive's own stated purpose (this module's own docstring): zero
+     real NIFTY options makes the archive worthless regardless of total
+     row count.
+   - **Relative floor, once more than one prior validated archive
+     exists**: real NIFTY-option count must be ≥50% of the rolling
+     average of the last `ROLLING_AVERAGE_WINDOW=5` validated archives'
+     real counts — a standard trailing-average drop-detection
+     heuristic, not a fresh guess. Requires **≥2** prior real data
+     points before applying (a single prior count isn't a real average
+     yet) — a real, deliberate reading of the brief's own "once more
+     than one exists."
+5. **Real NSE trading day** — reuses `data/calendar.py::NseCalendar`
+   unmodified, per the brief's own instruction ("already proven correct
+   elsewhere").
+
+Real, honest evidence this actually works against real data — not just
+synthetic fixtures — run directly against this project's one real
+archived file:
+
+```
+$ python -c "
+from datetime import date
+from data.calendar import NseCalendar
+from data.instrument_archive import ARCHIVE_DIR, validate_archive
+real_path = ARCHIVE_DIR / 'nfo_instruments_2026-09-05.json'
+result = validate_archive(real_path, date(2026, 9, 5), NseCalendar(), recent_validated_counts=[])
+print('valid:', result.valid)
+print('reason:', result.reason)
+print('nifty_option_count:', result.nifty_option_count)
+print('total_record_count:', result.total_record_count)
+"
+valid: False
+reason: archived date 2026-09-05 is not a real NSE trading day
+nifty_option_count: 1580
+total_record_count: 33439
+```
+
+This real file passes every other check (real JSON, all required fields
+present on all 33,439 records, exchange genuinely `"NFO"` throughout,
+1,580 real NIFTY options, well above the absolute floor) and correctly
+fails only the trading-day check — because, as Brief 16 already
+surfaced, that file is genuinely dated a real Saturday. This is the
+validator working correctly against real, pre-existing evidence, not a
+new bug.
+
+### Part B — the distinct written-but-invalid outcome
+
+`run_daily_archive` now calls `validate_archive` immediately after a
+successful write, before Brief 17's success notification would fire.
+On failure: `_archive_validation_failure_message(day, reason)` →
+`"archive for <date> written but failed validation: <specific reason>"`
+— sent via the same `notify_archive_status` Discord "system" channel
+path, `severity="WARNING"`, never the generic Brief 17 failure message
+(which covers "no session"/"API error" — a *pre-write* failure; this is
+a distinct *post-write* one). `run_daily_archive` returns `None` for
+this outcome (a written-but-untrustworthy archive is treated the same
+as "nothing trustworthy was produced"), but — per the brief's explicit
+instruction — the real file itself is never deleted or touched again;
+it stays on disk exactly as written, for inspection. `main.py`'s
+`instruments` command message was updated to stop claiming "no valid
+session" as the only explanation, since a real validation failure is
+now an equally real possibility for the same `None` return.
+
+### Part C — immutability once validated
+
+New `data/private/instrument_archives/validated_manifest.json` (real,
+gitignored like the archives themselves) — an append-only real record
+of `{date, nifty_option_count, validated_at}` for every archive that has
+ever passed Part A. `run_daily_archive` checks
+`is_date_validated(archive_dir, today)` **before** ever touching Kite or
+the filesystem for today's write; if true, it returns the existing real
+path immediately, without a second Kite call. This was **not** already
+true before this brief — `archive_nfo_instruments` is explicitly,
+deliberately idempotent-by-overwrite (Brief 13, unchanged), so a second
+same-day run previously always clobbered the first. The new gate sits
+one layer up, in `run_daily_archive`, leaving `archive_nfo_instruments`
+itself untouched (still directly tested overwriting on its own, for
+callers that genuinely want that).
+
+### Tests
+
+```
+$ python -m pytest tests/test_instrument_archive.py -v
+test_archive_writes_the_real_raw_response_to_a_timestamped_file PASSED
+test_archive_is_idempotent_for_the_same_real_day PASSED
+test_run_daily_archive_fails_closed_with_no_credentials_configured PASSED
+test_run_daily_archive_fails_closed_on_a_real_expired_token_error PASSED
+test_run_daily_archive_succeeds_with_a_real_looking_session PASSED
+test_find_missing_previous_archive_detects_a_real_gap PASSED
+test_find_missing_previous_archive_stays_silent_for_unbroken_history PASSED
+test_find_missing_previous_archive_skips_real_weekends PASSED
+test_find_missing_previous_archive_is_silent_on_the_real_first_ever_day PASSED
+test_check_and_notify_missing_archive_fires_a_real_notification_on_a_real_gap PASSED
+test_check_and_notify_missing_archive_stays_silent_with_no_false_alarms PASSED
+test_check_and_notify_missing_archive_never_raises_if_notification_transport_fails PASSED
+test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_credentials PASSED
+test_run_daily_archive_sends_a_real_success_status_notification PASSED
+test_run_daily_archive_sends_a_real_failure_status_notification_with_the_real_reason PASSED
+test_run_daily_archive_sends_a_real_failure_status_notification_with_no_credentials PASSED
+test_validate_archive_accepts_a_real_valid_archive PASSED
+test_validate_archive_catches_invalid_json_specifically PASSED
+test_validate_archive_catches_a_missing_required_field_specifically PASSED
+test_validate_archive_catches_a_segment_exchange_mismatch_specifically PASSED
+test_validate_archive_catches_zero_real_nifty_options PASSED
+test_validate_archive_catches_a_real_sudden_drop_against_the_rolling_average PASSED
+test_validate_archive_skips_the_rolling_average_check_with_only_one_prior_archive PASSED
+test_validate_archive_catches_a_non_trading_day_specifically PASSED
+test_validate_archive_against_the_real_existing_archived_file PASSED
+test_run_daily_archive_sends_the_normal_success_notification_for_a_real_valid_archive PASSED
+test_run_daily_archive_sends_a_distinct_validation_failure_notification PASSED
+test_run_daily_archive_never_silently_overwrites_an_already_validated_date PASSED
+28 passed in 0.71s
+```
+
+Directly answering the brief's required tests: `test_validate_archive_
+catches_a_missing_required_field_specifically`, `..._a_segment_exchange_
+mismatch_specifically`, and `..._invalid_json_specifically` each inject
+exactly one real defect and assert the *specific* reason text (e.g.
+`"BSE"` for the exchange mismatch, `"lot_size"` for the missing field)
+— never a generic "invalid" message. `test_run_daily_archive_sends_the_
+normal_success_notification_for_a_real_valid_archive` proves the good
+case is unaffected (Brief 17's existing success notification still
+fires). `test_run_daily_archive_never_silently_overwrites_an_already_
+validated_date` runs `run_daily_archive` twice for the same real date
+with a fake Kite session that would return a *different* (smaller,
+still individually valid) payload on the second call, and asserts the
+file on disk still matches the *first* call's content and Kite's
+`instruments()` was never invoked a second time (`call_count["n"] ==
+1`) — direct, real proof of immutability, not an inference.
+
+Existing tests whose fixtures previously used placeholder rows like
+`[{"tradingsymbol": "A"}]` were updated to real, complete NIFTY-option-
+shaped records (`_valid_nifty_option_rows`) — those tests were exercising
+"a successful archive," and a successful archive must now also be a
+*valid* one; the fixtures were the honest thing to change, not the new
+checks.
+
+```
+$ pytest -q
+345 passed in 81.72s
+$ ruff check .
+All checks passed!
+```
+
+**Plainly, per the standing instruction**: this closes the "trustworthy
+archive" gap only. The real option-price data archive (LTP/bid/ask/
+volume/OI per contract) remains entirely unbuilt and is explicitly the
+next, separate, larger piece — not started here.

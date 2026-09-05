@@ -17,14 +17,49 @@ import json
 from datetime import date, datetime
 from typing import ClassVar
 
+import pytest
+
 from config import Settings
 from data.calendar import NseCalendar
 from data.instrument_archive import (
+    ARCHIVE_DIR,
     archive_nfo_instruments,
     check_and_notify_missing_archive,
     find_missing_previous_archive,
+    is_date_validated,
     run_daily_archive,
+    validate_archive,
 )
+
+
+def _valid_nifty_option_row(strike: float, expiry: str, option_type: str, token: int) -> dict:
+    """A real-shaped NIFTY option record -- every field
+    data/instruments.py::parse_kite_instruments needs, matching the real
+    schema confirmed against this project's own real archived file
+    (data/private/instrument_archives/nfo_instruments_2026-09-05.json)."""
+    return {
+        "instrument_token": token,
+        "tradingsymbol": f"NIFTY26SEP{int(strike)}{option_type}",
+        "name": "NIFTY",
+        "expiry": expiry,
+        "strike": strike,
+        "lot_size": 65,
+        "instrument_type": option_type,
+        "segment": "NFO-OPT",
+        "exchange": "NFO",
+    }
+
+
+def _valid_nifty_option_rows(n: int, expiry: str = "2026-09-24") -> list[dict]:
+    return [
+        _valid_nifty_option_row(24000.0 + i * 50, expiry, "CE" if i % 2 == 0 else "PE", token=90000000 + i)
+        for i in range(n)
+    ]
+
+
+def _write_json(path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 class _FakeKite:
@@ -101,6 +136,7 @@ def test_run_daily_archive_fails_closed_on_a_real_expired_token_error(tmp_path, 
 def test_run_daily_archive_succeeds_with_a_real_looking_session(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    rows = _valid_nifty_option_rows(5)
 
     class _FakeKiteConnectModule:
         class KiteConnect:
@@ -111,18 +147,25 @@ def test_run_daily_archive_succeeds_with_a_real_looking_session(tmp_path, monkey
                 pass
 
             def instruments(self, segment):
-                return [{"tradingsymbol": "NIFTY26SEPFUT"}]
+                return rows
 
     import sys
 
     monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 9, 0, tzinfo=tz)  # a real Tuesday, deterministic
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
 
     result = run_daily_archive(settings)
 
     assert result is not None
     assert result.exists()
     saved = json.loads(result.read_text(encoding="utf-8"))
-    assert saved == [{"tradingsymbol": "NIFTY26SEPFUT"}]
+    assert saved == rows
 
 
 # --- Real, same-day missing-archive safeguard -------------------------
@@ -311,6 +354,7 @@ def test_run_daily_archive_sends_a_real_success_status_notification(tmp_path, mo
     _RecordingDiscord.instances = []
     monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
     settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    rows = _valid_nifty_option_rows(3)
 
     class _FakeKiteConnectModule:
         class KiteConnect:
@@ -321,7 +365,7 @@ def test_run_daily_archive_sends_a_real_success_status_notification(tmp_path, mo
                 pass
 
             def instruments(self, segment):
-                return [{"tradingsymbol": "A"}, {"tradingsymbol": "B"}, {"tradingsymbol": "C"}]
+                return rows
 
     import sys
 
@@ -400,3 +444,257 @@ def test_run_daily_archive_sends_a_real_failure_status_notification_with_no_cred
     assert message == (
         "Instrument archive failed: no_kite_credentials_configured -- check the scheduled task"
     )
+
+
+# --- Brief 18: real archive content validation -------------------------
+
+
+def test_validate_archive_accepts_a_real_valid_archive(tmp_path):
+    day = date(2026, 9, 8)  # a real Tuesday
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    _write_json(path, _valid_nifty_option_rows(10))
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert result.valid
+    assert result.reason == ""
+    assert result.nifty_option_count == 10
+    assert result.total_record_count == 10
+
+
+def test_validate_archive_catches_invalid_json_specifically(tmp_path):
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    path.write_text("{not valid json", encoding="utf-8")
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "invalid JSON" in result.reason
+
+
+def test_validate_archive_catches_a_missing_required_field_specifically(tmp_path):
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    rows = _valid_nifty_option_rows(3)
+    del rows[1]["lot_size"]  # a real, injected schema gap
+    _write_json(path, rows)
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "missing required field" in result.reason
+    assert "lot_size" in result.reason
+
+
+def test_validate_archive_catches_a_segment_exchange_mismatch_specifically(tmp_path):
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    rows = _valid_nifty_option_rows(3)
+    rows[0]["exchange"] = "BSE"  # a real, injected mixed-exchange record
+    _write_json(path, rows)
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "segment mismatch" in result.reason
+    assert "BSE" in result.reason
+
+
+def test_validate_archive_catches_zero_real_nifty_options(tmp_path):
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    row = _valid_nifty_option_row(24000.0, "2026-09-24", "CE", 1)
+    row["name"] = "BANKNIFTY"  # a real-shaped archive with zero NIFTY options
+    _write_json(path, [row])
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "zero real NIFTY option records" in result.reason
+
+
+def test_validate_archive_catches_a_real_sudden_drop_against_the_rolling_average(tmp_path):
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    _write_json(path, _valid_nifty_option_rows(10))  # a real, sudden drop vs. real recent history
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[1500, 1600, 1550])
+
+    assert not result.valid
+    assert "below 50% of the rolling average" in result.reason
+
+
+def test_validate_archive_skips_the_rolling_average_check_with_only_one_prior_archive(tmp_path):
+    """Part A #4: "once more than one exists" -- a single prior real
+    data point is not a real rolling average yet, so it must not by
+    itself fail an otherwise-real, valid archive."""
+    day = date(2026, 9, 8)
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    _write_json(path, _valid_nifty_option_rows(10))
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[1500])
+
+    assert result.valid
+
+
+def test_validate_archive_catches_a_non_trading_day_specifically(tmp_path):
+    day = date(2026, 9, 6)  # a real Sunday
+    path = tmp_path / f"nfo_instruments_{day.isoformat()}.json"
+    _write_json(path, _valid_nifty_option_rows(10))
+
+    result = validate_archive(path, day, NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "not a real NSE trading day" in result.reason
+
+
+def test_validate_archive_against_the_real_existing_archived_file():
+    """Real, live evidence, not a synthetic fixture: the one real archived
+    file this project has ever produced predates this brief's validation
+    and is dated a real Saturday -- confirms the trading-day check
+    correctly flags it against actual real data."""
+    real_path = ARCHIVE_DIR / "nfo_instruments_2026-09-05.json"
+    if not real_path.exists():
+        pytest.skip("no real archived file present in this environment")
+
+    result = validate_archive(real_path, date(2026, 9, 5), NseCalendar(), recent_validated_counts=[])
+
+    assert not result.valid
+    assert "not a real NSE trading day" in result.reason
+
+
+def test_run_daily_archive_sends_the_normal_success_notification_for_a_real_valid_archive(tmp_path, monkeypatch):
+    """Acceptance: a real, valid archive still gets Brief 17's existing
+    success notification -- unaffected by this brief's new validation."""
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    rows = _valid_nifty_option_rows(20)
+
+    class _FakeKiteConnectModule:
+        class KiteConnect:
+            def __init__(self, api_key):
+                pass
+
+            def set_access_token(self, token):
+                pass
+
+            def instruments(self, segment):
+                return rows
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
+
+    result = run_daily_archive(settings)
+
+    assert result is not None
+    severity, message, category = _RecordingDiscord.instances[-1].calls[0]
+    assert severity == "INFO"
+    assert category == "system"
+    assert "20 real instruments archived" in message
+    archive_dir = tmp_path / "data" / "private" / "instrument_archives"
+    assert is_date_validated(archive_dir, date(2026, 9, 8))
+
+
+def test_run_daily_archive_sends_a_distinct_validation_failure_notification(tmp_path, monkeypatch):
+    """Part B: a written-but-invalid file must send a distinct message
+    naming the specific check that failed -- not the generic Brief 17
+    failure message -- and the real file must not be deleted or
+    silently replaced."""
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    rows = _valid_nifty_option_rows(3)
+    rows[0]["exchange"] = "BSE"  # a real, injected segment mismatch
+
+    class _FakeKiteConnectModule:
+        class KiteConnect:
+            def __init__(self, api_key):
+                pass
+
+            def set_access_token(self, token):
+                pass
+
+            def instruments(self, segment):
+                return rows
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
+
+    result = run_daily_archive(settings)
+
+    assert result is None  # a written-but-invalid archive is not a trustworthy result
+    archive_dir = tmp_path / "data" / "private" / "instrument_archives"
+    written_path = archive_dir / "nfo_instruments_2026-09-08.json"
+    assert written_path.exists()  # Part B: the real file is kept, never deleted
+    saved = json.loads(written_path.read_text(encoding="utf-8"))
+    assert saved == rows  # untouched -- kept exactly as written, for real inspection
+    assert not is_date_validated(archive_dir, date(2026, 9, 8))
+    severity, message, category = _RecordingDiscord.instances[-1].calls[0]
+    assert severity == "WARNING"
+    assert category == "system"
+    assert message.startswith("archive for 2026-09-08 written but failed validation: segment mismatch")
+
+
+def test_run_daily_archive_never_silently_overwrites_an_already_validated_date(tmp_path, monkeypatch):
+    """Part C: once a real archive for a date has passed validation, a
+    second real write attempt for the same date must not touch it, even
+    if the second attempt's real session would have returned different
+    content."""
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    first_rows = _valid_nifty_option_rows(20)
+    second_rows = _valid_nifty_option_rows(5)  # a real, different (smaller) payload if it were ever written
+    call_count = {"n": 0}
+
+    class _FakeKiteConnectModule:
+        class KiteConnect:
+            def __init__(self, api_key):
+                pass
+
+            def set_access_token(self, token):
+                pass
+
+            def instruments(self, segment):
+                call_count["n"] += 1
+                return first_rows if call_count["n"] == 1 else second_rows
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
+
+    first_result = run_daily_archive(settings)
+    second_result = run_daily_archive(settings)  # a real second attempt, same real date
+
+    assert first_result is not None
+    assert second_result == first_result
+    archive_dir = tmp_path / "data" / "private" / "instrument_archives"
+    saved = json.loads((archive_dir / "nfo_instruments_2026-09-08.json").read_text(encoding="utf-8"))
+    assert saved == first_rows  # untouched by the second attempt
+    assert call_count["n"] == 1  # Kite was never called a second time for an already-validated date
