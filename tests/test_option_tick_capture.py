@@ -18,8 +18,10 @@ from config import Settings
 from data.option_tick_capture import (
     CAPTURED,
     DATA_UNAVAILABLE,
+    RECONNECT_FAILED,
     ContractUniverse,
     build_universe,
+    read_capture_gaps,
     run_capture_session,
     should_recenter,
 )
@@ -382,3 +384,276 @@ def test_a_second_real_capture_run_never_touches_the_first_runs_already_written_
     real_prefix = content_after_second_run[: len(content_after_first_run)]
     assert real_prefix == content_after_first_run  # byte-for-byte, at the same real offsets
     assert hashlib.sha256(real_prefix).hexdigest() == hash_after_first_run  # the real, permanent hash check
+
+
+# --- Phase 4A-2: reconnection, resilience, gap detection ---------------
+
+
+class _ResilientFakeTicker:
+    """Replays a real, scripted sequence of KiteTicker callback firings
+    synchronously within connect() -- no real thread/sleep needed. Each
+    script step is one of ("connect",), ("ticks", [tick, ...]),
+    ("close", code, reason), ("error", code, reason),
+    ("reconnect", attempt), or ("noreconnect",) -- the same real shapes
+    KiteTicker itself calls its callbacks with. `after_step(i)`, if
+    given, fires after step `i` -- used to snapshot real file state at a
+    specific real moment in the sequence (e.g. right before a simulated
+    disconnect), extending Brief 20's hash-comparison pattern to this
+    scenario."""
+
+    MODE_FULL = "full"
+
+    def __init__(self, script, after_step=None) -> None:
+        self.script = script
+        self.after_step = after_step or (lambda i: None)
+        self.on_connect = None
+        self.on_ticks = None
+        self.on_close = None
+        self.on_error = None
+        self.on_reconnect = None
+        self.on_noreconnect = None
+        self.subscribed: list[int] = []
+        self.mode_calls: list[tuple] = []
+        self.closed = False
+
+    def subscribe(self, tokens) -> None:
+        self.subscribed = list(tokens)
+
+    def set_mode(self, mode, tokens) -> None:
+        self.mode_calls.append((mode, list(tokens)))
+
+    def connect(self, threaded: bool = True) -> None:
+        for i, step in enumerate(self.script):
+            kind = step[0]
+            if kind == "connect" and self.on_connect:
+                self.on_connect(self, {})
+            elif kind == "ticks" and self.on_ticks:
+                self.on_ticks(self, step[1])
+            elif kind == "close" and self.on_close:
+                self.on_close(self, step[1], step[2])
+            elif kind == "error" and self.on_error:
+                self.on_error(self, step[1], step[2])
+            elif kind == "reconnect" and self.on_reconnect:
+                self.on_reconnect(self, step[1])
+            elif kind == "noreconnect" and self.on_noreconnect:
+                self.on_noreconnect(self)
+            self.after_step(i)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_disconnect_mid_session_starts_a_new_segment_leaving_the_first_byte_for_byte_unchanged(tmp_path):
+    """The real test that matters most for this brief: extends Brief
+    20's own hash-comparison pattern to a real reconnect specifically.
+    Segment 1's real bytes, snapshotted the instant before the real
+    disconnect, must be byte-for-byte identical to its final content
+    after the whole session (including the reconnect) completes."""
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    tick_before = _real_shaped_option_tick()
+    tick_before["exchange_timestamp"] = "2026-09-07 09:20:00"
+    tick_after = _real_shaped_option_tick()
+    tick_after["exchange_timestamp"] = "2026-09-07 09:20:47"
+    tick_after["last_price"] = 130.0
+
+    snapshot: dict = {}
+
+    def after_step(i):
+        if i == 1:  # right after tick_before is written, before the disconnect
+            path = tmp_path / "nifty_option_ticks_2026-09-07.jsonl"
+            snapshot["bytes"] = path.read_bytes()
+            snapshot["hash"] = hashlib.sha256(snapshot["bytes"]).hexdigest()
+
+    fake = _ResilientFakeTicker(
+        [
+            ("connect",),
+            ("ticks", [tick_before]),
+            ("close", 1006, "connection was closed uncleanly (going away)"),
+            ("connect",),  # a real, successful reconnect
+            ("ticks", [tick_after]),
+        ],
+        after_step=after_step,
+    )
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=0, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert result.status == CAPTURED
+    assert len(result.segments) == 2
+    seg1, seg2 = result.segments
+    assert seg1.name == "nifty_option_ticks_2026-09-07.jsonl"
+    assert seg2.name == "nifty_option_ticks_2026-09-07_seg2.jsonl"
+
+    final_seg1_bytes = seg1.read_bytes()
+    assert final_seg1_bytes == snapshot["bytes"]  # byte-for-byte unchanged by the reconnect
+    assert hashlib.sha256(final_seg1_bytes).hexdigest() == snapshot["hash"]
+
+    seg2_lines = seg2.read_text(encoding="utf-8").strip().splitlines()
+    assert len(seg2_lines) == 1
+    assert json.loads(seg2_lines[0])["tick"] == tick_after  # the real post-reconnect tick, in the NEW segment
+
+
+def test_real_gap_record_captures_the_real_before_after_timestamps_and_duration(tmp_path):
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    tick_before = _real_shaped_option_tick()
+    tick_before["exchange_timestamp"] = "2026-09-07 09:20:00"
+    tick_after = _real_shaped_option_tick()
+    tick_after["exchange_timestamp"] = "2026-09-07 09:20:47"
+
+    fake = _ResilientFakeTicker(
+        [
+            ("connect",),
+            ("ticks", [tick_before]),
+            ("close", 1006, "connection was closed uncleanly (going away)"),
+            ("connect",),
+            ("ticks", [tick_after]),
+        ]
+    )
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=0, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert len(result.gaps) == 1
+    gap = result.gaps[0]
+    assert gap.gap_start == "2026-09-07T09:20:00+05:30"
+    assert gap.gap_end == "2026-09-07T09:20:47+05:30"
+    assert gap.duration_seconds == 47.0
+    assert gap.segment_before == "nifty_option_ticks_2026-09-07.jsonl"
+    assert gap.segment_after == "nifty_option_ticks_2026-09-07_seg2.jsonl"
+
+    # The real, queryable record -- not just implied by file boundaries.
+    stored_gaps = read_capture_gaps(tmp_path, date(2026, 9, 7))
+    assert len(stored_gaps) == 1
+    assert stored_gaps[0]["duration_seconds"] == 47.0
+
+
+def test_reconnection_gives_up_after_bounded_retries_and_sends_a_real_alert(tmp_path, monkeypatch):
+    """Reconnection must genuinely give up -- not loop forever -- and a
+    real Discord/Telegram alert must fire on final failure. A huge
+    duration_seconds proves this doesn't just happen to finish within
+    the test's own patience: the give-up signal short-circuits the wait
+    immediately, real evidence "do not silently hang" holds."""
+    _RecordingDiscord.instances = []
+    _RecordingTelegram.instances = []
+    monkeypatch.setattr("data.option_tick_capture.DiscordNotifier", _RecordingDiscord)
+    monkeypatch.setattr("data.option_tick_capture.TelegramNotifier", _RecordingTelegram)
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+
+    fake = _ResilientFakeTicker(
+        [
+            ("connect",),
+            ("ticks", [_real_shaped_option_tick()]),
+            ("close", 1006, "connection was closed uncleanly (going away)"),
+            ("error", 1006, "connection was closed uncleanly (going away)"),
+            ("reconnect", 1),
+            ("error", 1006, "connection was closed uncleanly (going away)"),
+            ("reconnect", 2),
+            ("noreconnect",),
+        ]
+    )
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=999, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert result.status == RECONNECT_FAILED
+    assert result.auth_failure_suspected is False
+    assert len(_RecordingDiscord.instances) == 1
+    severity, message, category = _RecordingDiscord.instances[0].calls[0]
+    assert severity == "WARNING"
+    assert category == "system"
+    assert "reconnection failed" in message.lower()
+    assert len(_RecordingTelegram.instances) == 1
+
+
+def test_mid_session_auth_expiry_is_handled_via_the_same_fail_closed_path_distinct_alert(tmp_path, monkeypatch):
+    """Part C: a real mid-session auth expiry -- using the exact real
+    close-event signature confirmed live against a real, intentionally
+    invalid access token (code 1006, "403 - Forbidden") -- is handled by
+    the same fail-closed give-up path as a plain disconnect, but with a
+    distinct, evidence-based CRITICAL alert."""
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.option_tick_capture.DiscordNotifier", _RecordingDiscord)
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    real_auth_failure_reason = (
+        "connection was closed uncleanly (WebSocket connection upgrade failed (403 - Forbidden))"
+    )
+
+    fake = _ResilientFakeTicker(
+        [
+            ("connect",),
+            ("ticks", [_real_shaped_option_tick()]),
+            ("error", 1006, real_auth_failure_reason),
+            ("close", 1006, real_auth_failure_reason),
+            ("reconnect", 1),
+            ("error", 1006, real_auth_failure_reason),
+            ("close", 1006, real_auth_failure_reason),
+            ("noreconnect",),
+        ]
+    )
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=5, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert result.status == RECONNECT_FAILED
+    assert result.auth_failure_suspected is True
+    severity, message, category = _RecordingDiscord.instances[0].calls[0]
+    assert severity == "CRITICAL"
+    assert category == "system"
+    assert "auth" in message.lower()
+
+
+def test_out_of_order_tick_is_recorded_and_flagged_never_reordered_or_dropped(tmp_path):
+    """Part B #3: a real out-of-order tick (later real arrival, earlier
+    real exchange_timestamp) is recorded exactly as delivered and
+    flagged -- never silently reordered, never dropped."""
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    tick1 = _real_shaped_option_tick()
+    tick1["exchange_timestamp"] = "2026-09-07 09:20:10"
+    tick2 = _real_shaped_option_tick()
+    tick2["exchange_timestamp"] = "2026-09-07 09:20:05"  # earlier than tick1, arriving after it
+
+    fake = _ResilientFakeTicker([("connect",), ("ticks", [tick1, tick2])])
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=0, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert result.out_of_order_count == 1
+    lines = result.path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2  # never dropped
+    first_record = json.loads(lines[0])
+    second_record = json.loads(lines[1])
+    assert first_record["tick"] == tick1
+    assert "out_of_order" not in first_record
+    assert second_record["tick"] == tick2  # never reordered -- stored in the real order received
+    assert second_record.get("out_of_order") is True
+
+
+def test_a_normal_session_with_no_disconnect_still_produces_exactly_one_segment(tmp_path):
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    fake = _ResilientFakeTicker([("connect",), ("ticks", [_real_shaped_option_tick()])])
+
+    result = run_capture_session(
+        settings, universe, duration_seconds=0, capture_dir=tmp_path, today=date(2026, 9, 7),
+        kite_ticker_factory=lambda: fake,
+    )
+
+    assert result.status == CAPTURED
+    assert len(result.segments) == 1
+    assert result.gaps == ()
+    assert result.out_of_order_count == 0

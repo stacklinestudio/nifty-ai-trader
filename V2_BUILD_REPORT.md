@@ -5757,3 +5757,198 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 22 (Phase 4A-2): reconnection, resilience, gap detection (2026-09-06)
+
+Note on numbering: the request that prompted this section was itself
+titled "Brief 21," colliding again with the previous section's number.
+Numbered 22 here for the same reason as last time — flagged, not
+silently resolved.
+
+Makes live capture dependable across a real disconnect. Reuses existing,
+proven patterns throughout, per the brief's own instruction — and one
+real, load-bearing discovery changed the design for the better before
+any code was written: **`KiteTicker` already has its own real, built-in
+auto-reconnect**, confirmed by reading the installed library's source
+(`kiteconnect/ticker.py`) before writing anything: `reconnect=True` by
+default, real exponential backoff (documented starting near 2s, capped
+at a configurable `reconnect_max_delay`, library default 60s), up to a
+configurable `reconnect_max_tries` (library default 50). This is a
+stronger, more real "existing proven pattern" than anything this
+codebase would have hand-rolled — Phase 4A-2 configures and observes it
+rather than replacing it.
+
+### Part A — disconnect detection and reconnect
+
+1. **`WebsocketHealth` (`data/websocket.py`), confirmed present but
+   unwired in Brief 19's own report, is now wired in** — `data/option_
+   tick_capture.py::_CaptureState` calls its real `on_connect()`/`on_
+   disconnect()`/`on_tick()` methods, unmodified, to track real
+   connection state and the real last-tick timestamp.
+2. **Real, live empirical test against a real, intentionally invalid
+   access token** (not assumed from documentation):
+
+```
+$ python -c "... KiteTicker(s.kite_api_key, 'definitely-invalid-expired-token-12345') ..."
+on_error: 1006 | connection was closed uncleanly (WebSocket connection upgrade failed (403 - Forbidden))
+on_close: 1006 | connection was closed uncleanly (WebSocket connection upgrade failed (403 - Forbidden))
+on_reconnect: 1
+...
+on_reconnect: 2
+```
+
+   Real, load-bearing findings from this one test: (a) a real auth
+   rejection surfaces as WebSocket close code **1006** with a reason
+   containing **"403 - Forbidden"** — a real, reproducible signature,
+   not a documented Kite API error code; (b) the library's own
+   auto-reconnect **cannot tell an unrecoverable auth failure from a
+   transient network blip** — it retried regardless. Left at the
+   library's own default `reconnect_max_tries=50`, a real auth failure
+   would retry for up to ~50 attempts (each up to 60s) before giving up
+   — potentially tens of minutes. **This module therefore overrides only
+   `reconnect_max_tries`, down to `settings.max_consecutive_tick_
+   failures`** (an existing real config value, default 5, already used
+   for an analogous bounded-retry purpose in `Orchestrator.run_
+   supervised`) — reusing an existing config knob rather than adding a
+   new one, and reusing the library's own real backoff shape/max-delay
+   entirely unmodified.
+3. **Fail-closed on exhausted reconnection**: `on_noreconnect` (the
+   library's own real callback for "gave up") triggers `_notify_
+   capture_failure` — a real Discord "system" channel + Telegram alert,
+   reusing the exact same wiring as every other notification in this
+   project — and the session ends immediately via a `threading.Event`
+   (`state.give_up`) that short-circuits the session's own wait, rather
+   than waiting out the full configured `duration_seconds`. The give-up
+   message inspects the real, last-seen close/error reason for the real
+   "403" signature confirmed above and reports "likely an auth/session
+   issue" when it matches — a real, evidence-based diagnostic, never
+   changing the actual reconnect/give-up mechanics either way.
+
+### Part B — new segment on reconnect, gap recording
+
+1. **A real, distinct new segment file per reconnect** — `_CaptureState.
+   start_new_segment()` closes the current file handle and opens
+   `nifty_option_ticks_<date>_seg{N}.jsonl` for `N` ≥ 2 (the first
+   segment keeps the original, unchanged filename from Brief 19/20).
+   **Never appends into or reopens a prior segment for writing.**
+2. **A real, explicit, queryable gap record** — `GapRecord(gap_start,
+   gap_end, duration_seconds, segment_before, segment_after)`, written
+   to `capture_gaps_<date>.json` (same append-only-manifest pattern as
+   Brief 18's `validated_manifest.json`) via `read_capture_gaps(capture_
+   dir, day)`. `gap_start` is the real last tick's timestamp before
+   disconnect (from `WebsocketHealth.last_tick_at`); `gap_end` is the
+   real first tick's timestamp after reconnect — finalized only once
+   that real tick actually arrives, not at the moment the reconnect
+   handshake completes (a real distinction: the connection can come back
+   before any real market data does).
+3. **Out-of-order tick investigation, done rather than assumed**:
+   real transport-layer reordering within a single WebSocket/TCP
+   connection is not structurally possible (TCP guarantees in-order
+   delivery of the byte stream the library parses sequentially) — but
+   real Kite `exchange_timestamp` values carry no sub-second precision
+   (confirmed in Brief 19's field discovery: `"2026-09-04 15:39:59"`),
+   so multiple real ticks for the same instrument legitimately **tie**
+   within the same second; that is expected, not an anomaly. A genuine
+   **decrease** would be a real anomaly and has not been observed live
+   (impossible to force with the market closed) — handled defensively
+   regardless: `_CaptureState.write_tick` tracks the last real timestamp
+   per `instrument_token` and, on a real decrease, sets `"out_of_order":
+   true` at the envelope level (alongside the pre-existing `received_
+   at`) — **the raw `tick` value itself is never modified, reordered, or
+   dropped**, satisfying Brief 20's immutability rule exactly.
+
+### Part C — auth expiry mid-session
+
+Handled via the **identical** fail-closed path as Part A's exhausted
+reconnection (same `on_noreconnect` → `_notify_capture_failure` route) —
+per the real Part A finding, the library cannot structurally distinguish
+the two, so this module doesn't pretend to either; it only makes the
+resulting alert honest about which one the evidence points to.
+
+### Tests
+
+```
+$ python -m pytest tests/test_option_tick_capture.py -v
+test_build_universe_selects_a_real_bounded_atm_centered_window PASSED
+test_build_universe_never_subscribes_to_the_full_real_chain PASSED
+test_build_universe_bounds_cleanly_at_the_real_chain_edge PASSED
+test_build_universe_only_includes_the_given_real_expiry PASSED
+test_should_recenter_true_only_past_the_real_threshold PASSED
+test_should_recenter_detects_drift_even_past_the_tracked_windows_edge PASSED
+test_run_capture_session_reports_data_unavailable_with_no_credentials PASSED
+test_run_capture_session_never_writes_a_file_when_credentials_are_missing PASSED
+test_run_capture_session_subscribes_the_real_universe_in_full_mode PASSED
+test_run_capture_session_stores_the_real_raw_tick_without_fabricating_missing_fields PASSED
+test_run_capture_session_stops_cleanly_if_no_real_ticks_ever_arrive PASSED
+test_a_second_real_capture_run_never_touches_the_first_runs_already_written_bytes PASSED
+test_disconnect_mid_session_starts_a_new_segment_leaving_the_first_byte_for_byte_unchanged PASSED
+test_real_gap_record_captures_the_real_before_after_timestamps_and_duration PASSED
+test_reconnection_gives_up_after_bounded_retries_and_sends_a_real_alert PASSED
+test_mid_session_auth_expiry_is_handled_via_the_same_fail_closed_path_distinct_alert PASSED
+test_out_of_order_tick_is_recorded_and_flagged_never_reordered_or_dropped PASSED
+test_a_normal_session_with_no_disconnect_still_produces_exactly_one_segment PASSED
+18 passed in 0.44s
+```
+
+`test_disconnect_mid_session_starts_a_new_segment_leaving_the_first_
+byte_for_byte_unchanged` is the real test that matters most, per the
+brief's own instruction — it extends Brief 20's exact hash-comparison
+pattern to a reconnect specifically: segment 1's real bytes are
+snapshotted (and hashed) the instant before a simulated disconnect,
+then, after the full session (including a simulated successful
+reconnect and a second real tick) completes, its bytes are re-read and
+compared byte-for-byte and by hash against that snapshot. `test_
+reconnection_gives_up_after_bounded_retries_and_sends_a_real_alert` uses
+`duration_seconds=999` deliberately — the real give-up signal
+short-circuits the wait immediately, proving "do not silently hang or
+retry forever" directly rather than by inference. `test_mid_session_
+auth_expiry_is_handled_via_the_same_fail_closed_path_distinct_alert`
+replays the exact real close-code/reason text captured live above, not
+a fabricated string.
+
+Real, live end-to-end smoke test against today's actual Kite session
+(closed market, so no real disconnect occurred — this confirms the
+resilience-enabled code path doesn't regress the normal case, not that
+a real reconnect was observed live):
+
+```
+$ python -c "... run_capture_session(s, universe, duration_seconds=10, ...) ..."
+status: CAPTURED
+segments: ['nifty_option_ticks_2026-09-06.jsonl']
+tick_count: 43
+gaps: ()
+out_of_order_count: 0
+```
+
+```
+$ pytest -q
+381 passed in 89.79s
+$ ruff check .
+All checks passed!
+```
+
+### Ready for Monday's real session?
+
+**Watch the first real live exposure closely — same discipline as the
+original live trading scheduler's own first run.** Specifically:
+
+- The disconnect → reconnect → new-segment → gap-record path is
+  thoroughly tested against a **realistic, evidence-grounded simulation**
+  (the exact real close-code/reason signature captured live), but a real
+  network disconnect with a real, library-internal successful reconnect
+  has **never been observed live** — only simulated. The mechanism is
+  real and the simulation is honest, but this specific path's real-world
+  behavior is not yet empirically confirmed the way, e.g., Part A's
+  auth-failure signature is.
+- The out-of-order-tick code path has never fired against real data
+  (impossible to force with the market closed) — real confirmation
+  waits for the next real trading session, same as Brief 19's own
+  deferred live-behavior items.
+- Everything else (retry-count/backoff configuration, gap-manifest
+  read/write, segment naming, the immutability guarantee, the auth-
+  failure alert text) is real, tested, and additionally confirmed via a
+  real live smoke run today.
+
+Not a blocker to running Monday — but worth a human glance at the first
+real session's logs/notifications rather than assuming silence means
+success.

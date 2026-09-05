@@ -1,9 +1,32 @@
 """Brief 19 (Phase 4A-1): field discovery + minimal single-session raw
-tick capture. First of several sequenced pieces toward a real option-
-price archive -- deliberately does NOT build reconnect resilience, gap
-detection, or integrity validation (those are Phase 4A-2/4A-3/4A-4,
-separate, future, sequenced pieces; see V2_BUILD_REPORT.md's Brief 19
-section for what each will need to address).
+tick capture. Brief 22 (Phase 4A-2) added real reconnection, resilience,
+and gap detection (below) -- integrity validation at tick level and
+coverage reporting remain separate, future, sequenced pieces (4A-3/4A-4;
+see V2_BUILD_REPORT.md for what each will need to address).
+
+Phase 4A-2 real findings this module's resilience design depends on
+(2026-09-06, see V2_BUILD_REPORT.md for full evidence):
+
+- `KiteTicker` already has built-in auto-reconnect, enabled by default
+  (confirmed from the installed library's own source, `kiteconnect/
+  ticker.py`) -- real exponential backoff starting near 2s, capped at a
+  real, configurable `reconnect_max_delay` (library default 60s), up to
+  a real, configurable `reconnect_max_tries` (library default 50). This
+  module reuses that real, already-proven mechanism rather than writing
+  a new retry loop -- it only tightens `reconnect_max_tries` down to
+  `settings.max_consecutive_tick_failures` (an existing, real config
+  value, already used for an analogous bounded-retry purpose in
+  `Orchestrator.run_supervised`) so a genuinely unrecoverable failure
+  (e.g. an expired token) is not retried for the library's full default
+  of up to ~50 attempts before this module gives up and alerts.
+- Empirically confirmed live, using a real, intentionally invalid access
+  token: a real Kite auth failure surfaces as repeated `on_error`/
+  `on_close` calls with WebSocket close code 1006 and a reason
+  containing "403 - Forbidden" -- the library retries this exactly like
+  a network disconnect (it cannot tell the difference), so this module's
+  own give-up notification inspects the real, last-seen close reason for
+  that signature to report "likely an auth/session issue" honestly,
+  without changing the actual reconnect/give-up mechanics either way.
 
 Real, live field-discovery findings (2026-09-06, market closed;
 structure confirmed, live tick-frequency/real-time behavior NOT
@@ -64,7 +87,7 @@ first_runs_already_written_bytes` in tests/test_option_tick_capture.py.
 from __future__ import annotations
 
 import json
-import time
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -72,6 +95,7 @@ from itertools import pairwise
 from pathlib import Path
 
 from config import IST, Settings
+from data.websocket import WebsocketHealth
 from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
 from integrations.telegram import TelegramNotifier
 from monitoring.logger import configure_logger
@@ -79,6 +103,12 @@ from monitoring.logger import configure_logger
 logger = configure_logger(__name__)
 
 CAPTURE_DIR = Path("data/private/option_tick_capture")
+
+# Real close-event signature confirmed live (2026-09-06) against a real,
+# intentionally invalid access token -- Kite's own auth rejection at the
+# WebSocket-upgrade layer, not a documented API code, just what the
+# server actually sends.
+AUTH_FAILURE_SIGNATURE = "403"
 
 # The real, live NIFTY 50 index instrument_token (confirmed live via
 # kite.quote(["NSE:NIFTY 50"]) on 2026-09-06) -- stable across sessions,
@@ -105,6 +135,7 @@ RECENTER_THRESHOLD_STRIKES = STRIKES_EITHER_SIDE // 2
 
 DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
 CAPTURED = "CAPTURED"
+RECONNECT_FAILED = "RECONNECT_FAILED"
 
 
 @dataclass(frozen=True)
@@ -195,11 +226,75 @@ def should_recenter(
 
 
 @dataclass(frozen=True)
+class GapRecord:
+    """Part B #2: an honest, explicit record of a real gap -- never
+    implied only by a file boundary, and never filled/interpolated."""
+
+    gap_start: str  # real ISO timestamp of the last tick before disconnect
+    gap_end: str  # real ISO timestamp of the first tick after reconnect
+    duration_seconds: float
+    segment_before: str
+    segment_after: str
+
+
+def _gap_manifest_path(capture_dir: Path, day: date) -> Path:
+    return capture_dir / f"capture_gaps_{day.isoformat()}.json"
+
+
+def _record_gap(capture_dir: Path, day: date, gap: GapRecord) -> None:
+    path = _gap_manifest_path(capture_dir, day)
+    existing = read_capture_gaps(capture_dir, day)
+    existing.append(
+        {
+            "gap_start": gap.gap_start,
+            "gap_end": gap.gap_end,
+            "duration_seconds": gap.duration_seconds,
+            "segment_before": gap.segment_before,
+            "segment_after": gap.segment_after,
+        }
+    )
+    path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
+
+def read_capture_gaps(capture_dir: Path, day: date) -> list[dict]:
+    """The real, queryable gap record for a given real day -- never just
+    implied by which segment files happen to exist."""
+    path = _gap_manifest_path(capture_dir, day)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning("option_tick_capture_gap_manifest_corrupted path=%s", path)
+        return []
+
+
+def _parse_tick_timestamp(tick: dict) -> datetime | None:
+    """The real per-tick Kite timestamp (`exchange_timestamp`), parsed
+    for real duration math and real ordering checks. Real Kite format
+    confirmed live: "YYYY-MM-DD HH:MM:SS", no sub-second precision, IST
+    implied (never a UTC assumption -- this project never guesses a
+    broker timestamp's timezone). Returns None, never a guess, when the
+    real tick lacks this field (e.g. a malformed/unexpected record)."""
+    value = tick.get("exchange_timestamp")
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
 class CaptureSessionResult:
-    status: str  # CAPTURED or DATA_UNAVAILABLE
-    path: Path | None
-    tick_count: int
+    status: str  # CAPTURED, DATA_UNAVAILABLE, or RECONNECT_FAILED
+    path: Path | None  # the first/primary real segment, for backward compatibility
+    tick_count: int  # real ticks across every real segment this session wrote
     reason: str
+    segments: tuple[Path, ...] = ()
+    gaps: tuple[GapRecord, ...] = ()
+    auth_failure_suspected: bool = False
+    out_of_order_count: int = 0
 
 
 def _notify_capture_unavailable(settings: Settings, reason: str) -> None:
@@ -219,6 +314,154 @@ def _notify_capture_unavailable(settings: Settings, reason: str) -> None:
         logger.warning("option_tick_capture_notify_failed error=%s: %s", type(exc).__name__, exc)
 
 
+def _notify_capture_failure(settings: Settings, reason: str, auth_failure_suspected: bool) -> None:
+    """Part A #3: fail-closed notification once bounded reconnection
+    genuinely gives up -- reuses the same Discord "system" channel /
+    Telegram wiring verbatim. `auth_failure_suspected` is a real,
+    evidence-based diagnostic (the real last-seen close reason matched
+    Kite's real auth-rejection signature, AUTH_FAILURE_SIGNATURE) --
+    never changes the reconnect/give-up mechanics, only the honesty of
+    what the alert says happened."""
+    severity = "CRITICAL" if auth_failure_suspected else "WARNING"
+    prefix = (
+        "Option tick capture stopped -- likely an auth/session issue (token may need refreshing)"
+        if auth_failure_suspected
+        else "Option tick capture stopped after reconnection failed"
+    )
+    message = f"{prefix}: {reason}"
+    try:
+        discord = DiscordNotifier(
+            settings.discord_webhook_url,
+            webhooks_by_category=webhooks_by_category_from_settings(settings),
+        )
+        telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+        discord.send_message(severity, message, "system")
+        telegram.send_message(severity, message)
+    except Exception as exc:  # noqa: BLE001 - a notification failure must never break the capture session.
+        logger.warning("option_tick_capture_notify_failed error=%s: %s", type(exc).__name__, exc)
+
+
+class _CaptureState:
+    """Real, mutable, per-session state shared across the WebSocket
+    callbacks below -- kept in one place instead of a pile of
+    `nonlocal` declarations, since Phase 4A-2 needs several: the
+    current real segment file, `WebsocketHealth` (Part A #1, reused
+    unmodified), the pending real gap being assembled across a
+    disconnect/reconnect, and the real give-up signal."""
+
+    def __init__(self, capture_dir: Path, day: date, universe: ContractUniverse) -> None:
+        self.capture_dir = capture_dir
+        self.day = day
+        self.universe = universe
+        self.health = WebsocketHealth()
+        self.tick_count = 0
+        self.out_of_order_count = 0
+        self.last_timestamp_by_token: dict[int, datetime] = {}
+        self.gaps: list[GapRecord] = []
+        self.last_close_reason = ""
+        self.give_up = threading.Event()
+        self.give_up_reason = ""
+        self.auth_failure_suspected = False
+        self._awaiting_reconnect_tick = False
+        self._pending_gap_start: datetime | None = None
+        self._pending_gap_segment_before = ""
+        self.path = capture_dir / f"nifty_option_ticks_{day.isoformat()}.jsonl"
+        self.handle = self.path.open("a", encoding="utf-8")
+        self.segments: list[Path] = [self.path]
+
+    def start_new_segment(self) -> Path:
+        """Part B #1: a real, distinct new segment file on reconnect --
+        never appended into or overwritten, the pre-disconnect segment's
+        handle is closed (not touched again) and a brand new file is
+        opened for the next real segment number."""
+        self.handle.close()
+        segment_number = len(self.segments) + 1
+        new_path = self.capture_dir / f"nifty_option_ticks_{self.day.isoformat()}_seg{segment_number}.jsonl"
+        self.handle = new_path.open("a", encoding="utf-8")
+        self.segments.append(new_path)
+        return new_path
+
+    def on_real_disconnect(self) -> None:
+        self._pending_gap_start = self.health.last_tick_at
+        self._pending_gap_segment_before = self.segments[-1].name
+        self.health.on_disconnect()
+
+    def on_real_reconnect_established(self) -> None:
+        """Called from `on_connect` when it fires again after a real
+        disconnect (never on the session's first, initial connect)."""
+        new_path = self.start_new_segment()
+        self._awaiting_reconnect_tick = True
+        logger.warning("option_tick_capture_reconnected new_segment=%s", new_path)
+
+    def write_tick(self, tick: dict, received_at: datetime) -> None:
+        token = tick.get("instrument_token")
+        timestamp = _parse_tick_timestamp(tick)
+        out_of_order = False
+        if (
+            timestamp is not None
+            and token in self.last_timestamp_by_token
+            and timestamp < self.last_timestamp_by_token[token]
+        ):
+            out_of_order = True
+            self.out_of_order_count += 1
+            logger.warning(
+                "option_tick_capture_out_of_order token=%s previous=%s current=%s",
+                token,
+                self.last_timestamp_by_token[token].isoformat(),
+                timestamp.isoformat(),
+            )
+        if timestamp is not None:
+            self.last_timestamp_by_token[token] = timestamp
+            self.health.on_tick(timestamp)
+        record: dict = {"received_at": received_at.isoformat(), "tick": tick}
+        if out_of_order:
+            # Part B #3: recorded and flagged, never silently reordered
+            # or dropped -- the raw `tick` value itself is untouched,
+            # exactly as Brief 20's immutability rule requires; only
+            # this envelope-level metadata (alongside the pre-existing
+            # `received_at`) carries the real finding.
+            record["out_of_order"] = True
+        self.handle.write(json.dumps(record, default=str) + "\n")
+        self.handle.flush()
+        self.tick_count += 1
+        if self._awaiting_reconnect_tick:
+            self._finalize_pending_gap(timestamp or received_at)
+
+    def _finalize_pending_gap(self, gap_end: datetime) -> None:
+        gap_start = self._pending_gap_start
+        gap = GapRecord(
+            gap_start=gap_start.isoformat() if gap_start else "",
+            gap_end=gap_end.isoformat(),
+            duration_seconds=(gap_end - gap_start).total_seconds() if gap_start else 0.0,
+            segment_before=self._pending_gap_segment_before,
+            segment_after=self.segments[-1].name,
+        )
+        self.gaps.append(gap)
+        _record_gap(self.capture_dir, self.day, gap)
+        self._awaiting_reconnect_tick = False
+        self._pending_gap_start = None
+
+    def note_close_reason(self, reason: object) -> None:
+        self.last_close_reason = str(reason)
+
+    def give_up_now(self) -> None:
+        reason = self.last_close_reason or "unknown"
+        self.auth_failure_suspected = AUTH_FAILURE_SIGNATURE in reason
+        self.give_up_reason = reason
+        logger.error(
+            "option_tick_capture_reconnect_exhausted reason=%s auth_failure_suspected=%s",
+            reason,
+            self.auth_failure_suspected,
+        )
+        self.give_up.set()
+
+    def close(self) -> None:
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+
+
 def run_capture_session(
     settings: Settings,
     universe: ContractUniverse,
@@ -227,16 +470,16 @@ def run_capture_session(
     today: date | None = None,
     kite_ticker_factory: Callable[[], object] | None = None,
 ) -> CaptureSessionResult:
-    """Part C: minimal, single-session RAW tick capture. Deliberately no
-    reconnect resilience and no gap detection (Phase 4A-2, separate,
-    future, and only scoped after this brief's real findings are seen)
-    -- if the real WebSocket session drops mid-capture, this simply
-    stops capturing for the rest of the real session; it does not
-    attempt to reconnect. Every stored record is the real tick exactly
-    as `KiteTicker` delivered it, plus a real `received_at` timestamp --
-    no field is ever added, renamed, or fabricated, matching Part A's
-    real finding that several assumed fields (tradingsymbol, expiry,
-    strike, option_type, underlying price) simply are not present.
+    """Part C (Phase 4A-1) + Phase 4A-2 resilience: real tick capture
+    with real reconnection, a real new segment per reconnect (Brief 20's
+    immutability rule: never edits/appends into an already-written
+    segment), real gap recording, and a real fail-closed give-up path
+    (bounded retries exhausted, or a real mid-session auth expiry --
+    both surfaced the same way, see the module docstring) with a real
+    Discord/Telegram alert. Every stored record is the real tick exactly
+    as `KiteTicker` delivered it, plus real envelope metadata
+    (`received_at`, and `out_of_order` when real ordering is violated)
+    -- the raw `tick` value itself is never modified.
     """
     if not (settings.kite_api_key and settings.kite_access_token):
         reason = "no_kite_credentials_configured"
@@ -246,7 +489,6 @@ def run_capture_session(
 
     today = today or datetime.now(IST).date()
     capture_dir.mkdir(parents=True, exist_ok=True)
-    path = capture_dir / f"nifty_option_ticks_{today.isoformat()}.jsonl"
 
     if kite_ticker_factory is None:
         try:
@@ -256,39 +498,95 @@ def run_capture_session(
             logger.warning("option_tick_capture_unavailable reason=%s", reason)
             _notify_capture_unavailable(settings, reason)
             return CaptureSessionResult(DATA_UNAVAILABLE, None, 0, reason)
-        kite_ticker_factory = lambda: KiteTicker(settings.kite_api_key, settings.kite_access_token)
+        # Phase 4A-2 Part A #2: reuses KiteTicker's own real, already-
+        # proven auto-reconnect (exponential backoff up to a real
+        # library-default 60s max delay) -- only reconnect_max_tries is
+        # tightened, from the library's own default of 50 down to this
+        # project's existing settings.max_consecutive_tick_failures
+        # (already used for an analogous bounded-retry purpose in
+        # Orchestrator.run_supervised), so a genuinely unrecoverable
+        # failure gives up in a bounded, real amount of time.
+        max_tries = settings.max_consecutive_tick_failures
+        kite_ticker_factory = lambda: KiteTicker(
+            settings.kite_api_key, settings.kite_access_token, reconnect=True, reconnect_max_tries=max_tries
+        )
 
     kws = kite_ticker_factory()
-    tick_count = 0
+    state = _CaptureState(capture_dir, today, universe)
 
-    with path.open("a", encoding="utf-8") as handle:
+    def on_connect(ws, response):
+        # A reconnect, not the session's initial connect, iff a real
+        # disconnect (state.health.on_disconnect(), via on_close below)
+        # already happened at least once before this real connect fired.
+        was_disconnected = state.health.reconnects > 0 and not state.health.connected
+        state.health.on_connect()
+        if was_disconnected:
+            state.on_real_reconnect_established()
+        tokens = state.universe.all_tokens()
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_FULL, tokens)
 
-        def on_connect(ws, response):
-            tokens = universe.all_tokens()
-            ws.subscribe(tokens)
-            ws.set_mode(ws.MODE_FULL, tokens)
+    def on_ticks(ws, ticks):
+        received_at = datetime.now(IST)
+        for tick in ticks:
+            state.write_tick(tick, received_at)
 
-        def on_ticks(ws, ticks):
-            nonlocal tick_count
-            received_at = datetime.now(IST).isoformat()
-            for tick in ticks:
-                handle.write(json.dumps({"received_at": received_at, "tick": tick}, default=str) + "\n")
-                tick_count += 1
-            handle.flush()
+    def on_close(ws, code, reason):
+        logger.warning("option_tick_capture_socket_closed code=%s reason=%s", code, reason)
+        state.note_close_reason(reason)
+        if state.health.connected:
+            state.on_real_disconnect()
 
-        def on_close(ws, code, reason):
-            logger.warning("option_tick_capture_socket_closed code=%s reason=%s", code, reason)
+    def on_error(ws, code, reason):
+        logger.warning("option_tick_capture_socket_error code=%s reason=%s", code, reason)
+        state.note_close_reason(reason)
 
-        def on_error(ws, code, reason):
-            logger.warning("option_tick_capture_socket_error code=%s reason=%s", code, reason)
+    def on_reconnect(ws, attempts_count):
+        logger.warning("option_tick_capture_reconnect_attempt attempt=%d", attempts_count)
 
-        kws.on_connect = on_connect
-        kws.on_ticks = on_ticks
-        kws.on_close = on_close
-        kws.on_error = on_error
-        kws.connect(threaded=True)
-        time.sleep(duration_seconds)
-        kws.close()
+    def on_noreconnect(ws):
+        state.give_up_now()
 
-    logger.info("option_tick_capture_complete path=%s tick_count=%d", path, tick_count)
-    return CaptureSessionResult(CAPTURED, path, tick_count, "")
+    kws.on_connect = on_connect
+    kws.on_ticks = on_ticks
+    kws.on_close = on_close
+    kws.on_error = on_error
+    kws.on_reconnect = on_reconnect
+    kws.on_noreconnect = on_noreconnect
+    kws.connect(threaded=True)
+    gave_up = state.give_up.wait(timeout=duration_seconds)
+    kws.close()
+    state.close()
+
+    if gave_up:
+        reason = f"reconnection exhausted -- real last close/error reason: {state.give_up_reason}"
+        logger.error("option_tick_capture_gave_up reason=%s", reason)
+        _notify_capture_failure(settings, reason, state.auth_failure_suspected)
+        return CaptureSessionResult(
+            RECONNECT_FAILED,
+            state.segments[0],
+            state.tick_count,
+            reason,
+            tuple(state.segments),
+            tuple(state.gaps),
+            state.auth_failure_suspected,
+            state.out_of_order_count,
+        )
+
+    logger.info(
+        "option_tick_capture_complete segments=%s tick_count=%d gaps=%d out_of_order=%d",
+        [p.name for p in state.segments],
+        state.tick_count,
+        len(state.gaps),
+        state.out_of_order_count,
+    )
+    return CaptureSessionResult(
+        CAPTURED,
+        state.segments[0],
+        state.tick_count,
+        "",
+        tuple(state.segments),
+        tuple(state.gaps),
+        False,
+        state.out_of_order_count,
+    )
