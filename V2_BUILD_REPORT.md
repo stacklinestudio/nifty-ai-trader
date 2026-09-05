@@ -4813,3 +4813,89 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 17: real daily status notification for every archive attempt (2026-09-06)
+
+A small, explicitly additive extension to Brief 16's gap safeguard, not
+a replacement — both coexist. Brief 16 only speaks up when a *prior*
+day's archive is silently missing; this brief makes *today's own*
+attempt visible every single time it runs, success or failure.
+
+New, in `data/instrument_archive.py`:
+
+- **`notify_archive_status(settings, *, success, detail)`** — sends one
+  real message to the existing Discord "system" channel
+  (`integrations/discord.py::DiscordNotifier`) on every real archive
+  attempt. Guards its own send internally (unlike `notify_missing_
+  archive`, which relies on its one caller for this) since this
+  function now has three real call sites in `run_daily_archive` — a
+  notification-transport failure must never break the scheduled task
+  from any of them.
+- **`_archive_success_message(day, instrument_count, timestamp)`** /
+  **`_archive_failure_message(reason)`** — build the real message text.
+  Success: `"Instrument archive succeeded for <date>: <count> real
+  instruments archived at <timestamp>"` — `<count>` is read back from
+  the real saved JSON file itself (`len(json.loads(path.read_text()))`),
+  never a separately-tracked number that could silently drift from what
+  was actually written. Failure: `"Instrument archive failed: <reason>
+  -- check the scheduled task"` — `<reason>` is the real captured cause
+  in every one of the three failure paths (`no_kite_credentials_
+  configured`, `kiteconnect_not_installed`, or `f"{type(exc).__name__}:
+  {exc}"` for a real API failure such as an expired token).
+- Wired into all three of `run_daily_archive`'s existing outcomes (two
+  early-return skip paths, plus the real success/exception paths around
+  `archive_nfo_instruments`) — every real attempt now reports, not just
+  the ones that happen to fail.
+
+### Tests
+
+```
+$ python -m pytest tests/test_instrument_archive.py -v
+test_archive_writes_the_real_raw_response_to_a_timestamped_file PASSED
+test_archive_is_idempotent_for_the_same_real_day PASSED
+test_run_daily_archive_fails_closed_with_no_credentials_configured PASSED
+test_run_daily_archive_fails_closed_on_a_real_expired_token_error PASSED
+test_run_daily_archive_succeeds_with_a_real_looking_session PASSED
+test_find_missing_previous_archive_detects_a_real_gap PASSED
+test_find_missing_previous_archive_stays_silent_for_unbroken_history PASSED
+test_find_missing_previous_archive_skips_real_weekends PASSED
+test_find_missing_previous_archive_is_silent_on_the_real_first_ever_day PASSED
+test_check_and_notify_missing_archive_fires_a_real_notification_on_a_real_gap PASSED
+test_check_and_notify_missing_archive_stays_silent_with_no_false_alarms PASSED
+test_check_and_notify_missing_archive_never_raises_if_notification_transport_fails PASSED
+test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_credentials PASSED
+test_run_daily_archive_sends_a_real_success_status_notification PASSED
+test_run_daily_archive_sends_a_real_failure_status_notification_with_the_real_reason PASSED
+test_run_daily_archive_sends_a_real_failure_status_notification_with_no_credentials PASSED
+16 passed in 0.35s
+```
+
+`test_run_daily_archive_sends_a_real_success_status_notification` runs
+a real successful archive (3 fake-but-real rows through the same
+`archive_nfo_instruments` code path) and asserts the real date
+(`2026-09-08`), the real exact instrument count (`3 real instruments`,
+matching the 3 rows, not a placeholder), and the real timestamp
+(`2026-09-08T09:00:00...`) all appear in the sent message.
+`test_run_daily_archive_sends_a_real_failure_status_notification_with_
+the_real_reason` simulates a real `ConnectionError` (mirroring a real
+expired-token failure) and asserts the real exception type and real
+message text both appear verbatim in the notification, not a generic
+"archive failed" string. `test_run_daily_archive_still_checks_for_a_
+gap_even_with_no_kite_credentials` (updated from Brief 16) now confirms
+**both** real notifications fire independently and in the right order
+on a day that is simultaneously missing a prior archive *and* failing
+its own attempt — the gap safeguard first, then the status notification
+— proving requirement #2 (coexistence, not replacement) directly.
+
+Also confirmed no real notification is actually sent by any of these
+tests: `Settings()`'s `discord_webhook_url`/`discord_webhook_system`
+default to empty on this machine (verified live, no env override), and
+every test that isn't specifically checking the message content
+replaces `DiscordNotifier` with an in-memory recording fake regardless.
+
+```
+$ pytest -q
+333 passed in 78.16s
+$ ruff check .
+All checks passed!
+```

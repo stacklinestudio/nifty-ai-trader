@@ -117,6 +117,38 @@ def check_and_notify_missing_archive(
     return missing_day
 
 
+def _archive_success_message(day: date, instrument_count: int, timestamp: datetime) -> str:
+    return (
+        f"Instrument archive succeeded for {day.isoformat()}: "
+        f"{instrument_count} real instruments archived at {timestamp.isoformat()}"
+    )
+
+
+def _archive_failure_message(reason: str) -> str:
+    return f"Instrument archive failed: {reason} -- check the scheduled task"
+
+
+def notify_archive_status(settings: Settings, *, success: bool, detail: str) -> None:
+    """Real daily status notification, sent on *every* scheduled archive
+    attempt (success or failure) to the existing Discord "system"
+    channel -- a small addition alongside, never a replacement for, the
+    separate `check_and_notify_missing_archive` gap safeguard above: that
+    one reports a *prior* day's silent gap; this one reports *today's*
+    own real outcome every single time it runs. Guards its own send
+    internally (unlike `notify_missing_archive`, which relies on its one
+    caller for this) since this has three real call sites below, and a
+    notification-transport failure must never break the scheduled
+    archiving task either way."""
+    try:
+        discord = DiscordNotifier(
+            settings.discord_webhook_url,
+            webhooks_by_category=webhooks_by_category_from_settings(settings),
+        )
+        discord.send_message("INFO" if success else "WARNING", detail, "system")
+    except Exception as exc:  # noqa: BLE001 - a notification failure must never break the scheduled archiving task.
+        logger.warning("instrument_archive_status_notify_failed error=%s: %s", type(exc).__name__, exc)
+
+
 def run_daily_archive(settings: Settings) -> Path | None:
     """Fail-closed entry point for the real daily scheduled task (see
     scripts/archive_instruments.ps1 and the registered Windows Scheduled
@@ -131,23 +163,38 @@ def run_daily_archive(settings: Settings) -> Path | None:
     check_and_notify_missing_archive) -- checked unconditionally, before
     the credential check below, so a real gap in a *prior* day's archive
     still gets surfaced even on a day today's own session is also
-    missing/expired.
+    missing/expired. Separately, every real attempt here -- success or
+    failure -- also sends its own real status notification
+    (notify_archive_status), so a silent success run is just as visible
+    as a silent failure would otherwise be.
     """
     check_and_notify_missing_archive(settings)
+    today = datetime.now(IST).date()
     if not (settings.kite_api_key and settings.kite_access_token):
-        logger.warning("instrument_archive_skipped reason=no_kite_credentials_configured")
+        reason = "no_kite_credentials_configured"
+        logger.warning("instrument_archive_skipped reason=%s", reason)
+        notify_archive_status(settings, success=False, detail=_archive_failure_message(reason))
         return None
     try:
         from kiteconnect import KiteConnect
     except ImportError:
-        logger.warning("instrument_archive_skipped reason=kiteconnect_not_installed")
+        reason = "kiteconnect_not_installed"
+        logger.warning("instrument_archive_skipped reason=%s", reason)
+        notify_archive_status(settings, success=False, detail=_archive_failure_message(reason))
         return None
     kite = KiteConnect(api_key=settings.kite_api_key)
     kite.set_access_token(settings.kite_access_token)
     try:
-        path = archive_nfo_instruments(kite)
+        path = archive_nfo_instruments(kite, today=today)
     except Exception as exc:  # noqa: BLE001 - a real, expired/invalid token (or any other real API failure) must be logged, never crash the scheduled task.
-        logger.warning("instrument_archive_failed error=%s: %s", type(exc).__name__, exc)
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("instrument_archive_failed error=%s", reason)
+        notify_archive_status(settings, success=False, detail=_archive_failure_message(reason))
         return None
+    instrument_count = len(json.loads(path.read_text(encoding="utf-8")))
+    timestamp = datetime.now(IST)
     logger.info("instrument_archive_saved path=%s", path)
+    notify_archive_status(
+        settings, success=True, detail=_archive_success_message(today, instrument_count, timestamp)
+    )
     return path

@@ -285,7 +285,118 @@ def test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_credentials(
     result = run_daily_archive(settings)
 
     assert result is None  # still fails closed on no credentials, as before
-    assert len(_RecordingDiscord.instances) == 1
+    # Both real notifications fire independently: the gap safeguard (a
+    # prior day's silent gap) and the new per-attempt status message
+    # (today's own real outcome) -- one Discord send each.
+    assert len(_RecordingDiscord.instances) == 2
     assert _RecordingDiscord.instances[0].calls == [
         ("WARNING", "instrument archive missing for 2026-09-08, check the scheduled task", "system")
     ]
+    assert _RecordingDiscord.instances[1].calls == [
+        (
+            "WARNING",
+            "Instrument archive failed: no_kite_credentials_configured -- check the scheduled task",
+            "system",
+        )
+    ]
+
+
+# --- Real per-attempt status notification (success or failure) --------
+
+
+def test_run_daily_archive_sends_a_real_success_status_notification(tmp_path, monkeypatch):
+    """Requirement #1/#3: a real successful run must send the real date,
+    real instrument count, and real timestamp -- not placeholders."""
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+
+    class _FakeKiteConnectModule:
+        class KiteConnect:
+            def __init__(self, api_key):
+                pass
+
+            def set_access_token(self, token):
+                pass
+
+            def instruments(self, segment):
+                return [{"tradingsymbol": "A"}, {"tradingsymbol": "B"}, {"tradingsymbol": "C"}]
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
+
+    result = run_daily_archive(settings)
+
+    assert result is not None
+    # No prior archive history exists yet in this fresh tmp_path, so the
+    # gap safeguard stays silent (Part D's "first real day" rule) --
+    # exactly one real Discord send, the status notification itself.
+    assert len(_RecordingDiscord.instances) == 1
+    severity, message, category = _RecordingDiscord.instances[0].calls[0]
+    assert severity == "INFO"
+    assert category == "system"
+    assert "2026-09-08" in message  # the real archived date
+    assert "3 real instruments" in message  # the real, exact count -- matches the 3 fake rows above
+    assert "2026-09-08T09:00:00" in message  # the real timestamp
+
+
+def test_run_daily_archive_sends_a_real_failure_status_notification_with_the_real_reason(tmp_path, monkeypatch):
+    """Requirement #1/#3: a real failed run must send the real captured
+    error reason, not a generic message."""
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    settings = Settings(kite_api_key="looks-real", kite_access_token="stale-token")
+
+    class _FakeKiteConnectModule:
+        class KiteConnect:
+            def __init__(self, api_key):
+                pass
+
+            def set_access_token(self, token):
+                pass
+
+            def instruments(self, segment):
+                raise ConnectionError("simulated real TokenException: Incorrect api_key or access_token.")
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kiteconnect", _FakeKiteConnectModule)
+
+    result = run_daily_archive(settings)
+
+    assert result is None
+    assert len(_RecordingDiscord.instances) == 1
+    severity, message, category = _RecordingDiscord.instances[0].calls[0]
+    assert severity == "WARNING"
+    assert category == "system"
+    assert "ConnectionError" in message  # the real exception type, captured
+    assert "simulated real TokenException: Incorrect api_key or access_token." in message  # the real reason
+    assert message.endswith("-- check the scheduled task")
+
+
+def test_run_daily_archive_sends_a_real_failure_status_notification_with_no_credentials(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    settings = Settings(kite_api_key="", kite_access_token="")
+
+    result = run_daily_archive(settings)
+
+    assert result is None
+    assert len(_RecordingDiscord.instances) == 1
+    severity, message, category = _RecordingDiscord.instances[0].calls[0]
+    assert severity == "WARNING"
+    assert category == "system"
+    assert message == (
+        "Instrument archive failed: no_kite_credentials_configured -- check the scheduled task"
+    )
