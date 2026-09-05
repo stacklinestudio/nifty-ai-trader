@@ -4366,3 +4366,341 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 15 (Phase 2c): EV Diagnosis & Real-Option-Data Foundation (2026-09-05)
+
+Diagnosis only, per the brief's own explicit instruction. **No config,
+threshold, or trade-decision change of any kind in this brief.** The goal
+is understanding why Phase 2a's EV came out negative, not producing a
+better-looking number. Nothing here is tuned toward a positive result.
+
+New: `research/expected_value.py::EVDecomposition` (frozen dataclass:
+`win_contribution`, `loss_contribution`, `costs`, `slippage`, a `.total`
+property, and `.dominant_driver()`), `EVEstimate.decomposition()` (`None`
+for tier 1/3, a real breakdown for tier 2), and `recompute_ev(win_rate,
+avg_win_r, avg_loss_r, costs_r, slippage_r)` — the pure arithmetic core,
+factored out of `compute_ev`'s own tier-2 branch so this brief's
+decomposition and sensitivity sweep are provably the *same* calculation,
+never a second, independently-maintained one.
+
+```
+$ python -m pytest tests/test_ev_decomposition.py -v
+test_decomposition_sums_exactly_to_the_same_real_ev_compute_ev_produces PASSED
+test_decomposition_is_none_for_insufficient_data PASSED
+test_dominant_driver_correctly_identifies_the_largest_real_drag PASSED
+test_recompute_ev_sensitivity_sweep_is_monotonic_and_arithmetically_exact PASSED
+test_recompute_ev_matches_compute_ev_for_the_same_real_inputs PASSED
+5 passed in 0.87s
+```
+
+The sums-exactly test asserts `decomposition.total == estimate.ev_r` by
+real, exact equality (not `approx`) — both values come from the same
+floats with no independent rounding introduced. The sensitivity test
+asserts the sweep is strictly increasing, every step distinct, and each
+step's real delta equals `win_rate × Δavg_win_r` exactly — a real,
+arithmetically-checked relationship, not just "the number goes up."
+
+### Part A — Full EV decomposition, per real setup+regime combination
+
+Ran on both real windows (42-day, 12 real tier-2 combinations; 248-day,
+18 — all sufficiently sampled, unlike the 42-day window's 6 real
+`INSUFFICIENT_DATA` combinations). Sample lines (full real output, all
+30 combinations across both windows, was inspected — these two are
+representative, not cherry-picked for direction):
+
+```
+42-day: MOMENTUM_CONTINUATION/TREND_DOWN (n=186):
+  win_contribution=+0.548R  loss_contribution=-0.634R
+  costs=-0.110R  slippage=-0.011R  => total=-0.206R
+  dominant_driver=loss_contribution
+
+248-day: MOMENTUM_CONTINUATION/GAP_UP (n=37): win_rate=0.4865
+  win_contribution=+0.730R  loss_contribution=-0.514R
+  costs=-0.110R  slippage=-0.011R  => total=+0.096R
+  dominant_driver=loss_contribution
+```
+
+(This exactly reproduces Brief 14's own headline +0.096R for this same
+combination — the one real positive-EV combination found in that
+brief's 248-day window — now broken into its real components for the
+first time.)
+
+**Real dominant-driver tally, both windows:**
+
+```
+42-day  (12 real combos): {'loss_contribution': 12}   -- 100%
+248-day (18 real combos): {'loss_contribution': 18}   -- 100%
+```
+
+**Finding, stated plainly: `loss_contribution` is the dominant negative
+driver in every single real combination in both real windows — 30/30,
+with zero exceptions.** Real costs (~0.110R) and real slippage (~0.011R)
+are present and included, but neither is ever the largest drag; they are
+small and essentially constant relative to `loss_contribution`, which
+scales with the real observed loss rate. This is directly why Parts B
+and C below investigate the reward-ratio assumption and the cost
+contribution as *separate* hypotheses — Part A's own real data already
+points away from costs as the primary explanation, toward the real win
+rate itself being too low relative to the 1.5:1 reward:risk assumption.
+
+### Part B — Sensitivity to the 1.5R `AvgWin` assumption
+
+**Stated as a real limitation first**: `AvgWin(R) = 1.5` is not measured
+from real option P&L — it is `execution/live_context.py::_atr_zones`'
+own real, already-coded *lower* bound on its target-zone multiple
+(`execution/live_context.py:657,662,931-937`: target zone spans
+`spread × 1.5` to `spread × 2.0`). Every EV number in Phase 2a and this
+brief so far used only the 1.5 end of that real, already-coded range.
+
+Recomputed EV for every real tier-2 combination in both windows at
+`AvgWin ∈ {1.0, 1.5, 2.0, 2.5}`, holding every other real input
+(`win_rate`, `costs_r`, `slippage_r`) fixed:
+
+```
+42-day window (12 real combos):
+  AvgWin=1.0: median EV = -0.463R (0/12 positive)
+  AvgWin=1.5: median EV = -0.299R (0/12 positive)
+  AvgWin=2.0: median EV = -0.135R (2/12 positive)
+  AvgWin=2.5: median EV = +0.029R (7/12 positive)
+
+248-day window (18 real combos):
+  AvgWin=1.0: median EV = -0.412R (0/18 positive)
+  AvgWin=1.5: median EV = -0.234R (1/18 positive)
+  AvgWin=2.0: median EV = -0.057R (8/18 positive)
+  AvgWin=2.5: median EV = +0.120R (14/18 positive)
+```
+
+**Answering Part B's question directly**: the median EV only turns
+positive at `AvgWin = 2.5` in *both* real windows independently.
+`AvgWin = 2.0` — the *upper* end of the system's own real, already-coded
+target-zone range — is still negative in both windows (-0.135R and
+-0.057R), though visibly closer to zero and with a growing minority of
+individual combinations flipping positive (2/12 = 16.7%; 8/18 = 44.4%).
+`AvgWin = 2.5` is **outside** the range this system's code has ever
+actually implemented — it is not a real, defensible value under the
+current `_atr_zones` design, only a hypothetical "what if the target
+were set further out" test.
+
+So: **across the entire real, defensible range this system's own code
+currently uses (1.5 to 2.0), the median EV stays negative in both real
+windows.** It only turns positive past the top of that range. This is
+evidence *against* "the 1.5R assumption is simply wrong and a more
+generous one would flip the picture" — even the most generous value the
+code itself ever produces doesn't flip the median. It's evidence *for*
+Part A's finding: the dominant problem is the real win rate being too
+low relative to *any* value in the currently-coded reward-ratio range,
+not a mis-calibrated `AvgWin` constant.
+
+### Part C — Cost/slippage contribution, isolated
+
+Recomputed EV for every real tier-2 combination with `costs_r=0.0,
+slippage_r=0.0` — a clearly-labeled hypothetical, **never presented as
+achievable**; real transaction costs and real slippage are not
+optional in live or paper trading.
+
+```
+42-day window:
+  real median EV (with real costs+slippage):        -0.299R
+  hypothetical median EV (costs+slippage zeroed):    -0.179R
+  real combined costs+slippage account for 0.120R of the negative total
+
+248-day window:
+  real median EV (with real costs+slippage):        -0.234R
+  hypothetical median EV (costs+slippage zeroed):    -0.114R
+  real combined costs+slippage account for 0.120R of the negative total
+```
+
+The 0.120R figure matches almost exactly between the two independent
+windows — expected, since real costs/slippage are computed from the same
+fixed representative premium (₹120.5), lot size (65), and `Settings`
+slippage-tick configuration, independent of which historical window is
+replayed; it is not a coincidence requiring further explanation.
+
+**Answering Part C's question directly: even in the hypothetical,
+unachievable zero-cost/zero-slippage case, the median EV remains
+negative in both real windows** (-0.179R and -0.114R). Real transaction
+costs and slippage are real and non-trivial (~0.12R, a meaningful chunk
+of a typical loss), but they are not the primary cause of the negative
+result — removing them entirely does not flip the median positive in
+either window. This corroborates Parts A and B from a third, independent
+angle: the negative EV is fundamentally a real win-rate/structural-edge
+problem on the index-price-proxy basis, not primarily a cost problem.
+
+### Part D — Real option-data foundation: honest status and realistic path
+
+**1. Instrument archiving job status (Brief 13 Part 2), re-verified live
+for this report:**
+
+```
+$ ls -la data/private/instrument_archives/
+nfo_instruments_2026-09-05.json   9,384,623 bytes   Sep 5 04:42
+
+$ schtasks /Query /TN "NiftyAITrader-InstrumentArchive" /V /FO LIST
+TaskName:      \NiftyAITrader-InstrumentArchive
+Next Run Time: 06-09-2026 09:00:00
+Status:        Ready
+Logon Mode:    Interactive only
+Last Run Time: 05-09-2026 10:19:37
+Last Result:   -2147020576   (0x800710E0)
+```
+
+**Exactly 1 real archived day of NFO instrument data exists as of this
+report.** The task's `Last Run Time` (10:19:37) does not correspond to
+either of my two manual `schtasks /Run` triggers earlier the same day
+(04:41:23 and 04:42:28 — both real, both logged, both succeeded), and no
+log file exists in `data/private/instrument_archives/logs/` for the
+10:19:37 run. The strong circumstantial conclusion: **the task's own
+unattended trigger (most likely its real scheduled 09:00 fire) failed to
+even execute the script**, most likely because `schtasks /Create` was
+run without `/RU`/`/RP` credentials in Brief 13, defaulting to
+`Logon Mode: Interactive only` — a mode that requires an active
+interactive Windows session at trigger time to run at all. (`Get-WinEvent
+-LogName "Microsoft-Windows-TaskScheduler/Operational"` returned no
+events — that channel is disabled by default on this machine, so this is
+the strongest evidence obtainable without enabling it or supplying real
+Windows credentials, which I have not done unilaterally: storing a real
+password via `schtasks /RP` is a credential-handling action past what
+this brief authorizes me to decide alone.)
+
+**Honestly: the archiving job is not yet confirmed to run unattended.**
+Until either the task is reconfigured with stored run-as credentials (or
+switched to `S4U`/service-account logon), or someone manually triggers it
+each real morning, the real archived-day count will not grow on its own.
+
+**2. Realistic projection to sufficient historical option-contract data:**
+
+Given the above, a rate-based projection is not honest to present as a
+simple "N more days" — the real current rate is not "1 file/day", it is
+"1 file total, and the automated mechanism intended to produce more is
+unverified/likely broken." If the logon-mode issue is fixed today, the
+job would produce 1 real new file per trading day going forward.
+
+More importantly, **daily instrument-list archiving alone is
+insufficient for real historical option-price reconstruction, regardless
+of how many days accumulate** — it captures which contracts *existed*
+(strike, expiry, instrument token) on a given day, not their real
+traded/quoted prices at any point in time. Reconstructing a real
+historical option P&L requires a *second*, currently-nonexistent
+pipeline: continuous capture of real option-chain quotes/LTPs through
+the trading day. `storage/database.py::save_option_chain_snapshot` /
+`latest_option_chain_snapshot` (wired since an earlier brief) is the
+real mechanism for this — and it works — but it has been exercised
+exactly **once**, ad hoc, confirmed live for this report:
+
+```
+$ sqlite3 query on nifty_ai_trader.db
+SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM snapshots;
+(1, '2026-09-02T10:01:43.894934+05:30', '2026-09-02T10:01:43.894934+05:30')
+SELECT source, COUNT(*) FROM snapshots GROUP BY source;
+[('option_chain', 1)]
+```
+
+One real row, one real timestamp, from a single manual live check — not
+sustained operation. There is no scheduled task for `python main.py run`
+(or any lighter dedicated quote-capture script); only instrument
+archiving is scheduled. **Honest bottom line for Part D: real historical
+option-price reconstruction needs a second pipeline piece that does not
+exist yet even in nascent scheduled form, on top of fixing the first
+piece's unattended-execution reliability.** No projection to "N trading
+days until sufficient data" can be honestly stated until that second
+pipeline exists and itself starts accumulating real days.
+
+### Part E — Real minimum sample size, derived rigorously
+
+Real breakeven win rate, derived from this brief's own real, cited
+inputs (`AvgWin=1.5`, `AvgLoss=1.0` by definition, `costs_r + slippage_r
+≈ 0.121R`, all established in Parts A–C above):
+
+```
+p_breakeven × 1.5 - (1 - p_breakeven) × 1.0 - 0.121 = 0
+2.5 × p_breakeven = 1.121
+p_breakeven = 0.4484  (44.84%)
+```
+
+Real, sample-size-weighted pooled win rates, computed directly from this
+brief's own real per-combination `win_contribution` values (=
+`win_rate × 1.5`) and real sample sizes, across all real tier-2
+combinations in each window:
+
+```
+42-day window:  pooled real win rate = 0.3390 over N=1,675 real candidates
+248-day window: pooled real win rate = 0.3531 over N=3,464 real candidates
+```
+
+Using the standard normal-approximation margin-of-error formula for a
+proportion, solved for the sample size `n` required so a 95% confidence
+interval around the *observed* win rate is tight enough to actually
+distinguish it from the breakeven rate (i.e., the CI half-width equals
+the real observed gap to breakeven — a defensible, conservative bar: any
+looser and the CI could straddle breakeven and say nothing):
+
+```
+n = z² × p(1-p) / δ²         z = 1.96 (95% CI), δ = |p_observed - p_breakeven|
+
+42-day:  p=0.3390, δ=0.1094  ->  n = 1.96² × 0.3390×0.6610 / 0.1094²  ≈ 71.9
+248-day: p=0.3531, δ=0.0953  ->  n = 1.96² × 0.3531×0.6469 / 0.0953²  ≈ 96.7
+```
+
+**Real, defensible minimum: ~72–97 real samples per `(setup_type,
+regime)` combination**, depending on how far the true win rate sits from
+breakeven (a combination closer to breakeven needs *more* samples to
+distinguish reliably — the 248-day figure is larger because its pooled
+win rate sits closer to `p_breakeven` than the 42-day figure does, not
+because the window is longer). Rounding up for a conservative, single
+project-wide bar: **n ≈ 100 real samples** before EV should be allowed
+to influence trade ranking, roughly **5x** the `MIN_COUNTERFACTUAL_SAMPLES
+= 20` threshold this project's tier-2 gate currently uses (borrowed from
+`pattern_memory.py`'s own `MIN_SAMPLES_FOR_CONFIDENCE`, which was never
+derived for *this* purpose).
+
+Checked against Parts A–C's own real observed sample sizes: 6 of the 30
+real combinations across both windows sit below ~100 (as low as 27), and
+several more sit in the 30-90 range — meaning a real, non-trivial
+fraction of the combinations this brief already analyzed would **not**
+clear this brief's own rigorously-derived bar, even though they clear
+the current, looser `MIN_COUNTERFACTUAL_SAMPLES = 20` gate.
+
+### Summary: does Phase 2b now have a clearer path forward?
+
+**Not yet — and here specifically is what's still missing**, per the
+brief's own acceptance criterion:
+
+1. **The negative EV is real, robust, and now well-understood as a
+   win-rate/structural-edge issue, not a cost or reward-ratio-assumption
+   issue** (Parts A–C, unanimous across two independent real windows).
+   This *is* a clearer diagnosis than Phase 2a had — but a clear
+   diagnosis of "why it's negative" is not the same as "a path to make it
+   safe to act on."
+2. **Zero real trades still exist to calibrate the index-price proxy
+   against real option P&L** — every real number in this brief remains
+   `COUNTERFACTUAL_PROXY`, never validated against a real fill.
+3. **The scheduled archiving job's unattended execution is unverified and
+   likely broken** (Part D.1) — a concrete, fixable, but currently open
+   operational gap.
+4. **Real historical option-price data does not exist in any accumulating
+   form** — only 1 real archived instrument-list day, only 1 real
+   option-chain snapshot row, and no second pipeline piece scheduled to
+   grow either (Part D.2).
+5. **A real, rigorously-derived minimum sample size (~100 per
+   combination, Part E) is roughly 5x the threshold the code currently
+   gates on**, and several already-analyzed real combinations don't clear
+   it — meaning even the counterfactual-proxy numbers this project has
+   today are, by this brief's own math, under-sampled in multiple cases.
+
+Phase 2b (using EV to rank/select candidates in production) should
+**not** proceed on the current evidence. The concrete, real prerequisites
+this brief surfaces, in priority order: (a) fix the scheduled archiving
+task's unattended-execution reliability, (b) stand up the second,
+currently-nonexistent continuous option-quote-capture pipeline piece,
+(c) raise `MIN_COUNTERFACTUAL_SAMPLES` toward this brief's derived ~100
+bar (or re-derive it once real option data, rather than the index proxy,
+is available), and (d) accumulate real closed trades so tier 1 can
+eventually supersede the proxy entirely. None of these are done in this
+brief — diagnosis only, per the brief's own instruction.
+
+```
+$ pytest -q
+322 passed in 73.00s
+$ ruff check .
+All checks passed!
+```
