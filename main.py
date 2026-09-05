@@ -28,6 +28,7 @@ from config import IST, Settings
 from data.calendar import NseCalendar
 from data.global_market import YFinanceGlobalMarketProvider
 from data.historical import validate_candles
+from data.instrument_archive import run_daily_archive
 from data.market_data import KiteMarketData, validate_quote
 from data.rss_news import fetch_recent_news
 from demo.demo_trade import run_demo_trade
@@ -372,6 +373,26 @@ def main() -> int:
         # (demo/demo_trade.py::_demo_settings) -- never touches the real
         # `settings` object built above, or anything it points at.
         run_demo_trade()
+        return 0
+    if args.command == "instruments":
+        # Brief 13 Part 2: real, daily-scheduled NFO instrument archiving
+        # (data/instrument_archive.py) -- previously this subcommand was
+        # registered but never implemented, always falling through to the
+        # generic "no credentials" message below regardless of the real
+        # reason. Fails closed the same honest way run_daily_archive
+        # itself does: no valid session today (missing credentials, or a
+        # real API failure -- most often an expired access token) prints
+        # the same message a genuinely-unconfigured environment would,
+        # never a crash, never a fabricated archive file.
+        path = run_daily_archive(settings)
+        if path:
+            print(f"Archived real NFO instruments to {path}")
+        else:
+            print(
+                "Download instruments through an authenticated official Kite SDK session; "
+                "no valid session found (missing credentials, or today's access token has "
+                "expired/not yet been refreshed)."
+            )
         return 0
     print(
         "Download instruments through an authenticated official Kite SDK session; no credentials were found."
