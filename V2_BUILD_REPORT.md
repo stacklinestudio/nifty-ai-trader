@@ -3700,3 +3700,199 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 13: extended index-only sample + real daily instrument archiving (2026-09-05)
+
+Two independent extensions, neither retrying the already-confirmed-blocked
+42-day option-data path. Required a fresh real Kite login this session
+(the prior token, like every prior one, was expired as designed —
+single-use daily tokens; the user completed the real interactive
+browser login once, pasted back the resulting request token, exchanged
+for a real access token via `auth/kite_auth.py` — never automated,
+matching this project's permanent policy).
+
+### Part 1 — Extended index-only historical window
+
+**Real, live-confirmed limit** (not assumed): a 90-day real
+`kite.historical_data(..., interval="minute")` request fails —
+`InputException: interval exceeds max limit: 60 days`. Fetched the real
+12-month NIFTY 50 index minute history in 7 real, paginated ≤60-day
+chunks (1s real pacing between requests):
+
+```
+fetching 2026-07-08 -> 2026-09-05 ...  -> 16125 real rows
+fetching 2026-05-10 -> 2026-07-08 ...  -> 15000 real rows
+fetching 2026-03-12 -> 2026-05-10 ...  -> 13875 real rows
+fetching 2026-01-12 -> 2026-03-12 ...  -> 15375 real rows
+fetching 2025-11-14 -> 2026-01-12 ...  -> 15000 real rows
+fetching 2025-09-16 -> 2025-11-14 ...  -> 14685 real rows
+fetching 2025-09-05 -> 2025-09-16 ...  -> 2625 real rows
+
+real total rows: 92685
+real distinct trading days: 248
+real date range: 2025-09-05 to 2026-09-04
+```
+
+**248 real trading days** — 5.9x the original 42-day window. Real
+NIFTY 50 index price only; no option premiums, no real OI data for this
+extended window (the same already-confirmed, unfixable gap for any
+already-elapsed period — Part 2 below is what closes this going
+forward). Saved to `data/private/nifty_index_minute_2025-09-05_to_2026-09-04_extended.csv`
+(gitignored, not committed).
+
+**Independent ATR base-rate check** (Brief 10 Part C's own methodology,
+re-run unmodified on the 248-day dataset):
+
+```
+multiplier=1.0: 77/234 real days labeled genuinely tradeable (14 excluded, no 14-day history yet)
+multiplier=1.2: 47/234 real days labeled genuinely tradeable (14 excluded, no 14-day history yet)
+multiplier=1.5: 15/234 real days labeled genuinely tradeable (14 excluded, no 14-day history yet)
+```
+
+At the primary multiplier (1.2): **20.1%** of real days (47/234) —
+compared to **21.4%** (6/28) on the original 42-day window. Real,
+independent confirmation across a 5.9x larger sample that the original
+base rate wasn't a fluke of that specific window.
+
+**Extended score/counterfactual diagnostic** (`reports/score_diagnostic.py`,
+Brief 12 Part C's own unmodified pipeline, re-run on the 248-day
+dataset — scan cadence widened from every 5 to every 15 real minutes for
+this much larger window, both for real runtime reasons and because it
+somewhat reduces, without eliminating, the same-day-setup-recurrence
+correlation Brief 12's own report already flagged):
+
+```
+[INDEX-ONLY WINDOW: no real option premiums or OI data for this extended window -- see COUNTERFACTUAL label on every counterfactual line below]
+sessions (real trading days scanned): 248
+candidates (real structural setups scored): 3464
+actual trades (cleared signal_threshold): 0
+rejected candidates: 3464
+score distribution by bucket:
+  <40: 373 (10.8%)
+  40-49: 2206 (63.7%)
+  50-59: 885 (25.5%)
+  60-69: 0 (0.0%)
+  70-79: 0 (0.0%)
+  80+: 0 (0.0%)
+median score: 47.3  mean score: 47.0
+top rejection reasons:
+  confidence_gated: 3464
+most restrictive component (real points lost vs. its own real ceiling), by frequency:
+  volume_score: 3449
+  opening_score: 15
+[COUNTERFACTUAL -- INDEX-PRICE PROXY, NOT REAL OPTION P&L] rejected-but-counterfactually-profitable: 1223/3464 (index-proxy only, never real option P&L)
+[COUNTERFACTUAL -- INDEX-PRICE PROXY, NOT REAL OPTION P&L] rejected-and-correctly-avoided (index-proxy): 2241/3464
+```
+
+Real runtime: 57,636s (~16.0 hours). Genuinely this slow, diagnosed live
+rather than assumed: system-wide CPU load checked mid-run at 4% (no
+external contention) and the process's own memory footprint stayed ~45MB
+(no leak) — the real cause is that `execution/live_context.py`'s
+technical-feature computation (EMA/RSI/ATR/VWAP) recomputes over the
+*entire* preceding real price history on every single decision-point
+check rather than incrementally, so per-call cost genuinely grows as the
+window grows; a real, measured 10-calendar-day chunk late in the window
+(Aug 10→20) took 58 real minutes against 48 for the chunk immediately
+before it (Jul 31→Aug 10) — confirming the slowdown is structural, not
+external contention. Worth a real optimization pass if this kind of
+extended-window replay becomes routine; not attempted here (out of this
+brief's scope).
+
+**Real result, and it matches the 42-day window closely — the important
+finding**: every real statistic lands within a few points of the
+original 42-day numbers, at 5.9x the sample size:
+
+| | 42-day (Brief 12) | 248-day (extended) |
+|---|---|---|
+| Actual trades | 0 | 0 |
+| Median / mean score | 46.7 / 46.5 | 47.3 / 47.0 |
+| Score <40 / 40-49 / 50-59 | 12.6% / 65.8% / 21.5% | 10.8% / 63.7% / 25.5% |
+| `volume_score` most restrictive | 99.6% (1749/1756) | 99.6% (3449/3464) |
+| Counterfactual profitable (index-proxy) | 34.1% (598/1756) | 35.3% (1223/3464) |
+
+This is real, independent evidence that Brief 12's findings were not an
+artifact of that specific 42-day stretch — the same structural picture
+(zero real trades, the same dominant `volume_score` data-gap ceiling,
+the same ~1/3 index-favorable counterfactual rate) holds across a
+substantially larger, later-overlapping-but-mostly-independent real
+window. It does **not** change the "not enough evidence for a threshold
+conclusion" answer from Brief 12 — if anything it sharpens *why*:
+`volume_score`'s real ceiling (driven by the missing-option-snapshot
+gap) is now confirmed structural and persistent across 290 combined real
+days, not a 42-day coincidence, which makes Part 2 below (closing that
+gap going forward) the more load-bearing piece of infrastructure, not
+this sample-size extension by itself.
+
+### Part 2 — Real daily NFO instrument archiving, starting today
+
+Full detail in the commit itself (`bc4b925`); summarized here with real
+verification evidence.
+
+**Real, live-confirmed limit repro** (not re-litigating the
+already-confirmed-blocked path, just the mechanism this closes going
+forward): Kite's `/instruments` endpoint returns only currently-listed
+contracts — anything past its expiry is gone. `data/instrument_archive.py::run_daily_archive`
+saves the real, raw `kite.instruments("NFO")` response, timestamped, to
+`data/private/instrument_archives/` every real day it runs with a valid
+session.
+
+**Real, direct verification**:
+
+```
+$ python main.py instruments
+Archived real NFO instruments to data\private\instrument_archives\nfo_instruments_2026-09-05.json
+
+$ python -c "... inspect the real archived file ..."
+total NFO instruments archived: 33439
+NIFTY options: 1580
+distinct expiries: 18
+nearest expiry: 2026-09-08 furthest: 2031-06-24
+```
+
+**Real scheduled-task verification** — not just the underlying script,
+the actual Windows Scheduled Task mechanism:
+
+```
+$ schtasks /Create /TN "NiftyAITrader-InstrumentArchive" /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...\scripts\archive_instruments.ps1" /SC DAILY /ST 09:00 /F
+SUCCESS: The scheduled task "NiftyAITrader-InstrumentArchive" has successfully been created.
+
+$ schtasks /Query /TN "NiftyAITrader-InstrumentArchive" /V /FO LIST
+Next Run Time: 05-09-2026 09:00:00
+Status: Ready
+Scheduled Task State: Enabled
+Schedule Type: Daily
+
+$ schtasks /Run /TN "NiftyAITrader-InstrumentArchive"
+SUCCESS: Attempted to run the scheduled task "NiftyAITrader-InstrumentArchive".
+
+$ cat data\private\instrument_archives\logs\run_2026-09-05_044228.log
+{"timestamp": "...", "level": "INFO", "event": "instrument_archive_saved path=data\\private\\instrument_archives\\nfo_instruments_2026-09-05.json"}
+Archived real NFO instruments to data\private\instrument_archives\nfo_instruments_2026-09-05.json
+```
+
+**Confirmed real and running**, via two independent real invocations
+(direct CLI, and the actual scheduler triggering the same real code
+path) — not just registered, not just written.
+
+**Real operational constraint, stated plainly** (this session's own
+experience is the proof): Kite access tokens are single-day and require
+a genuine interactive browser login each real day — this session's own
+token, generated in an earlier brief, was already expired when this one
+started, requiring today's fresh login before either Part 1 or Part 2
+could run at all. The scheduled task registered above (daily, 09:00
+local/IST) will therefore only succeed on days when a fresh login has
+already been completed *that day* — `run_daily_archive` fails closed
+(logged, not a crash, no fabricated archive) on every day it hasn't.
+This is a real, permanent limitation of daily-token-based broker
+automation, not a bug in this implementation; from today onward, every
+real day someone completes the login before 09:00, that day's real NFO
+instrument list becomes permanently available for future backtesting —
+closing the exact gap that made the original 42-day window's option data
+unrecoverable.
+
+```
+$ pytest -q
+301 passed in 54.93s
+$ ruff check .
+All checks passed!
+```
