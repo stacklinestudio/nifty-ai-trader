@@ -5502,3 +5502,258 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 21: Obsidian as a structured knowledge layer, write-only (2026-09-06)
+
+Note on numbering: the request that prompted this section was itself
+titled "Brief 20," colliding with the immutability standing-rule brief
+immediately above, which already claimed that number. Numbered 21 here
+to keep the real, sequential history unambiguous; flagged to the user
+rather than silently resolved either way.
+
+Builds on the existing `ObsidianExporter` (already writing "Trade
+Journal"/"Daily Research" entries automatically since an earlier brief).
+Reuses real data already computed elsewhere in this project throughout
+— no new analysis, no new computation beyond real, mechanical plumbing
+to expose values that already existed one call-frame away.
+
+### The one non-negotiable boundary
+
+**Obsidian remains write-only.** Proven two ways, not just asserted:
+
+1. **Structurally** — `tests/test_obsidian_write_only.py::test_no_
+   source_file_outside_the_obsidian_module_reads_anything_obsidian_or_
+   vault_related` statically scans every real `.py` file under
+   `agents/`, `execution/`, `intelligence/`, `strategy/`, `risk/`,
+   `data/`, `learning/`, `research/`, and `main.py` (excluding
+   `integrations/obsidian.py` itself, which legitimately reads real
+   `docs/*.md`/`V2_BUILD_REPORT.md` to write fresh copies *into* the
+   vault) for any line mentioning "obsidian"/"vault" that also performs
+   a read operation (`.read_text(`, `open(`, `.glob(`, etc.) — zero
+   found. A second test confirms `integrations/obsidian.py` itself never
+   reads from `self.root` (the vault) either.
+2. **Behaviorally** — `test_a_poisoned_vault_never_changes_a_real_run_
+   cycle_outcome` runs a real `run_cycle()` against a vault deliberately
+   stuffed with adversarial content (a fake "ALWAYS_REJECT_ALL_TRADES"
+   risk-config note, a fake "FORCE REJECT" research note) and asserts
+   the result is identical — same consensus, same risk_approved, same
+   thesis fields, same validator reasons — to the exact same cycle with
+   no vault configured at all. Not "doesn't crash": bit-for-bit the same
+   real decision.
+
+**If a future brief ever proposes an agent reading from this knowledge
+base, that is a new, separate architectural decision requiring its own
+explicit safety review** — it must never bypass
+`learning/promotion_engine.py`'s validated-experiment gate the way a raw
+"lessons learned" note read directly into a live decision would.
+
+### Part A — real folder structure
+
+```
+NIFTY AI Trader/
+  01-Market-Knowledge/            real Regime enum + setup-type frozensets, read live from code
+    00-System/                    real docs/*.md, copied fresh on every sync (Part C)
+  03-Risk/                        real, current Settings values, read live
+  04-Data/                        real Brief 16/18/19 status, passed in by the caller
+  05-Research/                    real Brief 12/14/15 sections, copied verbatim from V2_BUILD_REPORT.md
+  06-Trades/YYYY/YYYY-MM-DD/      real per-trade records (reorganized from the old flat "Trade Journal/")
+  07-Learning/                    real pattern_memory stats, or an honest "no real data yet" placeholder
+  08-Reports/                     real daily summaries (reorganized from the old flat "Daily Research/")
+```
+
+No `02-`/other numbered folders were invented to fill gaps in the
+sequence — only real, populated sections exist. `sync_obsidian_
+knowledge_layer` (new, `main.py`) runs every Part A/C export in one
+call; wired into both the real daily scheduled path (`run_scheduled_
+day`) and the manual `export-obsidian` CLI command, so none of it can
+silently go stale between real runs.
+
+Real, live demonstration (fresh temp vault, real code, real Settings):
+
+```
+$ python -c "... sync_obsidian_knowledge_layer(settings) ..."
+01-Market-Knowledge\00-System\AGENTS.md
+01-Market-Knowledge\00-System\AI_SYSTEM.md
+01-Market-Knowledge\00-System\ARCHITECTURE.md
+01-Market-Knowledge\00-System\DATA_SOURCES.md
+01-Market-Knowledge\00-System\LEARNING.md
+01-Market-Knowledge\00-System\LIMITATIONS.md
+01-Market-Knowledge\00-System\NOTIFICATIONS.md
+01-Market-Knowledge\00-System\OBSIDIAN.md
+01-Market-Knowledge\00-System\SECURITY.md
+01-Market-Knowledge\00-System\TRADING_WORKFLOW.md
+01-Market-Knowledge\Regime and Setup Vocabulary.md
+03-Risk\Current Risk Configuration.md
+04-Data\Data Quality Status.md
+05-Research\Score Attribution and EV Findings.md
+07-Learning\Pattern Memory.md
+```
+
+`06-Trades/`/`08-Reports/` correctly don't appear — nothing had run
+that would populate them in this demonstration (no trade closed, no
+daily cycle completed). The real `04-Data` note's content, produced
+by actually running Brief 18's `validate_archive` against whichever
+real archive file is newest on disk:
+
+```
+# Data Quality Status
+...
+## Instrument archive (Brief 18 content validation)
+
+- **status**: INVALID
+- **detail**: nfo_instruments_2026-09-05.json: 33439 real records, 1580 real NIFTY options -- archived date 2026-09-05 is not a real NSE trading day
+
+## Missing-archive gap check (Brief 16)
+
+- **status**: GAP: missing archive for 2026-09-04
+```
+
+Real, honest, and consistent with Brief 16/18's own findings — the
+project's one real archived file really is dated a real Saturday, and
+really is missing a real prior trading day's archive. Not a new bug,
+the real status surfacing correctly.
+
+The real `07-Learning` note, with zero real trades in this fresh
+temp database:
+
+```
+# Pattern Memory
+
+No real data yet. Zero real trades have been closed by this project as
+of this export -- learning/pattern_memory.py::stats_for activates
+automatically once real trades accumulate, with no further code changes
+needed.
+```
+
+### Part B — real per-trade/per-candidate decision records
+
+`agents/orchestrator.py::CycleResult` gained a `score_attribution`
+field (the exact same dict already persisted via `database.save_
+signal`, just also exposed on the return value); `execution/position_
+supervisor.py::PositionState` gained `entry_score_attribution`/`entry_
+validation_reasons`, populated in `open_position()` from `cycle.score_
+attribution`/`cycle.validation.reasons` — both already computed within
+the very same `run_cycle()` call, never a new cross-table timestamp
+join invented to approximate them. `execution/position_persistence.py`
+updated to round-trip both through crash recovery, with a safe
+`.get()` default for a position persisted before this brief.
+
+New `integrations/obsidian.py::render_decision_note(attribution, *,
+validation_reasons=(), outcome=None, ev_estimate=None) -> str` — one
+pure formatter, used both for a real closed trade (`outcome` present)
+and a retroactive research candidate (`outcome` absent). The live
+Trade Journal export (`agents/orchestrator.py::_close_position`) now
+uses it, writing to the reorganized `06-Trades/{year}/{date}/` path.
+
+**No-drift tests** (`tests/test_obsidian_structure.py`): `test_render_
+decision_note_matches_the_real_attribution_exactly_no_drift` asserts
+every one of the 7 real score components appears verbatim in the
+rendered note; `test_render_decision_note_matches_the_real_ev_
+decomposition_exactly_no_drift` does the same against a real `EVEstimate.
+decomposition()` call (the exact same computation `render_decision_
+note` itself invokes, not a separately-constructed expectation that
+could quietly diverge — an earlier version of this test manually built
+an inconsistent `EVDecomposition` and caught nothing real; fixed to
+derive the expectation from the same real method under test).
+
+**Real, live, end-to-end demonstration** — regenerated real candidates
+from the 42-day window (`reports/score_diagnostic.py::generate_report`,
+the same real pipeline Briefs 12-15 already used), computed a real EV
+estimate for the first real candidate, and rendered/wrote a real note:
+
+```
+$ python -c "... generate_report(...); compute_ev(...); export_markdown(...) ..."
+real candidates: 1756
+real ev_source for this candidate: COUNTERFACTUAL_PROXY
+written to: ...\05-Research\Candidates\2026-07-07T09-20-00+05-30.md
+```
+
+Real written content (verbatim):
+
+```markdown
+# OPENING_RANGE_BREAKOUT / CALL — 2026-07-07T09:20:00+05:30
+
+**Regime**: TREND_UP
+**Confidence**: 46.249903160852284 (threshold 75.0, cleared: False)
+
+## Score attribution (7 components, real)
+
+- **technical_score**: 75.0
+- **opening_score**: 50.0
+- **volume_score**: 0.0 (index_candle_volume(no_prior_option_snapshot))
+- **option_score**: 0.0 (No prior snapshot to compare OI change against.)
+- **global_score**: -0.0019367829543859693 (direction: BEARISH)
+- **news_score**: 0.0 (direction: UNKNOWN)
+- **risk_penalty**: 0.0
+
+**Setup evidence**: opening range 24430.65-24488.45, ORB read=NO_TRADE
+
+**Real data completeness**: 57.14285714285714% (...)
+
+## Real Expected Value (measurement only -- see research/expected_value.py)
+
+- **ev_source**: COUNTERFACTUAL_PROXY
+- **sample_size**: 62
+- **win_rate**: 0.22580645161290322
+- **ev_r**: -0.5559335769844086
+- **win_contribution**: +0.339R
+- **loss_contribution**: -0.774R
+- **costs**: -0.110R
+- **slippage**: -0.011R
+- **dominant_driver**: loss_contribution
+```
+
+A full retroactive backfill of all 1,756/3,464 historical candidates
+was **not** attempted here — the brief asks for the mechanism, real and
+tested, demonstrated on real data; bulk-exporting the entire historical
+set is a separate, larger job this brief does not scope into.
+
+### Part C — real system/architecture docs sync
+
+`ObsidianExporter.sync_system_docs(docs_dir=Path("docs"))` **copies**
+(not references) every real `docs/*.md` file into `01-Market-Knowledge/
+00-System/`, fresh on every call — chosen over a filesystem reference
+because an Obsidian vault is commonly kept in a directory entirely
+separate from this git repo, where a reference wouldn't resolve, and
+Obsidian's own linking only works within the vault. "Kept in sync
+automatically" is satisfied by wiring the sync into the same daily/
+manual `sync_obsidian_knowledge_layer` call every other Part A section
+already runs through, not a separate, easy-to-forget step —
+`test_sync_system_docs_copies_real_current_content_and_stays_fresh`
+proves a changed real source file is reflected on the very next sync.
+
+### Tests
+
+```
+$ python -m pytest tests/test_obsidian_write_only.py tests/test_obsidian_structure.py tests/test_obsidian_wiring.py -v
+test_no_source_file_outside_the_obsidian_module_reads_anything_obsidian_or_vault_related PASSED
+test_obsidian_module_itself_never_reads_from_its_own_vault_root PASSED
+test_a_poisoned_vault_never_changes_a_real_run_cycle_outcome PASSED
+test_orchestrator_constructor_never_reads_the_vault_even_when_it_exists PASSED
+test_export_market_knowledge_reflects_the_real_current_code PASSED
+test_export_risk_config_reflects_real_live_settings_not_a_hardcoded_copy PASSED
+test_export_learning_with_zero_real_trades_writes_an_honest_placeholder_never_fabricated PASSED
+test_export_learning_with_real_trades_shows_real_pattern_memory_stats PASSED
+test_sync_system_docs_copies_real_current_content_and_stays_fresh PASSED
+test_sync_system_docs_targets_the_real_documented_subfolder PASSED
+test_export_research_summary_copies_the_real_v2_build_report_verbatim PASSED
+test_export_research_summary_is_honest_when_the_report_is_missing PASSED
+test_export_data_quality_renders_exactly_the_real_inputs_given PASSED
+test_render_decision_note_matches_the_real_attribution_exactly_no_drift PASSED
+test_render_decision_note_includes_the_real_outcome_when_present PASSED
+test_render_decision_note_omits_outcome_section_for_a_candidate_that_never_traded PASSED
+test_render_decision_note_matches_the_real_ev_decomposition_exactly_no_drift PASSED
+test_render_market_knowledge_and_render_risk_config_and_render_data_quality_are_pure_and_deterministic PASSED
+test_a_real_trade_close_writes_a_real_trade_journal_entry PASSED
+test_a_completed_day_writes_a_real_daily_research_entry PASSED
+test_no_vault_configured_is_fail_closed_not_a_crash PASSED
+test_a_real_vault_write_failure_does_not_break_the_trading_loop PASSED
+22 passed
+```
+
+```
+$ pytest -q
+375 passed in 87.68s
+$ ruff check .
+All checks passed!
+```

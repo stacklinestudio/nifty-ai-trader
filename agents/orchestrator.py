@@ -38,7 +38,7 @@ from execution.position_persistence import position_state_from_dict, position_st
 from execution.position_supervisor import PositionState, TickResult
 from execution.position_supervisor import tick as supervise_tick
 from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
-from integrations.obsidian import ObsidianExporter
+from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.logger import configure_logger
@@ -67,6 +67,12 @@ class CycleResult:
     validation: Validation
     risk_approved: bool
     order: dict[str, Any] | None
+    # Brief 20 (Obsidian knowledge layer): the same real score_attribution
+    # dict already persisted via database.save_signal below -- exposed here
+    # too so open_position can carry it into PositionState without a
+    # separate DB read/join. None whenever supplied_context never went
+    # through the live-context pipeline (see the save_signal guard above).
+    score_attribution: dict[str, Any] | None = None
 
 
 @dataclass
@@ -309,6 +315,7 @@ class Orchestrator:
             state.validation,
             state.risk_approved,
             state.order,
+            attribution,
         )
 
     def _on_research_complete(self, event: Event) -> None:
@@ -466,6 +473,8 @@ class Orchestrator:
             cycle.consensus,
             self._agent_directions(cycle.agent_results),
             cycle.order["order_id"],
+            cycle.score_attribution,
+            cycle.validation.reasons,
         )
         self.database.save_open_position(
             state.entry_order_id, state.opened_at.isoformat(), position_state_to_dict(state)
@@ -623,32 +632,44 @@ class Orchestrator:
         # Real per-trade journal entry, written as the day happens -- was
         # previously only reachable via the standalone `export-obsidian`
         # CLI command (a single placeholder "Daily Research" note on
-        # manual request), never during a normal live day.
-        # ObsidianExporter.export() already fails closed on OSError
-        # internally (returns None, no vault configured or a real write
-        # failure); this broader except also catches anything else a bad
-        # `facts` value could raise, matching the same non-fatal
-        # try/except pattern Discord/Telegram already use in _event() --
-        # a vault write failure must never break the trading loop.
+        # manual request), never during a normal live day. Brief 20:
+        # reorganized into 06-Trades/YYYY/YYYY-MM-DD/, and enriched with
+        # the real score_attribution 7-component breakdown and real
+        # validator reasoning carried on `state` since open_position()
+        # (see PositionState.entry_score_attribution/entry_validation_
+        # reasons) -- falls back to a minimal real attribution dict for a
+        # cycle that never went through the live-context pipeline (most
+        # tests' hand-built contexts), never a fabricated one.
+        # ObsidianExporter.export_markdown() already fails closed on
+        # OSError internally (returns None, no vault configured or a real
+        # write failure); this broader except also catches anything else
+        # a bad value could raise, matching the same non-fatal try/except
+        # pattern Discord/Telegram already use in _event() -- a vault
+        # write failure must never break the trading loop.
         try:
-            self.obsidian.export(
-                "Trade Journal",
-                f"{now.date().isoformat()}-{state.thesis.symbol}-{order['order_id']}",
-                {
-                    "symbol": state.thesis.symbol,
-                    "direction": state.thesis.candidate.direction,
-                    "setup_type": state.thesis.candidate.setup_type,
-                    "entry": state.thesis.entry,
-                    "exit": order["fill_price"],
-                    "quantity": state.thesis.quantity,
-                    "pnl": pnl,
-                    "exit_reason": result.reason,
-                    "mae": state.mae,
-                    "mfe": state.mfe,
-                    "hold_seconds": hold_seconds,
-                    "entry_regime": state.entry_regime,
-                    "confidence": state.thesis.confidence,
-                },
+            attribution = state.entry_score_attribution or {
+                "setup_type": state.thesis.candidate.setup_type,
+                "direction": state.thesis.candidate.direction,
+                "regime": state.entry_regime,
+                "confidence": state.thesis.confidence,
+                "now": now.isoformat(),
+            }
+            outcome = {
+                "symbol": state.thesis.symbol,
+                "entry": state.thesis.entry,
+                "exit": order["fill_price"],
+                "quantity": state.thesis.quantity,
+                "pnl": pnl,
+                "exit_reason": result.reason,
+                "mae": state.mae,
+                "mfe": state.mfe,
+                "hold_seconds": hold_seconds,
+                "stop_was_trailed": state.current_stop != state.thesis.stop,
+            }
+            self.obsidian.export_markdown(
+                f"06-Trades/{now.year}/{now.date().isoformat()}",
+                f"{state.thesis.symbol}-{order['order_id']}",
+                render_decision_note(attribution, validation_reasons=state.entry_validation_reasons, outcome=outcome),
             )
         except Exception as exc:  # noqa: BLE001 - a vault write failure must never break the trading loop.
             logger.warning("obsidian_trade_journal_export_failed order_id=%s error=%s", order["order_id"], exc)

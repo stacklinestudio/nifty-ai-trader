@@ -56,7 +56,7 @@ def test_a_real_trade_close_writes_a_real_trade_journal_entry(tmp_path):
     result = orchestrator.supervise_once(state, 20.0, now)  # comfortably past target -- real TAKE_PROFIT
     assert result.should_exit and result.reason == "TAKE_PROFIT"
 
-    journal_dir = vault / "NIFTY AI Trader" / "Trade Journal"
+    journal_dir = vault / "NIFTY AI Trader" / "06-Trades" / str(now.year) / now.date().isoformat()
     assert journal_dir.exists()
     files = list(journal_dir.glob("*.md"))
     assert len(files) == 1
@@ -89,7 +89,7 @@ def test_a_completed_day_writes_a_real_daily_research_entry(tmp_path, monkeypatc
     result = main.run_scheduled_day(settings)
 
     assert result["day_ran"] is True
-    research_dir = vault / "NIFTY AI Trader" / "Daily Research"
+    research_dir = vault / "NIFTY AI Trader" / "08-Reports"
     assert research_dir.exists()
     files = list(research_dir.glob("*.md"))
     assert len(files) == 1

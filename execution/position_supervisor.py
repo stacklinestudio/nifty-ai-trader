@@ -44,6 +44,14 @@ class PositionState:
     entry_consensus: str | None = None
     entry_agent_directions: dict[str, str] | None = None
     entry_order_id: str | None = None
+    # Brief 20 (Obsidian knowledge layer): the real score_attribution dict
+    # and real validator reasoning from the exact same run_cycle() call
+    # that produced this trade -- carried through unmodified so a later
+    # Trade Journal export can present them without a fuzzy, separately-
+    # computed timestamp join against the signals/audit_events tables.
+    # Not used by any decision logic; purely for later real reporting.
+    entry_score_attribution: dict[str, Any] | None = None
+    entry_validation_reasons: tuple[str, ...] = ()
 
     @classmethod
     def opening(
@@ -55,11 +63,13 @@ class PositionState:
         entry_consensus: str | None = None,
         entry_agent_directions: dict[str, str] | None = None,
         entry_order_id: str | None = None,
+        entry_score_attribution: dict[str, Any] | None = None,
+        entry_validation_reasons: tuple[str, ...] = (),
     ) -> PositionState:
         return cls(
             thesis, opened_at, thesis.stop, thesis.entry, opened_at, 0.0, 0.0,
             entry_regime, entry_volatility_regime, entry_consensus, entry_agent_directions,
-            entry_order_id,
+            entry_order_id, entry_score_attribution, entry_validation_reasons,
         )
 
     def observe(self, ltp: float, now: datetime, trail_pct: float) -> None:

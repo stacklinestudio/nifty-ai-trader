@@ -82,6 +82,8 @@ def position_state_to_dict(state: PositionState) -> dict[str, Any]:
         "entry_consensus": state.entry_consensus,
         "entry_agent_directions": state.entry_agent_directions,
         "entry_order_id": state.entry_order_id,
+        "entry_score_attribution": state.entry_score_attribution,
+        "entry_validation_reasons": list(state.entry_validation_reasons),
     }
 
 
@@ -99,4 +101,9 @@ def position_state_from_dict(data: dict[str, Any]) -> PositionState:
         data["entry_consensus"],
         data["entry_agent_directions"],
         data["entry_order_id"],
+        # .get() with a real, honest default: a position persisted before
+        # Brief 20 added these two fields has neither in its stored JSON --
+        # crash recovery must not fail on an older real record.
+        data.get("entry_score_attribution"),
+        tuple(data.get("entry_validation_reasons", ())),
     )

@@ -113,6 +113,94 @@ def build_live_quote_source(settings: Settings, symbol: str, kite: object | None
     return live_quote
 
 
+def _render_daily_report(day: datetime.date, summary: dict) -> str:
+    """Part A's 08-Reports: the same real summary dict run_scheduled_day
+    has always produced, now rendered as a readable note instead of a
+    flat bullet dump."""
+    lines = [f"# Daily Report — {day.isoformat()}", ""]
+    lines += [f"- **{key}**: {value}" for key, value in summary.items()]
+    return "\n".join(lines) + "\n"
+
+
+def sync_obsidian_knowledge_layer(settings: Settings) -> None:
+    """Brief 20 Parts A/C: keeps the vault's structural sections (real
+    regime/setup vocabulary, real current risk config, real data-quality
+    status, real research findings, real pattern-memory stats, and a
+    fresh copy of docs/*.md) up to date. Called from the real daily
+    scheduled path (above) so none of this can silently go stale, and
+    from `main.py export-obsidian` for a manual/on-demand refresh. Fails
+    closed exactly like every other Obsidian export -- a vault write
+    failure here must never break the trading loop or the CLI command.
+    """
+    exporter = ObsidianExporter(settings.obsidian_vault_path)
+    exporter.export_market_knowledge()
+    exporter.export_risk_config(settings)
+    archive_status, archive_detail = _real_archive_status()
+    exporter.export_data_quality(
+        archive_status,
+        archive_detail,
+        _real_gap_check_status(),
+        [
+            (
+                "REST kite.quote() and KiteTicker (MODE_FULL) never carry tradingsymbol, "
+                "expiry, strike, option_type, or the underlying NIFTY price inline -- both "
+                "require a separate join/subscription (confirmed live, 2026-09-06)."
+            ),
+            (
+                "KiteTicker MODE_QUOTE/MODE_LTP omit market depth entirely; MODE_FULL is "
+                "required for real depth/OI capture (confirmed from the installed "
+                "kiteconnect library's own real parsing source)."
+            ),
+            (
+                "Real bid/ask is 5-level market depth (depth.buy/depth.sell, each with "
+                "price+quantity+orders), not a flat bid/ask pair."
+            ),
+            (
+                "Live tick frequency, live bid/ask movement, and real-time OI update "
+                "cadence remain unverified as of Brief 19 -- structure confirmed only, "
+                "pending the next real trading session."
+            ),
+        ],
+    )
+    exporter.export_research_summary()
+    exporter.export_learning(MemoryStore(settings.database_path))
+    exporter.sync_system_docs()
+
+
+def _real_archive_status() -> tuple[str, str]:
+    """Runs Brief 18's real validate_archive against whichever real
+    instrument-archive file is most recently dated on disk -- never a
+    cached or assumed status."""
+    from data.calendar import NseCalendar as _NseCalendar
+    from data.instrument_archive import (
+        ARCHIVE_DIR,
+        recent_validated_nifty_option_counts,
+        validate_archive,
+    )
+
+    files = sorted(ARCHIVE_DIR.glob("nfo_instruments_*.json"))
+    if not files:
+        return "NO_ARCHIVE", "No real instrument archive file exists yet."
+    latest = files[-1]
+    day = datetime.date.fromisoformat(latest.stem.removeprefix("nfo_instruments_"))
+    result = validate_archive(latest, day, _NseCalendar(), recent_validated_nifty_option_counts(ARCHIVE_DIR))
+    status = "VALID" if result.valid else "INVALID"
+    detail = (
+        f"{latest.name}: {result.total_record_count} real records, "
+        f"{result.nifty_option_count} real NIFTY options"
+        + (f" -- {result.reason}" if result.reason else "")
+    )
+    return status, detail
+
+
+def _real_gap_check_status() -> str:
+    from data.calendar import NseCalendar as _NseCalendar
+    from data.instrument_archive import ARCHIVE_DIR, find_missing_previous_archive
+
+    missing = find_missing_previous_archive(ARCHIVE_DIR, _NseCalendar(), datetime.datetime.now(IST).date())
+    return f"GAP: missing archive for {missing.isoformat()}" if missing else "NO_GAP"
+
+
 def run_scheduled_day(settings: Settings) -> dict:
     """Entry point for unattended daily operation (Brief 3, Part A1).
 
@@ -255,9 +343,10 @@ def run_scheduled_day(settings: Settings) -> dict:
     # write failure must never prevent this function from returning its
     # real result.
     try:
-        ObsidianExporter(settings.obsidian_vault_path).export(
-            "Daily Research", clock().date().isoformat(), summary
+        ObsidianExporter(settings.obsidian_vault_path).export_markdown(
+            "08-Reports", clock().date().isoformat(), _render_daily_report(clock().date(), summary)
         )
+        sync_obsidian_knowledge_layer(settings)
     except Exception as exc:  # noqa: BLE001 - a vault write failure must never break the trading loop.
         logger.warning("obsidian_daily_research_export_failed error=%s", exc)
     return summary
@@ -349,12 +438,22 @@ def main() -> int:
         )
         return 0
     if args.command == "export-obsidian":
-        path = ObsidianExporter(settings.obsidian_vault_path).export(
-            "Daily Research",
+        # Brief 20: manual/on-demand trigger for the full real structural
+        # export (market knowledge, current risk config, real data-
+        # quality status, real research findings, real pattern-memory
+        # stats, a fresh docs/ sync) -- the same real sync the daily
+        # scheduled path already runs automatically.
+        exporter = ObsidianExporter(settings.obsidian_vault_path)
+        if exporter.root is None:
+            print("Obsidian vault not configured or unavailable.")
+            return 0
+        report_path = exporter.export_markdown(
+            "08-Reports",
             datetime.datetime.now(IST).date().isoformat(),
-            {"mode": "paper", "note": "No fabricated market data."},
+            "# Daily Report\n\n- **mode**: paper\n- **note**: No fabricated market data.\n",
         )
-        print(path or "Obsidian vault not configured or unavailable.")
+        sync_obsidian_knowledge_layer(settings)
+        print(report_path)
         return 0
     if args.command == "run":
         lock = ProcessLock(Path(f"{settings.database_path}.lock"))
