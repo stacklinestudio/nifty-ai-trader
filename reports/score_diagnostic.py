@@ -32,7 +32,11 @@ from execution.live_context import (
     assemble_context,
 )
 from intelligence.technicals import feature_frame
-from research.counterfactual import COUNTERFACTUAL_LABEL, evaluate_counterfactual
+from research.counterfactual import (
+    COUNTERFACTUAL_LABEL,
+    CounterfactualRecord,
+    evaluate_counterfactual,
+)
 
 # This project's own, already-established real per-component ceilings
 # (V2_BUILD_REPORT.md's "the real ceiling isn't one number" analysis) --
@@ -91,6 +95,13 @@ class DiagnosticReport:
     median_data_completeness: float = 0.0
     data_completeness_distinct_values: Counter[float] = field(default_factory=Counter)
     confidence_completeness_correlation: float | None = None
+    # Brief 14: the raw real records (see counterfactual_records above).
+    counterfactual_records: list[CounterfactualRecord] = field(default_factory=list)
+    # Brief 14: the raw real per-candidate score_attribution dicts (see
+    # execution/live_context.py) -- so a caller can correlate EV against
+    # real confidence, setup_type, or regime without a second, duplicate
+    # replay pass over the same real data.
+    attributions: list[dict] = field(default_factory=list)
     counterfactual_label: str = COUNTERFACTUAL_LABEL
 
     def summary_lines(self) -> list[str]:
@@ -190,6 +201,11 @@ def generate_report(
     counterfactual_profitable = 0
     counterfactual_not_profitable = 0
     counterfactual_no_data = 0
+    # Brief 14: the raw real records, not just the tally -- so
+    # research/expected_value.py can key its tier-2 estimate by real
+    # (setup_type, regime) without a second, duplicate replay pass over
+    # the same real data.
+    counterfactual_records: list = []
 
     for trading_day in trading_days:
         todays_all = candles[candles.index.date == trading_day]
@@ -242,13 +258,16 @@ def generate_report(
                     todays,
                     remaining,
                     features,
+                    regime=attribution["regime"],
                 )
                 if record is None:
                     counterfactual_no_data += 1
                 elif record.profitable:
                     counterfactual_profitable += 1
+                    counterfactual_records.append(record)
                 else:
                     counterfactual_not_profitable += 1
+                    counterfactual_records.append(record)
 
     scores = [a["confidence"] for a in attributions]
     bucket_counts: dict[str, int] = {b: 0 for b in ("<40", "40-49", "50-59", "60-69", "70-79", "80+")}
@@ -295,4 +314,6 @@ def generate_report(
         median_data_completeness=float(completeness_series.median()),
         data_completeness_distinct_values=completeness_distinct,
         confidence_completeness_correlation=correlation,
+        counterfactual_records=counterfactual_records,
+        attributions=attributions,
     )

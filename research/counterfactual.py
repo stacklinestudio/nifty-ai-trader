@@ -47,6 +47,12 @@ class CounterfactualRecord:
     exit_reason: str  # TAKE_PROFIT | STOP_LOSS | SESSION_END
     exit_time: datetime
     profitable: bool
+    # Brief 14: real regime this candidate structurally fired in --
+    # needed so research/expected_value.py can key its tier-2 estimate by
+    # the same real (setup_type, regime) granularity
+    # learning/pattern_memory.py::stats_for already uses for tier 1, so
+    # the two tiers can cleanly fall through to each other.
+    regime: str = ""
 
     @property
     def label(self) -> str:
@@ -69,12 +75,13 @@ class CounterfactualRecord:
             "exit_reason": self.exit_reason,
             "exit_time": self.exit_time.isoformat(),
             "profitable": self.profitable,
+            "regime": self.regime,
         }
 
     def describe(self) -> str:
         verdict = "PROFITABLE" if self.profitable else "NOT PROFITABLE"
         return (
-            f"[{self.label}] {self.setup_type} {self.direction} rejected "
+            f"[{self.label}] {self.setup_type}/{self.regime} {self.direction} rejected "
             f"({self.rejection_reason}) at {self.timestamp.isoformat()} -- "
             f"entry={self.entry:.2f} stop={self.stop:.2f} target={self.target:.2f} "
             f"-> {self.exit_reason} at {self.exit_price:.2f} ({verdict}, index-proxy only)"
@@ -134,6 +141,7 @@ def evaluate_counterfactual(
     todays: pd.DataFrame,
     remaining_today: pd.DataFrame,
     features: dict[str, float],
+    regime: str = "",
 ) -> CounterfactualRecord | None:
     """Real entry/stop/target from the same real zone logic, walked
     forward against REAL subsequent same-day index candles only -- no
@@ -172,4 +180,5 @@ def evaluate_counterfactual(
         exit_reason=exit_reason,
         exit_time=exit_time.to_pydatetime() if hasattr(exit_time, "to_pydatetime") else exit_time,
         profitable=profitable,
+        regime=regime,
     )
