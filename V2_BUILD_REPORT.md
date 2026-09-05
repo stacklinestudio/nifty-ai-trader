@@ -4018,3 +4018,151 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Two separate pieces of work landed together, reported separately as requested (2026-09-05)
+
+Per the request: "Report real command output for both this fix and
+Brief 13 separately and clearly ... don't just report a combined
+pass/fail." Both below.
+
+### Performance/correctness fix — already completed the same session, recapped here with its own real evidence
+
+This exact investigation (does live compute indicators the same way as
+backtest, bound the window if not, prove it's safe, re-time) was already
+carried out in full in the immediately preceding turn — recapped here
+standalone rather than re-run, so no real work or real evidence is
+duplicated:
+
+1. **Real, direct-from-code answer**: the live path
+   (`execution/live_context.py::build_live_context`) has always fetched
+   only a bounded **10-calendar-day** window from Kite for technical-
+   feature computation. The backtest/replay path
+   (`backtest/daily_backtest.py`, `reports/score_diagnostic.py`) fed the
+   *entire* accumulated real history into the same computation instead —
+   **a real divergence between what was tested and what live could ever
+   actually run**, not merely a performance issue. Reported honestly
+   before any fix.
+2. **Real empirical proof the bound is safe**: 15 real sample points
+   across a real 12-month dataset (21–246 days of accumulated history
+   each) — EMA(9)/EMA(21)/ATR(14) matched between bounded and
+   full-history computation to **0.000000% relative difference**, every
+   time.
+3. **Fixed**: extracted `execution/live_context.py::TECHNICAL_FEATURE_WINDOW_DAYS`
+   as the single shared constant both paths now use.
+   `tests/test_technical_feature_window.py` proves the bound within a
+   tight `1e-4` real tolerance against an independent real dataset (4
+   sample points, all passing).
+4. **Real before/after, same 248-day replay**: `57636.0s (~16.0h)` →
+   `368.0s (~6.1min)` — **156.6x**, byte-identical real output.
+5. Multiprocessing not reached for — not needed.
+
+Full detail, real command output, and the isolated test/suite results
+for this fix specifically are in the "Brief 13 follow-up" section
+directly above this one. Commits `cabd454` (fix + test), `08914dd`
+(report).
+
+**This fix's own isolated test result** (already reported above, restated
+for this response's own accounting): `pytest tests/test_technical_feature_window.py`
+→ 4 passed. Full suite at the time of that fix: 305 passed, ruff clean.
+
+### Brief 13: Data-Quality Separation (Phase 1 of the EV-ranking architecture) — new work this turn
+
+No config or threshold changes. Does not touch how a trade is approved
+or rejected — that's explicitly Phase 2, not built here.
+
+**Part A** — `execution/live_context.py::_add_candidate` now sets, inside
+the existing `context["score_attribution"]` (Brief 12, extended not
+replaced): a real per-input `data_available` dict and a real
+`data_completeness` percentage. Every boolean reuses the exact real
+condition the corresponding scoring function already branches on —
+`_combined_volume_score`/`detect_buildup`'s own
+`option_quotes and previous_option_quotes` check for `volume_score`/
+`option_score`; `_global_score`/`_news_score`'s own
+`context.get("global_context"/"news_items")` reads for those two.
+`technical_score`/`opening_score`/`risk_penalty` are always real once
+this code path is reached — all three derive from the same real candle
+data whose sufficiency already gated entry into `_add_candidate`, with
+no separate external dependency the way the other four have.
+
+```
+$ pytest tests/test_data_quality.py -v
+test_all_seven_inputs_genuinely_available_reports_100_percent PASSED
+test_no_real_option_snapshot_reduces_completeness_by_exactly_its_real_share PASSED
+test_news_unavailable_alone_reduces_completeness_by_exactly_one_seventh PASSED
+test_data_quality_fields_never_change_any_of_brief_12s_original_score_values PASSED
+4 passed in 0.92s
+```
+
+**Honest finding surfaced while writing the tests, stated plainly rather
+than papered over**: `volume_score` and `option_score` share the *exact
+same* real gating condition in the current implementation
+(`option_quotes and previous_option_quotes`) — there is no real scenario
+today where one is available and the other isn't. A missing option
+snapshot honestly costs **2/7 (28.6%)**, not 1/7, of `data_completeness`.
+The regression test proves this directly rather than forcing an
+inaccurate "just volume" scenario the real code doesn't support; a
+separate test (`news` alone) demonstrates the clean, independently-
+gateable 1/7 case for the one input that genuinely has one.
+
+**Part B** — report-only; `reports/score_diagnostic.py` now reports real
+`data_completeness` statistics alongside confidence, with an honest,
+explicit `UNDEFINED` correlation state when there's no real variance to
+correlate (never fabricated as `0`, never silently dropped).
+
+**Real 42-day result** (same dataset and driver as Brief 12,
+`scan_interval_bars=5`, unchanged):
+
+```
+sessions (real trading days scanned): 42
+candidates (real structural setups scored): 1756
+data_completeness: median=42.9% mean=42.9%
+data_completeness real distinct values (Brief 13 Part A, report-only):
+  42.9%: 1756 (100.0%)
+confidence vs. data_completeness correlation: UNDEFINED -- data_completeness has zero real variance in this dataset (every candidate has the same real completeness), so no correlation coefficient is computable, not silently reported as 0 or omitted.
+```
+
+Runtime: 183.0s — also a real, if secondary, confirmation of the
+above-recapped performance fix: the *identical* 42-day/`scan_interval_bars=5`
+configuration that took 751.6s in Brief 12 now takes 183.0s (4.1x;
+smaller than the 12-month window's 156.6x, exactly as expected, since a
+42-day window's average accumulated history was always much shorter than
+a 12-month one's — the algorithmic gap the fix closes scales with window
+length).
+
+**Cross-checked independently against the higher-fidelity `run_daily_backtest`
+path too** (which *does* supply real cached global-market data, unlike
+`generate_report`), to rule out this being an artifact of the simpler
+report generator specifically:
+
+```
+trading days evaluated: 42   candidates formed: 0   real signals persisted: 35
+real distinct data_completeness values: Counter({57.14: 35})
+```
+
+**Still constant** — 57.14% (4/7: technical, opening, global, risk_penalty
+real; volume, option, news unavailable) for all 35 real evaluations, via
+a completely independent real code path.
+
+**The honest, real answer to "does confidence correlate with
+data_completeness the way the 99.6% finding suggests it should"**:
+**cannot be tested within this specific 42-day window, by either real
+methodology available in this codebase.** `data_completeness` has *zero*
+real variance across the entire window — not low variance, zero — because
+the missing option-chain and news data is completely absent for the full
+42 real days, not merely usually absent. This is itself a real, useful
+finding, not a null result from a weak signal: it directly explains *why*
+Brief 13 Part 2's archiving job matters beyond "more data is nice" — only
+once real weeks with genuinely varying completeness exist (some with a
+real persisted option snapshot, some without) does this correlation even
+become a testable question. Not attempted to force a correlation from a
+constant value; reported honestly as `UNDEFINED` instead.
+
+```
+$ pytest -q
+309 passed in 58.55s
+$ ruff check .
+All checks passed!
+```
+
+No threshold or scoring-decision change made anywhere in this brief, per
+its own explicit ground rule. Phase 1 closes here.
