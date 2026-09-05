@@ -219,6 +219,33 @@ def find_missing_previous_archive(
     return candidate
 
 
+def real_archive_status(archive_dir: Path = ARCHIVE_DIR) -> tuple[str, str]:
+    """Runs Brief 18's real `validate_archive` against whichever real
+    instrument-archive file is most recently dated on disk -- never a
+    cached or assumed status. Shared by `main.py`'s Obsidian knowledge-
+    layer sync and Brief 23's system health gate, so both read the exact
+    same real check rather than two independently-maintained copies."""
+    files = sorted(archive_dir.glob("nfo_instruments_*.json"))
+    if not files:
+        return "NO_ARCHIVE", "No real instrument archive file exists yet."
+    latest = files[-1]
+    day = date.fromisoformat(latest.stem.removeprefix("nfo_instruments_"))
+    result = validate_archive(latest, day, NseCalendar(), recent_validated_nifty_option_counts(archive_dir))
+    status = "VALID" if result.valid else "INVALID"
+    detail = (
+        f"{latest.name}: {result.total_record_count} real records, "
+        f"{result.nifty_option_count} real NIFTY options"
+        + (f" -- {result.reason}" if result.reason else "")
+    )
+    return status, detail
+
+
+def real_gap_check_status(archive_dir: Path = ARCHIVE_DIR, today: date | None = None) -> str:
+    today = today or datetime.now(IST).date()
+    missing = find_missing_previous_archive(archive_dir, NseCalendar(), today)
+    return f"GAP: missing archive for {missing.isoformat()}" if missing else "NO_GAP"
+
+
 def notify_missing_archive(settings: Settings, missing_day: date) -> None:
     """Reuses the existing Discord "system" channel / Telegram wiring
     (integrations/discord.py, integrations/telegram.py) -- the same

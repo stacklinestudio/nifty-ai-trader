@@ -5952,3 +5952,156 @@ original live trading scheduler's own first run.** Specifically:
 Not a blocker to running Monday — but worth a human glance at the first
 real session's logs/notifications rather than assuming silence means
 success.
+
+## Brief 23: System Health Gate (2026-09-06)
+
+Aggregates real, already-built checks into one honest readiness answer.
+No new data sources, no new intelligence — every check is a real,
+deterministic threshold against a real, already-computed value from an
+earlier brief. AI never decides whether data is "good enough" here.
+
+New module: `monitoring/system_health_gate.py`. Small refactor alongside
+it: `main.py`'s private `_real_archive_status`/`_real_gap_check_status`
+helpers (added in Brief 21 for the Obsidian sync) moved to `data/
+instrument_archive.py` as public `real_archive_status`/`real_gap_check_
+status`, so both the Obsidian sync and this new gate read the exact same
+real check rather than two independently-maintained copies.
+
+### The 7 real checks
+
+1. **Kite connection** — a real, live `kite.profile()` call, not just
+   "is a token string configured." This is deliberately **stronger**
+   than `monitoring/health.py::system_health`'s own existing "kite"
+   component, which only checks `settings.kite_access_token` is
+   non-empty — a real, expired-but-still-configured token (the exact
+   situation this project hit at the start of Brief 19) would pass that
+   check and correctly fail this one.
+2. **AI provider** — reuses `system_health`'s own real check verbatim
+   (`settings.ai_provider == "unavailable"`). Deliberately a
+   configuration check, not a live API probe — a live probe would spend
+   real money/quota against an account already confirmed (Brief 8 Part
+   C) to have no credit balance.
+3. **Option tick capture** — real status read from the real segment/gap
+   files Brief 19/22 already write to disk. `CaptureSessionResult`
+   itself is never persisted anywhere (confirmed: no code writes it to a
+   file) — a real, honest finding surfaced while building this check,
+   not assumed — so this reads the real artifacts a capture session
+   leaves behind rather than inventing a new manifest. Real gaps are
+   reported for visibility, not treated as disqualifying by themselves —
+   Brief 22 built gap recording specifically so a real, honest gap is an
+   expected, handled outcome.
+4. **Instrument archive** — reuses Brief 18's real `validate_archive`
+   verbatim via the newly-shared `real_archive_status`.
+5. **Data completeness** — the real `data_completeness` field from the
+   most recently persisted real signal (`Database.recent_signals`,
+   Brief 12/13's work) — never recomputed, never guessed at.
+6. **Notifications** — reuses the exact real `send_message()` calls
+   `python main.py notifications` already makes.
+7. **Risk engine / paper broker** — confirms `RiskManager`/`PaperBroker`
+   construct cleanly from current real `Settings`, exactly as `main.py::
+   engine` already constructs them. A sanity check, not new logic.
+
+### The real, justified minimum for data completeness
+
+`MIN_DATA_COMPLETENESS_PERCENT = 3 / 7 * 100 ≈ 42.9%` — derived, not
+invented. Of `execution/live_context.py`'s real 7 score_attribution
+components: `technical_score`/`opening_score`/`risk_penalty` are always
+real (no external dependency, Brief 12/13); `volume_score`/`option_
+score` require 2 consecutive real option-chain snapshots, which needs a
+continuously-running real capture pipeline this project does not yet
+have scheduled (Brief 19/22's own finding); `global_score`/`news_score`
+are real wiring over still-empty real data, a known, documented,
+unresolved gap (Brief 5/8). Requiring more than 3/7 would report
+`BLOCKED` on data completeness every single real day for a structural
+reason distinct from an actual regression — this threshold exists to
+catch a regression *in* the guaranteed real baseline, not to enforce a
+target the system can't yet reach daily.
+
+### Tests
+
+```
+$ python -m pytest tests/test_system_health_gate.py -v
+test_check_kite_connection_fails_with_no_credentials PASSED
+test_check_kite_connection_ok_with_a_real_valid_session PASSED
+test_check_kite_connection_fails_with_a_real_expired_token PASSED
+test_check_ai_provider_fails_when_unavailable PASSED
+test_check_ai_provider_ok_when_a_real_provider_is_selected PASSED
+test_check_option_tick_capture_fails_with_no_real_segment PASSED
+test_check_option_tick_capture_ok_with_real_segments_and_reports_real_counts PASSED
+test_check_instrument_archive_ok_with_a_real_valid_archive PASSED
+test_check_instrument_archive_fails_with_no_archive PASSED
+test_check_instrument_archive_fails_with_a_real_invalid_archive PASSED
+test_check_data_completeness_fails_with_no_real_signal PASSED
+test_check_data_completeness_ok_at_or_above_the_real_minimum PASSED
+test_check_data_completeness_fails_below_the_real_minimum PASSED
+test_check_data_completeness_uses_the_most_recent_real_signal PASSED
+test_check_notifications_ok_when_at_least_one_channel_is_reachable PASSED
+test_check_notifications_fails_when_neither_channel_is_reachable PASSED
+test_check_risk_and_broker_construction_ok_with_real_settings PASSED
+test_run_system_health_gate_is_ready_when_every_real_check_passes PASSED
+test_run_system_health_gate_is_blocked_and_names_every_real_failing_reason PASSED
+test_run_system_health_gate_describe_lists_every_real_check_and_the_verdict PASSED
+test_system_health_gate_is_reporting_only_never_imported_by_agents_or_orchestrator PASSED
+21 passed in 1.35s
+```
+
+`test_run_system_health_gate_is_blocked_and_names_every_real_failing_
+reason` is the required two-simultaneous-failures test: breaks the
+option-tick-capture and instrument-archive checks independently and
+confirms `blocking_reasons` names both (`len(...) == 2`), with the other
+5 real checks still passing. `test_system_health_gate_is_reporting_
+only_never_imported_by_agents_or_orchestrator` is a real, structural
+scan (not just a claim in the docstring) confirming no file under
+`agents/`, `execution/`, `intelligence/`, `strategy/`, or `risk/`
+references this module at all — it is wired only into `main.py`'s new,
+separate `health-gate` CLI command.
+
+```
+$ pytest -q
+402 passed in 105.33s
+$ ruff check .
+All checks passed!
+```
+
+### Real command output against the current real project state
+
+```
+$ python main.py health-gate
+System Health Gate: BLOCKED
+  [OK] kite_connection: real session valid, user_id=RJJ326
+  [OK] ai_provider: provider=anthropic
+  [FAIL] option_tick_capture: no real capture segment found for 2026-09-06
+  [FAIL] instrument_archive: nfo_instruments_2026-09-05.json: 33439 real records, 1580 real NIFTY options -- archived date 2026-09-05 is not a real NSE trading day
+  [FAIL] data_completeness: no real signal recorded yet
+  [OK] notifications: telegram=reachable, discord=unreachable/not configured
+  [OK] risk_and_broker: RiskManager/PaperBroker construct cleanly from current real Settings
+BLOCKED: option_tick_capture: no real capture segment found for 2026-09-06; instrument_archive: nfo_instruments_2026-09-05.json: 33439 real records, 1580 real NIFTY options -- archived date 2026-09-05 is not a real NSE trading day; data_completeness: no real signal recorded yet
+(Reporting only -- this gate does not block main.py run in this brief.)
+```
+
+Real, honest, and consistent with every real finding already established
+in this project: no real capture has run for today, the one real archive
+file is genuinely invalid (dated a real Saturday — Brief 16/18/21's own
+finding), and no real signal has been evaluated yet today. Kite/AI/
+notifications/risk-broker all correctly report real, current health.
+(Note, transparently: this real run sent one real Telegram test message
+— `check_notifications` reuses the actual live `send_message()` call,
+exactly as instructed; this is expected, not a bug, and matches how
+`python main.py notifications` already behaves today.)
+
+### Scope, stated explicitly
+
+**This is a reporting tool, not an enforcement mechanism, in this
+brief.** `run_system_health_gate` is never called from `main.py run`,
+`Orchestrator`, or any agent — confirmed by the structural test above.
+Whether to wire it as an actual pre-flight gate that refuses to trade
+when `BLOCKED` is a separate, future decision, made once the report has
+been observed across a few real days.
+
+**Explicitly out of scope for this brief, deferred pending real evidence
+and further discussion, not silently dropped**: decision ledger with
+unique candidate IDs, market-state snapshot formalization, artifact-
+typed agents, the experiment laboratory, multi-model AI diversity, and
+Obsidian wiki-link graph connections. Each is a real, worthwhile idea;
+none is what's currently blocking anything, per the source document's
+own stated priority ranking.

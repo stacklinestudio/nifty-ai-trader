@@ -28,7 +28,7 @@ from config import IST, Settings
 from data.calendar import NseCalendar
 from data.global_market import YFinanceGlobalMarketProvider
 from data.historical import validate_candles
-from data.instrument_archive import run_daily_archive
+from data.instrument_archive import real_archive_status, real_gap_check_status, run_daily_archive
 from data.market_data import KiteMarketData, validate_quote
 from data.rss_news import fetch_recent_news
 from demo.demo_trade import run_demo_trade
@@ -41,6 +41,7 @@ from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
 from monitoring.health import check_health, system_health
 from monitoring.logger import configure_logger
+from monitoring.system_health_gate import run_system_health_gate
 from risk.risk_manager import RiskManager
 from storage.database import Database
 
@@ -135,11 +136,11 @@ def sync_obsidian_knowledge_layer(settings: Settings) -> None:
     exporter = ObsidianExporter(settings.obsidian_vault_path)
     exporter.export_market_knowledge()
     exporter.export_risk_config(settings)
-    archive_status, archive_detail = _real_archive_status()
+    archive_status, archive_detail = real_archive_status()
     exporter.export_data_quality(
         archive_status,
         archive_detail,
-        _real_gap_check_status(),
+        real_gap_check_status(),
         [
             (
                 "REST kite.quote() and KiteTicker (MODE_FULL) never carry tradingsymbol, "
@@ -165,40 +166,6 @@ def sync_obsidian_knowledge_layer(settings: Settings) -> None:
     exporter.export_research_summary()
     exporter.export_learning(MemoryStore(settings.database_path))
     exporter.sync_system_docs()
-
-
-def _real_archive_status() -> tuple[str, str]:
-    """Runs Brief 18's real validate_archive against whichever real
-    instrument-archive file is most recently dated on disk -- never a
-    cached or assumed status."""
-    from data.calendar import NseCalendar as _NseCalendar
-    from data.instrument_archive import (
-        ARCHIVE_DIR,
-        recent_validated_nifty_option_counts,
-        validate_archive,
-    )
-
-    files = sorted(ARCHIVE_DIR.glob("nfo_instruments_*.json"))
-    if not files:
-        return "NO_ARCHIVE", "No real instrument archive file exists yet."
-    latest = files[-1]
-    day = datetime.date.fromisoformat(latest.stem.removeprefix("nfo_instruments_"))
-    result = validate_archive(latest, day, _NseCalendar(), recent_validated_nifty_option_counts(ARCHIVE_DIR))
-    status = "VALID" if result.valid else "INVALID"
-    detail = (
-        f"{latest.name}: {result.total_record_count} real records, "
-        f"{result.nifty_option_count} real NIFTY options"
-        + (f" -- {result.reason}" if result.reason else "")
-    )
-    return status, detail
-
-
-def _real_gap_check_status() -> str:
-    from data.calendar import NseCalendar as _NseCalendar
-    from data.instrument_archive import ARCHIVE_DIR, find_missing_previous_archive
-
-    missing = find_missing_previous_archive(ARCHIVE_DIR, _NseCalendar(), datetime.datetime.now(IST).date())
-    return f"GAP: missing archive for {missing.isoformat()}" if missing else "NO_GAP"
 
 
 def run_scheduled_day(settings: Settings) -> dict:
@@ -373,6 +340,7 @@ def main() -> int:
         command.add_argument("--output", default="reports/generated/backtest.json")
     for name in (
         "health",
+        "health-gate",
         "paper",
         "instruments",
         "agents",
@@ -402,6 +370,15 @@ def main() -> int:
         now = datetime.datetime.now(IST)
         print(check_health(settings, None, now))
         print(*system_health(settings, True, None, now), sep="\n")
+        return 0
+    if args.command == "health-gate":
+        # Brief 23: a reporting tool only -- does NOT block this or any
+        # other command. Whether to wire it as an actual pre-flight gate
+        # is a separate, future decision.
+        database = Database(settings.database_path)
+        database.initialize()
+        report = run_system_health_gate(settings, database)
+        print(report.describe())
         return 0
     if args.command in {"paper", "agents"}:
         print(json.dumps(paper_dry_run(settings), indent=2, default=str))
