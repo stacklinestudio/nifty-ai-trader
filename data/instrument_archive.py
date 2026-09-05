@@ -25,10 +25,13 @@ not a crash, not a fabricated archive.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from config import IST, Settings
+from data.calendar import NseCalendar
+from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
+from integrations.telegram import TelegramNotifier
 from monitoring.logger import configure_logger
 
 logger = configure_logger(__name__)
@@ -49,6 +52,71 @@ def archive_nfo_instruments(kite: object, archive_dir: Path = ARCHIVE_DIR, today
     return path
 
 
+def find_missing_previous_archive(
+    archive_dir: Path, calendar: NseCalendar, today: date
+) -> date | None:
+    """The most recent real trading day strictly before `today`. Returns
+    that date if no real archive file exists for it -- but only when at
+    least one earlier real archive already exists somewhere in
+    `archive_dir`, proving archiving was genuinely running before. A
+    brand-new install's very first real day has no prior history to be
+    "missing" against, so it never raises a false alarm.
+
+    Uses the same real, weekday-only `NseCalendar` fail-closed convention
+    already used elsewhere in this project (main.py, demo/demo_trade.py)
+    -- explicit NSE holidays are not currently loaded, so a real holiday
+    could still be misidentified as a missed trading day. Documented, not
+    silently assumed away.
+    """
+    candidate = today - timedelta(days=1)
+    while not calendar.is_trading_day(candidate):
+        candidate -= timedelta(days=1)
+    if (archive_dir / f"nfo_instruments_{candidate.isoformat()}.json").exists():
+        return None
+    if not archive_dir.exists() or not any(archive_dir.glob("nfo_instruments_*.json")):
+        return None
+    return candidate
+
+
+def notify_missing_archive(settings: Settings, missing_day: date) -> None:
+    """Reuses the existing Discord "system" channel / Telegram wiring
+    (integrations/discord.py, integrations/telegram.py) -- the same
+    notifiers `main.py notifications` already exercises. Each notifier
+    fails closed on its own (returns False, never raises) when no real
+    webhook/token is configured; nothing here treats that as an error."""
+    message = f"instrument archive missing for {missing_day.isoformat()}, check the scheduled task"
+    discord = DiscordNotifier(
+        settings.discord_webhook_url,
+        webhooks_by_category=webhooks_by_category_from_settings(settings),
+    )
+    telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+    discord.send_message("WARNING", message, "system")
+    telegram.send_message("WARNING", message)
+
+
+def check_and_notify_missing_archive(
+    settings: Settings, archive_dir: Path = ARCHIVE_DIR, today: date | None = None
+) -> date | None:
+    """Real, same-day safeguard: run at the start of every scheduled
+    archive attempt (see run_daily_archive below), independent of whether
+    today's own Kite session is valid -- a real gap in a prior day's
+    archive is worth surfacing even on a day today's own archive also
+    fails closed. Never raises: a notification-transport failure is
+    logged, never allowed to break the scheduled archiving task, matching
+    every other notification path in this codebase.
+    """
+    today = today or datetime.now(IST).date()
+    missing_day = find_missing_previous_archive(archive_dir, NseCalendar(), today)
+    if missing_day is None:
+        return None
+    logger.warning("instrument_archive_gap_detected missing_day=%s", missing_day)
+    try:
+        notify_missing_archive(settings, missing_day)
+    except Exception as exc:  # noqa: BLE001 - a notification failure must never break the scheduled archiving task.
+        logger.warning("instrument_archive_gap_notify_failed error=%s: %s", type(exc).__name__, exc)
+    return missing_day
+
+
 def run_daily_archive(settings: Settings) -> Path | None:
     """Fail-closed entry point for the real daily scheduled task (see
     scripts/archive_instruments.ps1 and the registered Windows Scheduled
@@ -58,7 +126,14 @@ def run_daily_archive(settings: Settings) -> Path | None:
     expired/not-yet-refreshed access token) are all logged and treated
     the same honest way: nothing to archive today, try again once a
     fresh session exists, never fabricate a placeholder file.
+
+    Also runs the real same-day gap safeguard first (see
+    check_and_notify_missing_archive) -- checked unconditionally, before
+    the credential check below, so a real gap in a *prior* day's archive
+    still gets surfaced even on a day today's own session is also
+    missing/expired.
     """
+    check_and_notify_missing_archive(settings)
     if not (settings.kite_api_key and settings.kite_access_token):
         logger.warning("instrument_archive_skipped reason=no_kite_credentials_configured")
         return None

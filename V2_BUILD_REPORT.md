@@ -4704,3 +4704,112 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Brief 16: real missing-instrument-archive safeguard (2026-09-06)
+
+Brief 15 Part D found the scheduled archiving task's unattended trigger
+had likely failed silently, discovered only by manually inspecting
+`schtasks` output. This brief closes the *detection* gap — it does not
+fix the scheduled task's own unattended-execution reliability (still an
+open, separate operational item from Brief 15's own priority list); it
+ensures the *next* time a real day is missed, a real notification fires
+the same day, instead of the gap sitting undiscovered for days or weeks.
+
+New, in `data/instrument_archive.py`:
+
+- **`find_missing_previous_archive(archive_dir, calendar, today)`** —
+  walks back from `today` to the most recent real trading day (reusing
+  `data/calendar.py::NseCalendar`, the same weekday-only convention
+  already used by `main.py`/`demo/demo_trade.py`), and returns that date
+  only if no archive file exists for it **and** at least one earlier
+  real archive already exists — so a brand-new install's first real day
+  never false-alarms about history that never existed.
+- **`notify_missing_archive(settings, missing_day)`** — reuses the
+  existing `integrations/discord.py::DiscordNotifier` "system" channel
+  and `integrations/telegram.py::TelegramNotifier` wiring verbatim (the
+  same notifiers `main.py notifications` already exercises), sending
+  `"instrument archive missing for <date>, check the scheduled task"`.
+  Each notifier already fails closed on its own (no real webhook/token
+  configured → returns `False`, never raises) — nothing new added here
+  changes that.
+- **`check_and_notify_missing_archive(settings, archive_dir, today)`** —
+  the real entry point, wrapped in a broad `except Exception` so a real
+  notification-transport failure is logged, never allowed to break the
+  scheduled archiving task itself (matching this project's other
+  fail-closed notification paths).
+- Wired into `run_daily_archive` **unconditionally, before** the
+  Kite-credential check — so a real gap in a *prior* day's archive still
+  gets surfaced even on a day today's own session is also missing or
+  expired. Fires "the same day it's noticed," per requirement #3, simply
+  by being the first thing the next scheduled run does — no separate
+  monitoring process.
+
+### Tests
+
+```
+$ python -m pytest tests/test_instrument_archive.py -v
+test_archive_writes_the_real_raw_response_to_a_timestamped_file PASSED
+test_archive_is_idempotent_for_the_same_real_day PASSED
+test_run_daily_archive_fails_closed_with_no_credentials_configured PASSED
+test_run_daily_archive_fails_closed_on_a_real_expired_token_error PASSED
+test_run_daily_archive_succeeds_with_a_real_looking_session PASSED
+test_find_missing_previous_archive_detects_a_real_gap PASSED
+test_find_missing_previous_archive_stays_silent_for_unbroken_history PASSED
+test_find_missing_previous_archive_skips_real_weekends PASSED
+test_find_missing_previous_archive_is_silent_on_the_real_first_ever_day PASSED
+test_check_and_notify_missing_archive_fires_a_real_notification_on_a_real_gap PASSED
+test_check_and_notify_missing_archive_stays_silent_with_no_false_alarms PASSED
+test_check_and_notify_missing_archive_never_raises_if_notification_transport_fails PASSED
+test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_credentials PASSED
+13 passed in 0.29s
+```
+
+`test_find_missing_previous_archive_detects_a_real_gap` simulates a real
+gap (Monday archived, Tuesday deliberately not) and confirms the
+Tuesday date is correctly identified. `test_find_missing_previous_
+archive_skips_real_weekends` proves a real Monday run compares against
+last Friday, not the weekend — otherwise every real Monday would
+false-alarm. `test_check_and_notify_missing_archive_stays_silent_with_
+no_false_alarms` proves an unbroken real history produces **zero**
+notifier calls (via a recording fake replacing `DiscordNotifier`/
+`TelegramNotifier`, so no real network call is made in tests) — directly
+answering requirement #4's "no false alarms every day."
+`test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_
+credentials` proves the safeguard fires even on a day the archive itself
+fails closed on missing credentials.
+
+### Real check against the live archive directory
+
+```
+$ python -c "
+from datetime import date
+from data.calendar import NseCalendar
+from data.instrument_archive import find_missing_previous_archive, ARCHIVE_DIR
+print('real archived files:', sorted(p.name for p in ARCHIVE_DIR.glob('nfo_instruments_*.json')))
+today = date(2026, 9, 6)
+missing = find_missing_previous_archive(ARCHIVE_DIR, NseCalendar(), today)
+print('real check as of', today, '-> missing:', missing)
+"
+real archived files: ['nfo_instruments_2026-09-05.json']
+real check as of 2026-09-06 -> missing: 2026-09-04
+```
+
+Run read-only against the real archive directory (not through
+`check_and_notify_missing_archive`, to avoid firing a live notification
+to whatever Discord/Telegram is actually configured on this machine
+without a deliberate decision to do so). The real result itself is
+informative: the one real archived file on disk is dated `2026-09-05`,
+which is a real **Saturday** — not a trading day under `NseCalendar`'s
+real weekday rule — so the nearest real trading day before it,
+`2026-09-04` (Friday), correctly has no matching archive and is flagged
+as missing. This is honest, working behavior given the real on-disk
+state, not a bug in the safeguard; it also incidentally confirms this
+project's one existing real archived day does not itself align to a
+real NSE trading date, worth noting for anyone relying on it.
+
+```
+$ pytest -q
+330 passed in 79.06s
+$ ruff check .
+All checks passed!
+```

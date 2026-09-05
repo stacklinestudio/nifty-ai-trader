@@ -14,10 +14,17 @@ exactly this path.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
+from typing import ClassVar
 
 from config import Settings
-from data.instrument_archive import archive_nfo_instruments, run_daily_archive
+from data.calendar import NseCalendar
+from data.instrument_archive import (
+    archive_nfo_instruments,
+    check_and_notify_missing_archive,
+    find_missing_previous_archive,
+    run_daily_archive,
+)
 
 
 class _FakeKite:
@@ -116,3 +123,169 @@ def test_run_daily_archive_succeeds_with_a_real_looking_session(tmp_path, monkey
     assert result.exists()
     saved = json.loads(result.read_text(encoding="utf-8"))
     assert saved == [{"tradingsymbol": "NIFTY26SEPFUT"}]
+
+
+# --- Real, same-day missing-archive safeguard -------------------------
+
+
+def _write_fake_archive(archive_dir, day: date) -> None:
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    (archive_dir / f"nfo_instruments_{day.isoformat()}.json").write_text("[]", encoding="utf-8")
+
+
+class _RecordingDiscord:
+    """Records every real send_message call instead of making a real
+    HTTP request -- proves check_and_notify_missing_archive actually
+    calls the existing Discord "system" channel wiring, without a real
+    webhook."""
+
+    instances: ClassVar[list[_RecordingDiscord]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.calls: list[tuple] = []
+        _RecordingDiscord.instances.append(self)
+
+    def send_message(self, severity: str, message: str, category: str | None = None) -> bool:
+        self.calls.append((severity, message, category))
+        return True
+
+
+class _RecordingTelegram:
+    instances: ClassVar[list[_RecordingTelegram]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.calls: list[tuple] = []
+        _RecordingTelegram.instances.append(self)
+
+    def send_message(self, severity: str, message: str) -> bool:
+        self.calls.append((severity, message))
+        return True
+
+
+def test_find_missing_previous_archive_detects_a_real_gap(tmp_path):
+    calendar = NseCalendar()
+    _write_fake_archive(tmp_path, date(2026, 9, 7))  # real Monday: archived
+    # 2026-09-08 (real Tuesday) is deliberately NOT archived -- the gap.
+    today = date(2026, 9, 9)  # real Wednesday, the next scheduled run
+
+    missing = find_missing_previous_archive(tmp_path, calendar, today)
+
+    assert missing == date(2026, 9, 8)
+
+
+def test_find_missing_previous_archive_stays_silent_for_unbroken_history(tmp_path):
+    calendar = NseCalendar()
+    _write_fake_archive(tmp_path, date(2026, 9, 8))  # real Tuesday: archived
+    today = date(2026, 9, 9)  # real Wednesday
+
+    missing = find_missing_previous_archive(tmp_path, calendar, today)
+
+    assert missing is None
+
+
+def test_find_missing_previous_archive_skips_real_weekends(tmp_path):
+    """A real Monday's scheduled run must compare against last real
+    Friday, not the weekend -- otherwise every real Monday would falsely
+    alarm."""
+    calendar = NseCalendar()
+    _write_fake_archive(tmp_path, date(2026, 9, 4))  # real Friday: archived
+    today = date(2026, 9, 7)  # real Monday
+
+    missing = find_missing_previous_archive(tmp_path, calendar, today)
+
+    assert missing is None
+
+
+def test_find_missing_previous_archive_is_silent_on_the_real_first_ever_day(tmp_path):
+    """No real archive has ever been written yet -- nothing to compare
+    against, so this must never be treated as a gap."""
+    calendar = NseCalendar()
+    today = date(2026, 9, 9)
+
+    missing = find_missing_previous_archive(tmp_path, calendar, today)
+
+    assert missing is None
+
+
+def test_check_and_notify_missing_archive_fires_a_real_notification_on_a_real_gap(tmp_path, monkeypatch):
+    _RecordingDiscord.instances = []
+    _RecordingTelegram.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    monkeypatch.setattr("data.instrument_archive.TelegramNotifier", _RecordingTelegram)
+    _write_fake_archive(tmp_path, date(2026, 9, 7))  # Monday archived
+    # Tuesday 2026-09-08 missing -- the real, simulated gap.
+    settings = Settings()
+
+    missing = check_and_notify_missing_archive(settings, archive_dir=tmp_path, today=date(2026, 9, 9))
+
+    assert missing == date(2026, 9, 8)
+    assert len(_RecordingDiscord.instances) == 1
+    discord_calls = _RecordingDiscord.instances[0].calls
+    assert discord_calls == [
+        ("WARNING", "instrument archive missing for 2026-09-08, check the scheduled task", "system")
+    ]
+    telegram_calls = _RecordingTelegram.instances[0].calls
+    assert telegram_calls == [
+        ("WARNING", "instrument archive missing for 2026-09-08, check the scheduled task")
+    ]
+
+
+def test_check_and_notify_missing_archive_stays_silent_with_no_false_alarms(tmp_path, monkeypatch):
+    """A real, unbroken archive history must never fire a notification --
+    proves this safeguard won't spam every single day it runs."""
+    _RecordingDiscord.instances = []
+    _RecordingTelegram.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    monkeypatch.setattr("data.instrument_archive.TelegramNotifier", _RecordingTelegram)
+    _write_fake_archive(tmp_path, date(2026, 9, 8))  # Tuesday archived
+    settings = Settings()
+
+    missing = check_and_notify_missing_archive(settings, archive_dir=tmp_path, today=date(2026, 9, 9))
+
+    assert missing is None
+    assert _RecordingDiscord.instances == []
+    assert _RecordingTelegram.instances == []
+
+
+def test_check_and_notify_missing_archive_never_raises_if_notification_transport_fails(tmp_path, monkeypatch):
+    class _ExplodingDiscord:
+        def __init__(self, *args, **kwargs) -> None:
+            raise ConnectionError("simulated real network failure")
+
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _ExplodingDiscord)
+    _write_fake_archive(tmp_path, date(2026, 9, 7))
+    settings = Settings()
+
+    missing = check_and_notify_missing_archive(settings, archive_dir=tmp_path, today=date(2026, 9, 9))  # must not raise
+
+    assert missing == date(2026, 9, 8)
+
+
+def test_run_daily_archive_still_checks_for_a_gap_even_with_no_kite_credentials(tmp_path, monkeypatch):
+    """Part 3's own requirement: the safeguard must fire the same day it's
+    noticed, as part of the *next scheduled run's own startup check* --
+    even a run whose own archive attempt fails closed on missing
+    credentials must still have already run the gap check."""
+    monkeypatch.chdir(tmp_path)
+    _RecordingDiscord.instances = []
+    _RecordingTelegram.instances = []
+    monkeypatch.setattr("data.instrument_archive.DiscordNotifier", _RecordingDiscord)
+    monkeypatch.setattr("data.instrument_archive.TelegramNotifier", _RecordingTelegram)
+    archive_dir = tmp_path / "data" / "private" / "instrument_archives"
+    _write_fake_archive(archive_dir, date(2026, 9, 7))  # Monday archived, Tuesday missing
+
+    class _FixedDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 9, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr("data.instrument_archive.datetime", _FixedDate)
+    settings = Settings(kite_api_key="", kite_access_token="")
+
+    result = run_daily_archive(settings)
+
+    assert result is None  # still fails closed on no credentials, as before
+    assert len(_RecordingDiscord.instances) == 1
+    assert _RecordingDiscord.instances[0].calls == [
+        ("WARNING", "instrument archive missing for 2026-09-08, check the scheduled task", "system")
+    ]
