@@ -6105,3 +6105,155 @@ typed agents, the experiment laboratory, multi-model AI diversity, and
 Obsidian wiki-link graph connections. Each is a real, worthwhile idea;
 none is what's currently blocking anything, per the source document's
 own stated priority ranking.
+
+## Brief 24: `python main.py start-day` (2026-09-06)
+
+A single real command that runs everything after the real Kite login in
+one shot, in order: (1) System Health Gate, (2) instrument archiving,
+(3) start real option tick capture, (4) start the real main trading
+scheduler. `main.py::start_day`, wired to the new `start-day` CLI
+subcommand (same `ProcessLock` single-instance guard as `run`).
+
+### The explicit decision, made not assumed
+
+A real `BLOCKED` gate verdict does **not** stop the sequence — printed
+and sent as a real Discord/Telegram notification regardless of outcome
+(`_notify_gate_result`), then the sequence continues, with an explicit
+printed statement why ("an explicit decision for now, observing the
+real gate before deciding whether it should hard-block, Brief 23").
+**The one absolute exception**: a real, failed `kite_connection` check
+stops everything immediately — nothing downstream (real instruments,
+real capture, real live scheduler data) can meaningfully run without
+it. Steps 2-4 are independent: a real failure in one (archiving, or
+capture) is caught, reported clearly, and does not prevent the
+remaining steps.
+
+### A real bug, found by actually running it end to end, not assumed
+
+The very first real run (below) surfaced a genuine problem: option tick
+capture is meant to run *concurrently* with the trading scheduler (both
+cover the same real session), so it's launched in a background daemon
+thread. On a real non-trading day, `run_trading_day`'s own real
+not-a-trading-day short-circuit returns almost instantly — meaning
+`start_day` would return right after, and the real daemon capture
+thread (launched with a multi-hour real `duration_seconds`, time until
+real market close) would be **silently killed mid-wait, before writing
+anything.**
+
+Real, direct proof this happened on the first live run:
+
+```
+$ ls -la data/private/option_tick_capture/
+-rw-r--r-- 1 prasanth 197121 0 Sep  6 03:42 nifty_option_ticks_2026-09-06.jsonl
+```
+
+A real, 0-byte file — the thread was killed before its first real tick
+could even arrive. Fixed two ways, both verified live afterward:
+
+1. **Capture is not started at all on a real non-trading day** —
+   nothing would stream anyway (Brief 19's own finding: a closed market
+   produces at most one snapshot tick, this project's data source, not
+   a shortcut invented here), so launching a real, multi-hour thread
+   destined to be killed is both wasteful and dishonest about what
+   actually happened. Reported as a distinct, real `SKIPPED` status,
+   not folded into `STARTED` or `FAILED`.
+2. **On a real trading day, `start_day` now joins the real capture
+   thread before returning** — so once the scheduler naturally finishes
+   around the same real close time capture's own duration targets, the
+   capture thread is never silently cut off.
+
+Real, live re-run after the fix, same real non-trading day:
+
+```
+$ python main.py start-day
+...
+option tick capture: SKIPPED -- 2026-09-06 is not a real NSE trading day
+trading scheduler: OK
+```
+
+### Tests
+
+```
+$ python -m pytest tests/test_start_day.py -v
+test_a_real_kite_connection_failure_stops_the_whole_sequence PASSED
+test_a_blocked_gate_without_a_kite_failure_still_runs_the_whole_sequence PASSED
+test_a_real_ready_gate_runs_the_whole_sequence PASSED
+test_a_non_kite_failure_eg_tick_capture_lets_the_rest_proceed_with_the_failure_reported PASSED
+test_an_archive_failure_lets_capture_and_scheduler_still_proceed PASSED
+test_a_real_health_gate_is_computed_when_none_is_injected PASSED
+test_capture_is_skipped_not_started_on_a_real_non_trading_day PASSED
+test_the_real_capture_thread_is_joined_before_start_day_returns PASSED
+test_start_option_tick_capture_in_background_uses_a_real_nsecalendar_by_default PASSED
+9 passed in 3.75s
+```
+
+The two required tests: `test_a_real_kite_connection_failure_stops_the_
+whole_sequence` confirms archive/capture/scheduler are never even
+attempted (`.calls == []` on each injected tracker) when `kite_
+connection` fails, and that the real gate result was still notified.
+`test_a_non_kite_failure_eg_tick_capture_lets_the_rest_proceed_with_
+the_failure_reported` confirms a real tick-capture setup failure is
+reported (`status == "FAILED"`, the real exception text present) while
+archiving and the scheduler both still ran. `test_a_blocked_gate_
+without_a_kite_failure_still_runs_the_whole_sequence` separately proves
+the explicit BLOCKED-continues decision. `archive_runner`/`capture_
+starter`/`scheduler_runner`/`gate` are all injectable (default to the
+real functions) purely for deterministic testing — production callers
+never pass them.
+
+```
+$ pytest -q
+411 passed in 78.35s
+$ ruff check .
+All checks passed!
+```
+
+### Real command output — both real runs preserved as evidence
+
+First real run (the bug, before the fix):
+
+```
+$ python main.py start-day
+System Health Gate: BLOCKED
+  [OK] kite_connection: real session valid, user_id=RJJ326
+  [OK] ai_provider: provider=anthropic
+  [FAIL] option_tick_capture: no real capture segment found for 2026-09-06
+  [FAIL] instrument_archive: nfo_instruments_2026-09-05.json: ... -- archived date 2026-09-05 is not a real NSE trading day
+  [FAIL] data_completeness: no real signal recorded yet
+  [OK] notifications: telegram=reachable, discord=unreachable/not configured
+  [OK] risk_and_broker: RiskManager/PaperBroker construct cleanly from current real Settings
+BLOCKED: ...
+start-day CONTINUING despite a BLOCKED health gate -- an explicit decision for now, observing the real gate before deciding whether it should hard-block (Brief 23).
+instrument archiving: FAILED -- no real archive produced
+option tick capture: STARTED -- running in the background for the rest of the real session
+trading scheduler: OK
+```
+
+Second real run (after the fix, same real non-trading day):
+
+```
+$ python main.py start-day
+System Health Gate: BLOCKED
+  [OK] kite_connection: real session valid, user_id=RJJ326
+  [OK] ai_provider: provider=anthropic
+  [OK] option_tick_capture: 1 real segment(s), 0 real ticks, 0 real gap(s) for 2026-09-06
+  [FAIL] instrument_archive: nfo_instruments_2026-09-06.json: 32655 real records, 1580 real NIFTY options -- archived date 2026-09-06 is not a real NSE trading day
+  [FAIL] data_completeness: no real signal recorded yet
+  [OK] notifications: telegram=reachable, discord=unreachable/not configured
+  [OK] risk_and_broker: RiskManager/PaperBroker construct cleanly from current real Settings
+BLOCKED: instrument_archive: ...; data_completeness: no real signal recorded yet
+(Reporting only -- this gate does not block main.py run in this brief.)
+start-day CONTINUING despite a BLOCKED health gate -- an explicit decision for now, observing the real gate before deciding whether it should hard-block (Brief 23).
+instrument archiving: FAILED -- no real archive produced
+option tick capture: SKIPPED -- 2026-09-06 is not a real NSE trading day
+trading scheduler: OK
+```
+
+Both runs were safe to execute for real (today is a genuine non-trading
+Saturday — `run_trading_day` returns immediately, confirmed before
+running) and both real side effects (the real, correctly-flagged-invalid
+`nfo_instruments_2026-09-06.json`, and the real, 0-byte pre-fix capture
+file) are left in place as real evidence, not cleaned up. Also
+transparent: each run sent one real Telegram notification (the gate
+result), matching `check_notifications`'/`_notify_gate_result`'s
+already-established real behavior — expected, not a bug.

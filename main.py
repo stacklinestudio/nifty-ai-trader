@@ -14,6 +14,7 @@ load_dotenv(".env")  # ...falling back to the non-secret template/defaults
 import argparse
 import datetime
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -319,6 +320,172 @@ def run_scheduled_day(settings: Settings) -> dict:
     return summary
 
 
+def _notify_gate_result(settings: Settings, gate) -> None:
+    """Brief 24: the real System Health Gate result, printed above and
+    also sent as a real Discord "system" channel + Telegram notification
+    -- regardless of verdict -- so an unattended headless run still
+    surfaces it, not just a console nobody is watching."""
+    severity = "INFO" if gate.verdict == "READY" else "WARNING"
+    try:
+        discord = DiscordNotifier(
+            settings.discord_webhook_url,
+            webhooks_by_category=webhooks_by_category_from_settings(settings),
+        )
+        telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+        discord.send_message(severity, gate.describe(), "system")
+        telegram.send_message(severity, gate.describe())
+    except Exception as exc:  # noqa: BLE001 - a notification failure must never break start-day.
+        logger.warning("start_day_gate_notify_failed error=%s", exc)
+
+
+def _start_option_tick_capture_in_background(settings: Settings) -> threading.Thread:
+    """Brief 24 step 3: real option tick capture must run CONCURRENTLY
+    with the real trading scheduler (step 4), not block before it --
+    both cover the same real trading session. Launched in a daemon
+    background thread; `run_capture_session` itself already fails closed
+    and sends its own real notifications internally (Brief 19/22), so
+    this function's own try/except only needs to cover real setup
+    failures (fetching the real spot/instrument list to build today's
+    real universe), a distinct, separate failure mode.
+    """
+    from data.option_tick_capture import build_universe, run_capture_session
+
+    kite = build_kite_session(settings)
+    if kite is None:
+        raise RuntimeError("no real Kite session available for option tick capture")
+    spot = kite.quote(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
+    instruments = kite.instruments("NFO")
+    nifty_options = [r for r in instruments if r.get("name") == "NIFTY" and r.get("segment") == "NFO-OPT"]
+    if not nifty_options:
+        raise RuntimeError("no real NIFTY NFO-OPT instruments found -- cannot build today's real universe")
+
+    def _row_expiry(row: dict) -> datetime.date:
+        value = row["expiry"]
+        return value if isinstance(value, datetime.date) else datetime.date.fromisoformat(str(value)[:10])
+
+    nearest_expiry = min(_row_expiry(row) for row in nifty_options)
+    universe = build_universe(instruments, spot, nearest_expiry)
+
+    calendar = NseCalendar()
+    now = datetime.datetime.now(IST)
+    close_at = datetime.datetime.combine(now.date(), calendar.close_time, tzinfo=IST)
+    duration_seconds = max(0.0, (close_at - now).total_seconds())
+
+    thread = threading.Thread(
+        target=run_capture_session, args=(settings, universe, duration_seconds), daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def start_day(
+    settings: Settings,
+    gate=None,
+    archive_runner=None,
+    capture_starter=None,
+    scheduler_runner=None,
+    calendar: NseCalendar | None = None,
+    today: datetime.date | None = None,
+) -> dict:
+    """`python main.py start-day`: everything after the real Kite login,
+    in one shot, in order -- (1) System Health Gate, (2) instrument
+    archiving, (3) start real option tick capture in the background,
+    (4) start the real main trading scheduler in the foreground
+    (blocking, same as `python main.py run`).
+
+    Real finding from actually running this end to end (not assumed):
+    on a real non-trading day, `run_scheduled_day` returns almost
+    instantly (`run_trading_day`'s own real not-a-trading-day
+    short-circuit), so this function would otherwise return right after
+    it -- silently killing the real background capture thread (a daemon
+    thread) mid-way through its real, multi-hour `duration_seconds`
+    wait, before it ever got to do anything. Fixed two ways: (a) capture
+    is not even started on a real non-trading day (nothing would stream
+    anyway -- Brief 19's own finding), and (b) on a real trading day,
+    this function joins the real capture thread before returning, so it
+    is never silently killed once the scheduler naturally finishes
+    around the same real close time capture's own duration targets.
+
+    Explicit decision, not assumed: a real `BLOCKED` gate verdict does
+    NOT stop this sequence -- it is printed and notified prominently
+    (`_notify_gate_result`, regardless of outcome) and the sequence
+    continues, matching Brief 23's own stated plan to observe the real
+    gate across a few real days before deciding whether it should hard-
+    block. The ONE absolute exception: a real, failed `kite_connection`
+    check stops everything immediately -- nothing downstream (real
+    instruments, real capture, real live scheduler data) can
+    meaningfully run without it.
+
+    Steps 2-4 are independent: a real failure in one is caught, reported
+    clearly in the returned result (and printed), and does not prevent
+    the remaining steps from being attempted. `gate`/`archive_runner`/
+    `capture_starter`/`scheduler_runner` are injectable (default to the
+    real functions) purely so this can be tested deterministically
+    without live network calls -- production callers never pass them.
+    """
+    archive_runner = archive_runner or run_daily_archive
+    capture_starter = capture_starter or _start_option_tick_capture_in_background
+    scheduler_runner = scheduler_runner or run_scheduled_day
+    calendar = calendar or NseCalendar()
+    today = today or datetime.datetime.now(IST).date()
+
+    result: dict = {"gate": None, "stopped_after_gate": False, "archive": None, "capture": None, "scheduler": None}
+
+    if gate is None:
+        database = Database(settings.database_path)
+        database.initialize()
+        gate = run_system_health_gate(settings, database)
+    print(gate.describe())
+    _notify_gate_result(settings, gate)
+    result["gate"] = {"verdict": gate.verdict, "blocking_reasons": gate.blocking_reasons}
+
+    kite_check = next((c for c in gate.checks if c.name == "kite_connection"), None)
+    if kite_check is not None and kite_check.status != "OK":
+        print(f"start-day STOPPED: real kite_connection check failed ({kite_check.detail}) -- nothing else can meaningfully run.")
+        result["stopped_after_gate"] = True
+        return result
+    if gate.verdict == "BLOCKED":
+        print(
+            "start-day CONTINUING despite a BLOCKED health gate -- an explicit decision for now, "
+            "observing the real gate before deciding whether it should hard-block (Brief 23)."
+        )
+
+    try:
+        path = archive_runner(settings)
+        result["archive"] = {"status": "OK" if path else "FAILED", "detail": str(path) if path else "no real archive produced"}
+    except Exception as exc:  # noqa: BLE001 - one step's real failure must never prevent the others from being attempted.
+        result["archive"] = {"status": "FAILED", "detail": f"{type(exc).__name__}: {exc}"}
+    print(f"instrument archiving: {result['archive']['status']} -- {result['archive']['detail']}")
+
+    capture_thread = None
+    if not calendar.is_trading_day(today):
+        result["capture"] = {"status": "SKIPPED", "detail": f"{today.isoformat()} is not a real NSE trading day"}
+    else:
+        try:
+            capture_thread = capture_starter(settings)
+            result["capture"] = {
+                "status": "STARTED", "detail": "running in the background for the rest of the real session"
+            }
+        except Exception as exc:  # noqa: BLE001 - one step's real failure must never prevent the others from being attempted.
+            result["capture"] = {"status": "FAILED", "detail": f"{type(exc).__name__}: {exc}"}
+    print(f"option tick capture: {result['capture']['status']} -- {result['capture']['detail']}")
+
+    try:
+        day_summary = scheduler_runner(settings)
+        result["scheduler"] = {"status": "OK", "detail": day_summary}
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed silently -- but this is the last real step either way.
+        result["scheduler"] = {"status": "FAILED", "detail": f"{type(exc).__name__}: {exc}"}
+    print(f"trading scheduler: {result['scheduler']['status']}")
+
+    if capture_thread is not None:
+        # Never let the real background capture thread be silently
+        # killed by this function returning first -- see the docstring's
+        # real finding above.
+        capture_thread.join()
+
+    return result
+
+
 def paper_dry_run(settings: Settings) -> dict:
     """Runs the full V2 workflow with empty facts; it must result in NO TRADE."""
     result = Orchestrator(settings).run_cycle({"market_data_fresh": False, "market_open": False})
@@ -349,6 +516,7 @@ def main() -> int:
         "notifications",
         "export-obsidian",
         "run",
+        "start-day",
         "demo-trade",
     ):
         sub.add_parser(name)
@@ -441,6 +609,21 @@ def main() -> int:
             return 1
         try:
             print(json.dumps(run_scheduled_day(settings), indent=2, default=str))
+            return 0
+        finally:
+            lock.release()
+    if args.command == "start-day":
+        # Everything after the real Kite login, in one shot -- same
+        # single-instance guard as "run", since this also ends up
+        # calling run_scheduled_day.
+        lock = ProcessLock(Path(f"{settings.database_path}.lock"))
+        try:
+            lock.acquire()
+        except AlreadyRunningError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 1
+        try:
+            start_day(settings)
             return 0
         finally:
             lock.release()
