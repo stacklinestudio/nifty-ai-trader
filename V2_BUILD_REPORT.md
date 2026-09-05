@@ -4192,3 +4192,177 @@ All checks passed!
 
 No threshold or scoring-decision change made anywhere in this brief, per
 its own explicit ground rule. Phase 1 closes here.
+
+## Brief 14: Real Expected-Value Calculation (Phase 2a — Measurement Only) (2026-09-05)
+
+No config, threshold, or trade-decision changes. Risk Engine untouched —
+not read from, not written to, not referenced by anything built here.
+New module `research/expected_value.py` is never imported by `RiskAgent`,
+`TradeBuilderAgent`, `Orchestrator`'s decision path, or `SignalEngine`.
+
+```
+EV (R) = P(win) x AvgWin(R) - P(loss) x AvgLoss(R) - real_costs(R) - real_slippage(R)
+```
+
+`1R = settings.max_risk_per_trade`, read live on every call (currently
+₹600 — never hardcoded, since it has already been revised once this
+project and may be again).
+
+### Part A — Tiered, labeled probability/expectancy source
+
+1. **`REAL_TRADE_DATA`** — `learning/pattern_memory.py::stats_for`,
+   already built, reused unmodified. Checked first, every call. Currently
+   always empty (zero real trades this project has ever closed,
+   confirmed repeatedly throughout this whole engagement) — will activate
+   automatically once real trades accumulate, with no further code
+   changes (proven by a real test that writes 25 real trade records via
+   `MemoryStore` and confirms `compute_ev` picks them up in preference to
+   a real, otherwise-sufficient counterfactual sample for the same
+   combination).
+2. **`COUNTERFACTUAL_PROXY`** — `research/counterfactual.py`'s real,
+   already-built index-price-proxy win rate, once ≥
+   `MIN_COUNTERFACTUAL_SAMPLES` (=20, the same real bar
+   `pattern_memory.py` already uses) real records exist for the exact
+   `(setup_type, regime)` combination. `research/counterfactual.py::
+   CounterfactualRecord` gained a real `regime` field so tier 2 can key
+   at the same granularity tier 1 does.
+3. **`INSUFFICIENT_DATA`** — no fabricated number.
+
+`AvgLoss(R) = 1.0` by definition of R itself (a stop-loss exit realizes
+exactly the risked amount — not an estimate). `AvgWin(R) =
+REWARD_RISK_RATIO = 1.5`, this project's own real, already-coded
+target:stop spread ratio (`execution/live_context.py::_atr_zones`'
+target multiple against its stop multiple) — independently matches
+`risk/risk_manager.py::RiskManager`'s own real `reward_multiple=1.5`
+default, a real cross-check that this project's own code already agrees
+with itself on this ratio in two separately-written places. Stated
+plainly: this is a real, cited structural assumption, not measured, and
+labeled as such everywhere it's used — never presented as, or confused
+with, a real measured average win.
+
+### Part B — Real costs and slippage
+
+**Real, current, cited transaction costs** — fetched live from
+[zerodha.com/charges/](https://zerodha.com/charges/), 2026-09, not
+assumed:
+
+| Component | Real rate | Side |
+|---|---|---|
+| Brokerage | ₹20 per executed order | both legs |
+| STT | 0.15% of premium | sell side only (this project's paper trades always square off via a real sell order, never exercise) |
+| NSE transaction charges | 0.03553% of premium | both legs |
+| SEBI charges | ₹10/crore | both legs |
+| GST | 18% on (brokerage + transaction charges + SEBI charges) | — |
+| Stamp duty | 0.003% (= ₹300/crore, same rate two ways) | buy side only |
+
+Applied to a representative round-trip (this project's own already-
+established representative premium, `tests/test_supervision_quote_symbol.py::REPRESENTATIVE_OPTION_LTP=120.5`,
+reused for consistency — real per-candidate option premiums don't exist
+for any historical window in this project, confirmed repeatedly): real
+total cost ≈ ₹65.8 → **0.110R**.
+
+**Real slippage** reuses `execution/paper_broker.py::PaperBroker`'s own
+real, already-tested adverse-fill formula exactly (`slippage_ticks ×
+tick_size`, both entry and exit) — not a new estimate: ₹6.50 → **0.011R**.
+
+Combined real costs + slippage drag: **≈0.121R per trade**, before any
+win/loss outcome.
+
+```
+$ pytest tests/test_expected_value.py -v
+test_ev_arithmetic_is_exact_for_a_known_counterfactual_scenario PASSED
+test_no_real_or_counterfactual_data_reports_insufficient_data_not_fabricated PASSED
+test_below_minimum_counterfactual_sample_size_also_reports_insufficient_data PASSED
+test_1r_is_read_live_from_settings_not_hardcoded PASSED
+test_real_trade_data_tier_activates_automatically_once_enough_real_trades_exist PASSED
+test_real_transaction_costs_use_the_cited_real_fee_schedule PASSED
+test_real_slippage_matches_paper_brokers_own_real_formula PASSED
+7 passed in 1.00s
+```
+
+### Part C — Real EV distribution, both windows
+
+**42-day window** (real cached global-market data supplied, matching
+Brief 13's corrected methodology):
+
+```
+real candidates: 1756   real distinct (setup_type, regime) combinations: 18
+real ev_source tally: {'INSUFFICIENT_DATA': 6, 'COUNTERFACTUAL_PROXY': 12}
+real candidates with real EV available (tier 2): 1675/1756 (95.4%)
+real EV distribution (R): min=-0.695 max=-0.158 median=-0.273 mean=-0.273
+real correlation (confidence vs EV), Pearson r: -0.1170
+real count of positive-EV combinations: 0/12
+```
+
+**248-day window** (5.9x the sample):
+
+```
+real candidates: 3464   real distinct (setup_type, regime) combinations: 18
+real ev_source tally: {'COUNTERFACTUAL_PROXY': 18}
+real candidates with real EV available (tier 2): 3464/3464 (100.0%)
+real EV distribution (R): min=-0.652 max=+0.096 median=-0.252 mean=-0.238
+real correlation (confidence vs EV), Pearson r: +0.1686
+real count of positive-EV combinations: 1/18 (MOMENTUM_CONTINUATION/GAP_UP, win_rate=0.49, sample_size=37)
+```
+
+Tier 1 (`REAL_TRADE_DATA`) inactive in both — zero real trades, as
+established throughout this project.
+
+**The single most useful output of this brief, stated plainly**:
+
+- **Nearly every real `(setup_type, regime)` combination has a negative
+  real EV on the index-price-proxy basis** — 12/12 in the 42-day window,
+  17/18 in the 248-day window (the sole exception, +0.096R, rests on a
+  modest 37-sample near-coin-flip win rate). This is *before* any real
+  option-specific drag this measurement cannot model (theta decay, IV
+  crush, wider real bid-ask spread than the modeled tick-based slippage)
+  — real option EV would plausibly be *more* negative still, not less.
+- **Confidence and EV do not reliably agree, and the relationship isn't
+  even stable in direction**: weakly negative (r=-0.117) in the 42-day
+  window, weakly positive (r=+0.169) in the 248-day window. Concretely,
+  `VWAP_BREAKOUT/TREND_UP` has the *worst* real EV in the 42-day window
+  (-0.695R) while sharing the same real confidence ceiling (~53.8) as
+  every other combination — the existing confidence score, dominated by
+  Brief 13's own `volume_score`-unavailability finding, cannot currently
+  distinguish a real setup+regime combination that's losing hardest on
+  the index-price proxy from one that's merely mediocre. This is real,
+  concrete evidence of exactly the kind of ranking disagreement Phase 2b
+  would need to resolve — surfaced here, not acted on.
+
+### Is tier 2 alone enough evidence for Phase 2b's ranking-replacement decision?
+
+**No — stated plainly, not proceeded on.** Three real, specific reasons,
+from this pass's own numbers:
+
+1. **Every real EV number here is index-price-proxy, not real option
+   P&L** — the `COUNTERFACTUAL_PROXY` label is on every single one
+   because that caveat is load-bearing, not decorative. `AvgWin(R)` is a
+   real, cited *structural* assumption (this project's own coded
+   target:stop ratio), not a measured one — a real Phase 2b ranking
+   decision built on it would be ranking by a formula whose reward side
+   was never actually observed, only assumed consistent with real design
+   intent.
+2. **Zero real trades exist to calibrate or validate this proxy against**
+   — tier 1 is empty in both windows. There is no real evidence yet that
+   a real option position's actual outcome tracks the index-price-proxy
+   outcome closely enough for EV(R) to be trustworthy as a ranking
+   signal, only a structural expectation that it should, directionally.
+3. **The confidence/EV correlation instability itself is evidence of
+   insufficient maturity, not just insufficient sign**: a relationship
+   that flips sign between two overlapping-but-different real windows of
+   the same instrument is not yet a signal Phase 2b could safely act on
+   without more real evidence accumulating first (more real trading
+   days, and separately, real option-chain data via Brief 13 Part 2's
+   now-running daily archiving job, which would eventually let a real
+   option-P&L-based EV supersede the index-proxy one entirely).
+
+This closes Phase 2a only. Per the brief's own explicit instruction, no
+recommendation to proceed to Phase 2b is made here — these numbers are
+reported for discussion and a separate, future scoping decision.
+
+```
+$ pytest -q
+317 passed in 73.69s
+$ ruff check .
+All checks passed!
+```
