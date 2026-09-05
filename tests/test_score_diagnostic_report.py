@@ -54,6 +54,13 @@ def test_report_runs_against_the_real_42_day_dataset_and_is_internally_consisten
     )
     assert cf_total == report.rejected_candidates
     assert report.counterfactual_label == COUNTERFACTUAL_LABEL
+    # Brief 13 Part B: report-only fields -- real, sane bounds, never
+    # negative, never exceeding 100%.
+    assert 0.0 <= report.mean_data_completeness <= 100.0
+    assert 0.0 <= report.median_data_completeness <= 100.0
+    assert sum(report.data_completeness_distinct_values.values()) == report.candidates
+    if report.confidence_completeness_correlation is not None:
+        assert -1.0 <= report.confidence_completeness_correlation <= 1.0
 
 
 def test_summary_lines_always_carry_the_counterfactual_label():

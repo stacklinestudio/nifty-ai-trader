@@ -18,7 +18,7 @@ number is used.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time as time_of_day
 from datetime import timedelta
 
@@ -84,6 +84,12 @@ class DiagnosticReport:
     counterfactual_profitable: int
     counterfactual_not_profitable: int
     counterfactual_no_data: int
+    # Brief 13 Part B: report-only -- does NOT change how a candidate is
+    # scored or rejected here or anywhere else.
+    mean_data_completeness: float = 0.0
+    median_data_completeness: float = 0.0
+    data_completeness_distinct_values: Counter[float] = field(default_factory=Counter)
+    confidence_completeness_correlation: float | None = None
     counterfactual_label: str = COUNTERFACTUAL_LABEL
 
     def summary_lines(self) -> list[str]:
@@ -99,6 +105,25 @@ class DiagnosticReport:
             pct = (count / n * 100) if n else 0.0
             lines.append(f"  {bucket}: {count} ({pct:.1f}%)")
         lines.append(f"median score: {self.median_score:.1f}  mean score: {self.mean_score:.1f}")
+        lines.append(
+            f"data_completeness: median={self.median_data_completeness:.1f}% "
+            f"mean={self.mean_data_completeness:.1f}%"
+        )
+        lines.append("data_completeness real distinct values (Brief 13 Part A, report-only):")
+        for value, count in sorted(self.data_completeness_distinct_values.items()):
+            pct = (count / self.candidates * 100) if self.candidates else 0.0
+            lines.append(f"  {value:.1f}%: {count} ({pct:.1f}%)")
+        if self.confidence_completeness_correlation is None:
+            lines.append(
+                "confidence vs. data_completeness correlation: UNDEFINED -- data_completeness has "
+                "zero real variance in this dataset (every candidate has the same real completeness), "
+                "so no correlation coefficient is computable, not silently reported as 0 or omitted."
+            )
+        else:
+            lines.append(
+                f"confidence vs. data_completeness correlation (Pearson r): "
+                f"{self.confidence_completeness_correlation:.4f}"
+            )
         lines.append("top rejection reasons:")
         for reason, count in self.top_rejection_reasons.most_common():
             lines.append(f"  {reason}: {count}")
@@ -207,6 +232,21 @@ def generate_report(
         _most_restrictive_component(a) for a in attributions if not a["cleared_threshold"]
     )
 
+    # Brief 13 Part B: real, report-only -- does not touch scoring or
+    # rejection. round()'d to 1 decimal for the distinct-value tally since
+    # data_completeness is always n/7 * 100 for a real n in [0, 7], so
+    # float rounding noise (e.g. 71.42857142857143) would otherwise
+    # fragment what is really one real value into several near-duplicate
+    # buckets.
+    completeness = [round(a["data_completeness"], 1) for a in attributions]
+    completeness_series = pd.Series(completeness) if completeness else pd.Series([0.0])
+    completeness_distinct = Counter(completeness)
+    correlation = None
+    if len(completeness_distinct) > 1:
+        raw_correlation = pd.Series(scores).corr(pd.Series(completeness))
+        if pd.notna(raw_correlation):
+            correlation = float(raw_correlation)
+
     scores_series = pd.Series(scores) if scores else pd.Series([0.0])
     return DiagnosticReport(
         sessions=len(trading_days),
@@ -221,4 +261,8 @@ def generate_report(
         counterfactual_profitable=counterfactual_profitable,
         counterfactual_not_profitable=counterfactual_not_profitable,
         counterfactual_no_data=counterfactual_no_data,
+        mean_data_completeness=float(completeness_series.mean()),
+        median_data_completeness=float(completeness_series.median()),
+        data_completeness_distinct_values=completeness_distinct,
+        confidence_completeness_correlation=correlation,
     )

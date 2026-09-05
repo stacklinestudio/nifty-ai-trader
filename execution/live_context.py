@@ -831,6 +831,38 @@ def _add_candidate(
         # candidate at all on a RANGE/UNCERTAIN regime.
         override_direction=direction,
     )
+    # Brief 13 Part A: real, per-input DATA AVAILABILITY, separate from
+    # each input's own score/reason -- Brief 12's diagnostic proved
+    # volume_score is 0.0 on 99.6% of real evaluations specifically
+    # because option-chain history is unavailable for this window, not
+    # because real volume, when available, is weak. Conflating "genuinely
+    # weak" and "structurally unavailable" into one number was the real
+    # problem this closes. Each boolean below reuses the EXACT real
+    # condition the corresponding scoring function itself already
+    # branches on (see _combined_volume_score/_option_score's own
+    # `if option_quotes and previous_option_quotes`,
+    # detect_buildup's own `if not previous or not current`, _global_score/
+    # _news_score's own `context.get(...)` reads) -- not a new signal,
+    # just exposing what already gates each function's real vs.
+    # fail-closed-default branch. technical/opening/risk_penalty are
+    # always real once this point is reached: all three are derived from
+    # the same real candle data whose sufficiency already gated entry
+    # into _add_candidate (len(todays) > OPENING_RANGE_MINUTES) and
+    # _select_setup finding a real structural setup -- there is no
+    # separate external dependency for these three the way there is for
+    # the other four.
+    real_option_snapshot_available = bool(option_quotes) and bool(previous_option_quotes)
+    data_available = {
+        "technical_score": True,
+        "opening_score": True,
+        "volume_score": real_option_snapshot_available,
+        "option_score": real_option_snapshot_available,
+        "global_score": bool(context.get("global_context")),
+        "news_score": bool(context.get("news_items")),
+        "risk_penalty": True,
+    }
+    data_completeness = sum(data_available.values()) / len(data_available) * 100.0
+
     # Brief 12 Part A: structured, queryable record of the same real 7
     # inputs SignalEngine just scored -- previously this existed only as
     # the log line below (or, on the cleared-threshold path, as free-text
@@ -860,6 +892,11 @@ def _add_candidate(
         "news_direction": news_direction,
         "risk_penalty": risk_penalty,
         "setup_evidence": setup_evidence,
+        # Brief 13 Part A: additive fields -- every key already present
+        # above is byte-identical to Brief 12's own output (see
+        # tests/test_data_quality.py's regression test).
+        "data_available": data_available,
+        "data_completeness": data_completeness,
     }
     if signal.direction not in {"CALL", "PUT"}:
         # SignalEngine itself vetoed -- a real computed signal that didn't
