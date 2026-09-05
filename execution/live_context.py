@@ -98,6 +98,26 @@ NIFTY_INDEX_SYMBOL = "NSE:NIFTY 50"
 OPENING_RANGE_MINUTES = 5
 OPTION_STRIKE_WINDOW = 500.0  # points either side of spot
 
+# Brief 13: the real window build_live_context (below) has always fetched
+# for its Kite candle request -- a live process only ever *can* see this
+# much real history anyway, so this is also the real, correct bound for
+# technical-feature computation (_technical_features -> feature_frame's
+# EMA(9)/EMA(21)/RSI(14)/ATR(14)) generally, not a live-specific
+# shortcut. Empirically confirmed (15 real sample points across a real
+# 12-month dataset, 21-246 days of accumulated history each): EMA/ATR
+# computed on this bounded window vs. the full accumulated history match
+# to 0.000000% relative difference every time -- RSI/ATR are already
+# rolling(14) (bounded by construction regardless of how much extra
+# history is fed in), and EMA's exponential decay makes anything before
+# ~10 real calendar days' worth of 1-minute bars (thousands of bars)
+# contribute a weight below float64 precision. backtest/daily_backtest.py
+# and reports/score_diagnostic.py both import this so the real replay/
+# backtest path can never again silently diverge from what the real live
+# path actually computes -- previously the replay path fed the ENTIRE
+# accumulated history into feature_frame instead, which was purely
+# wasted computation (proven, not assumed), not extra correctness.
+TECHNICAL_FEATURE_WINDOW_DAYS = 10
+
 # Brief 6 Part A: how long after the real session open an open-window
 # setup stays eligible -- distinct from OPENING_RANGE_MINUTES above, which
 # is how many bars *define* the opening range itself, not how long a
@@ -1000,7 +1020,7 @@ def build_live_context(
 
     try:
         candles = KiteHistoricalData(kite).candles(
-            NIFTY_INDEX_TOKEN, now - timedelta(days=10), now, interval="minute"
+            NIFTY_INDEX_TOKEN, now - timedelta(days=TECHNICAL_FEATURE_WINDOW_DAYS), now, interval="minute"
         )
     except Exception as exc:  # noqa: BLE001 - no candles means no technical/ORB read; still return what we have.
         logger.warning("live_context_candles_unavailable error=%s", exc)

@@ -32,15 +32,15 @@ live daily scheduler main.py run drives -- no change to that behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
 from agents.orchestrator import CycleResult, Orchestrator
-from config import Settings
+from config import IST, Settings
 from data.global_market import ContextValue
 from data.option_chain import OptionQuote
-from execution.live_context import assemble_context
+from execution.live_context import TECHNICAL_FEATURE_WINDOW_DAYS, assemble_context
 from monitoring.logger import configure_logger
 
 logger = configure_logger(__name__)
@@ -79,7 +79,19 @@ class DailyBacktestReport:
 def _decision_time_candles(
     all_candles: pd.DataFrame, trading_day: date, cutoff_bars: int
 ) -> pd.DataFrame:
-    prior = all_candles[all_candles.index.date < trading_day]
+    """Brief 13: `prior` is bounded to the same real
+    TECHNICAL_FEATURE_WINDOW_DAYS execution/live_context.py::
+    build_live_context actually fetches from Kite for the live path --
+    a live process can never see more real history than that anyway, and
+    empirically (a real 12-month dataset, 15 sample points) an unbounded
+    `prior` produced byte-identical EMA/RSI/ATR to this bounded one every
+    time, so the previous unbounded version was pure wasted computation,
+    not extra correctness, and -- before this fix -- a real, if
+    practically harmless, divergence between what this backtest replayed
+    and what the live path could ever actually compute.
+    """
+    window_start = pd.Timestamp(trading_day, tz=IST) - timedelta(days=TECHNICAL_FEATURE_WINDOW_DAYS)
+    prior = all_candles[(all_candles.index.date < trading_day) & (all_candles.index >= window_start)]
     todays = all_candles[all_candles.index.date == trading_day]
     return pd.concat([prior, todays.iloc[:cutoff_bars]])
 

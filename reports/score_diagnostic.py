@@ -20,11 +20,16 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import time as time_of_day
+from datetime import timedelta
 
 import pandas as pd
 
 from config import Settings
-from execution.live_context import OPENING_RANGE_MINUTES, assemble_context
+from execution.live_context import (
+    OPENING_RANGE_MINUTES,
+    TECHNICAL_FEATURE_WINDOW_DAYS,
+    assemble_context,
+)
 from intelligence.technicals import feature_frame
 from research.counterfactual import COUNTERFACTUAL_LABEL, evaluate_counterfactual
 
@@ -145,9 +150,18 @@ def generate_report(
         todays_all = candles[candles.index.date == trading_day]
         if len(todays_all) <= OPENING_RANGE_MINUTES:
             continue
-        prior = candles[candles.index.date < trading_day]
-        if prior.empty:
+        # Real existence check stays unbounded (is there ANY real prior
+        # day at all -- only ever false for the dataset's very first
+        # day(s)); the `prior` actually fed into feature computation
+        # below is bounded to TECHNICAL_FEATURE_WINDOW_DAYS, the same
+        # real window execution/live_context.py::build_live_context
+        # fetches for the live path -- see that constant's own docstring
+        # for the real empirical proof this doesn't change any computed
+        # value, only the cost of computing it.
+        if candles[candles.index.date < trading_day].empty:
             continue
+        window_start = pd.Timestamp(trading_day, tz=candles.index.tz) - timedelta(days=TECHNICAL_FEATURE_WINDOW_DAYS)
+        prior = candles[(candles.index.date < trading_day) & (candles.index >= window_start)]
         decision_times = [ts for ts in todays_all.index if ts.time() <= cutoff][OPENING_RANGE_MINUTES::scan_interval_bars]
         for now in decision_times:
             as_of = pd.concat([prior, todays_all[todays_all.index <= now]])
