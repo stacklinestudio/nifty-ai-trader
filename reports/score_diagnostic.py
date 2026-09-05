@@ -19,12 +19,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from datetime import time as time_of_day
-from datetime import timedelta
 
 import pandas as pd
 
 from config import Settings
+from data.global_market import ContextValue
 from execution.live_context import (
     OPENING_RANGE_MINUTES,
     TECHNICAL_FEATURE_WINDOW_DAYS,
@@ -163,8 +164,27 @@ def _score_bucket(score: float) -> str:
 
 
 def generate_report(
-    candles: pd.DataFrame, settings: Settings, scan_interval_bars: int = 5, cutoff: time_of_day = time_of_day(15, 0)
+    candles: pd.DataFrame,
+    settings: Settings,
+    scan_interval_bars: int = 5,
+    cutoff: time_of_day = time_of_day(15, 0),
+    global_context_by_day: dict[date, list[ContextValue]] | None = None,
 ) -> DiagnosticReport:
+    """global_context_by_day (fix, found via a real reported discrepancy
+    between this function's own 42.9% data_completeness figure and a
+    separate 57.14% figure from backtest/daily_backtest.py::
+    run_daily_backtest on the identical real window): matches
+    run_daily_backtest's own real parameter exactly -- real historical
+    global-market data per real day, e.g. from
+    data/global_market.py::fetch_global_history. Defaults to None/{} -- a
+    day with no entry reads as [] (unavailable), never fabricated. Before
+    this fix, this function had NO parameter for global-market data at
+    all, so global_score was structurally unavailable for every single
+    candidate regardless of whether real data existed for that day --
+    not a live-vs-backtest inconsistency, a real gap in this specific
+    report generator, now closed.
+    """
+    global_context_by_day = global_context_by_day or {}
     trading_days = sorted({ts.date() for ts in candles.index})
     attributions: list[dict] = []
     counterfactual_profitable = 0
@@ -188,9 +208,19 @@ def generate_report(
         window_start = pd.Timestamp(trading_day, tz=candles.index.tz) - timedelta(days=TECHNICAL_FEATURE_WINDOW_DAYS)
         prior = candles[(candles.index.date < trading_day) & (candles.index >= window_start)]
         decision_times = [ts for ts in todays_all.index if ts.time() <= cutoff][OPENING_RANGE_MINUTES::scan_interval_bars]
+        todays_global_context = global_context_by_day.get(trading_day, [])
         for now in decision_times:
             as_of = pd.concat([prior, todays_all[todays_all.index <= now]])
-            context = assemble_context(as_of, [], float(as_of.iloc[-1].close), now.to_pydatetime(), True, settings)
+            context = assemble_context(
+                as_of,
+                [],
+                float(as_of.iloc[-1].close),
+                now.to_pydatetime(),
+                True,
+                settings,
+                previous_option_quotes=None,
+                global_context=todays_global_context,
+            )
             attribution = context.get("score_attribution")
             if attribution is None:
                 continue

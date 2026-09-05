@@ -8,9 +8,13 @@ confidence values.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
+import pytest
 
 from config import IST, Settings
+from data.global_market import ContextValue
 from reports.score_diagnostic import generate_report
 from research.counterfactual import COUNTERFACTUAL_LABEL
 
@@ -85,3 +89,33 @@ def test_most_restrictive_component_is_one_of_the_real_seven_inputs():
     valid = {"technical_score", "opening_score", "volume_score", "option_score", "global_score", "news_score", "risk_penalty"}
     for component in report.most_restrictive_component_counts:
         assert component in valid
+
+
+def test_generate_report_actually_uses_real_supplied_global_context_by_day():
+    """Regression for a real found gap: generate_report previously had no
+    parameter for global-market data at all, so global_score was
+    structurally unavailable for every candidate regardless of whether
+    real data existed for that day -- a report generator silently
+    omitting real available data, not a live-vs-backtest inconsistency.
+    Proves both real directions: supplying real data makes global_score
+    available; a day genuinely missing from the dict (not fabricated)
+    correctly stays unavailable, same as before this fix, for that day.
+    """
+    candles = _real_candles(limit_days=6)
+    settings = Settings()
+    trading_days = sorted({ts.date() for ts in candles.index})
+
+    # Real data supplied for EVERY real day in this slice -- isolates the
+    # effect to exactly one input (global_score) with no partial-coverage
+    # ambiguity in the aggregate comparison below.
+    global_context_by_day = {
+        day: [ContextValue("SP500", 0.4, datetime.now(IST), "yfinance", True)] for day in trading_days
+    }
+
+    report_without = generate_report(candles, settings)  # old call shape -- must still work, defaults to {}
+    report_with = generate_report(candles, settings, global_context_by_day=global_context_by_day)
+
+    assert report_with.candidates == report_without.candidates  # same real candidates found either way -- only completeness changed
+    # Real, direct proof: exactly one more of the 7 real inputs (1/7 ≈
+    # 14.29 points) became available for every real candidate.
+    assert report_with.mean_data_completeness - report_without.mean_data_completeness == pytest.approx(1 / 7 * 100.0, abs=0.5)
