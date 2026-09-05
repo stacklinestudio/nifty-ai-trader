@@ -564,3 +564,107 @@ def test_demo_live_link_sends_a_real_notification_with_the_real_working_link(tmp
         assert "DEMO" in event.output_summary["note"]
     assert result["live_status_url"].startswith("http://")
     assert result["live_status_url"].endswith(f":{settings.live_status_port}/live")
+
+
+# --- Brief 27: a real bug report -- the link was dead on arrival -------
+
+
+def test_run_scheduled_day_starts_the_real_server_before_the_real_trading_day_logic_runs(tmp_path, monkeypatch):
+    """The real, empirically-confirmed fix for a real bug report: the
+    live-status server's real lifetime is tied to the enclosing OS
+    process, not to run_scheduled_day() itself returning -- so it stays
+    reachable for as long as the real trading day (run_trading_day)
+    keeps that process alive. Proven deterministically, safe on any
+    real calendar day (this test never depends on today actually being
+    a real trading day): monkeypatches main.run_trading_day/resume_
+    open_positions (the same established pattern as test_obsidian_
+    wiring.py) so the mocked "day" itself makes a real HTTP request to
+    the live-status server from inside its own call -- proving the
+    server is already up and reachable by the time real trading-day
+    logic would run, not just at the very end.
+    """
+    import main
+    from execution.scheduler import DayResult
+
+    port = 8792
+    settings = Settings(database_path=tmp_path / "paper.db", live_status_port=port)
+    observed: dict = {}
+
+    def fake_run_trading_day(*args, **kwargs):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/live", timeout=3) as response:
+                observed["status"] = response.status
+                observed["body"] = response.read().decode("utf-8")
+        except Exception as exc:  # noqa: BLE001 - captured for the assertion below, not swallowed silently.
+            observed["error"] = repr(exc)
+        return DayResult(ran=True, reason="scan_cutoff_reached", rounds=[])
+
+    monkeypatch.setattr(main, "resume_open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(main, "run_trading_day", fake_run_trading_day)
+
+    main.run_scheduled_day(settings)
+
+    assert observed.get("status") == 200, observed
+    assert "No open position" in observed.get("body", "")
+
+
+def test_demo_live_link_cli_keeps_a_real_server_running_reachable_from_a_separate_process(tmp_path):
+    """The real bug this brief fixes, reproduced and then proven fixed:
+    a real bug report found the link in demo-live-link's own real
+    notification was dead on arrival -- ERR_CONNECTION_REFUSED
+    immediately, not "after a few minutes" -- because the command never
+    started a server at all. Runs the REAL CLI as a genuinely separate
+    OS subprocess (exactly how a user invokes it) and makes a real HTTP
+    request from THIS process (a separate one) while it's running --
+    this is the real test that would have caught the original bug,
+    since the original manual verification fetch ran from inside the
+    same process/session that happened to still be alive at that
+    moment. Then terminates it and confirms the real port is freed,
+    direct proof the server was genuinely tied to this process."""
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    port = 8793
+    env = dict(os.environ)
+    env["LIVE_STATUS_PORT"] = str(port)
+    env["DATABASE_PATH"] = str(tmp_path / "demo_link_cli.db")
+    env["DISCORD_WEBHOOK_URL"] = ""
+    env["TELEGRAM_BOT_TOKEN"] = ""
+
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(
+        [sys.executable, "main.py", "demo-live-link"],
+        cwd=str(repo_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        body = None
+        for _ in range(40):
+            if proc.poll() is not None:
+                break  # the real process already exited -- stop polling, fail below with its real output
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/live", timeout=1) as response:
+                    body = response.read().decode("utf-8")
+                    break
+            except Exception:  # noqa: BLE001 - any connection-not-ready error is expected while polling for real startup.
+                time.sleep(0.25)
+
+        assert body is not None, f"real server never became reachable; process output so far:\n{proc.stdout.read()}"
+        assert "DEMO DATA" in body
+        assert "NOT A REAL POSITION" in body
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # After the real process is gone, the real port must be free again --
+    # confirms the server was genuinely tied to this specific process,
+    # not some other, coincidentally-already-running server.
+    time.sleep(0.5)
+    with pytest.raises(Exception):  # noqa: B017 - any connection failure is the real, expected proof here.
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/live", timeout=1)

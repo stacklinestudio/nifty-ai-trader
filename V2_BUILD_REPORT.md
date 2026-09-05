@@ -6532,3 +6532,114 @@ actually landed, exactly as requested. The real demo state was cleared
 from the real production database (`Database.clear_demo_position()`)
 immediately after capturing this evidence, so it doesn't linger
 indefinitely on the real page.
+
+## Brief 27: real bug report — the demo link was dead on arrival (2026-09-06)
+
+A real user clicked the real link Brief 26's demo notification sent and
+got `ERR_CONNECTION_REFUSED`. Investigated directly rather than assumed.
+
+### Real, confirmed findings
+
+**1. `demo-live-link` never started a server at all.** Confirmed with a
+real, immediate reproduction — no waiting "a few minutes" required:
+
+```
+$ python main.py demo-live-link
+Demo position written (DEMO DATA, not a real trade): DEMO-NIFTY00000CE
+Live status page: http://192.168.1.2:8765/live
+Discord sent: True  Telegram sent: True
+
+$ curl -s -m 3 -o /dev/null -w "curl exit/http_code: %{exitcode}/%{http_code}\n" http://127.0.0.1:8765/live
+curl exit/http_code: 7/000   (connection refused, immediately)
+```
+
+`main.demo_live_link()` only ever wrote the demo state and sent the
+notification — it never called `run_live_status_server_in_background`
+or anything like it. The link only ever worked in my own prior brief's
+report because I had *separately* started `python main.py live-status`
+moments before, in a different terminal — an accidental, not a real,
+dependency. This is the confirmed root cause of the real incident.
+
+**2. `python main.py start-day` / `run_scheduled_day` — this one is
+correct for the real Monday case**, confirmed empirically rather than
+argued from reading the code alone. A real subprocess test, run today
+against the actual, unmocked `run_scheduled_day`:
+
+```
+$ python -c "... subprocess.Popen(['python','-c','import main; main.run_scheduled_day(main.Settings())']) ..."
+was server reachable while the subprocess was alive: 200
+AFTER the real run_scheduled_day subprocess exited: NOT reachable -> [WinError 10061] connection actively refused
+```
+
+Real, precise mechanism confirmed: the live-status server's daemon
+thread dies exactly when — and only when — the enclosing real OS
+process exits, never merely because the Python function `run_scheduled_
+day()` returns. Today (a real non-trading day) `run_trading_day` returns
+almost instantly, so the process exits quickly and the server goes down
+with it — correctly, since there's no real trading session to show
+status for. On an actual real trading day, `run_trading_day` blocks
+synchronously for the entire real session (existing, independently
+tested behavior, unchanged by this brief) — meaning the enclosing
+process, and therefore the server, stays alive for that entire real
+duration too. **Not a bug for Monday** — but previously unverified by a
+real test, only assumed. Now it is: `test_run_scheduled_day_starts_the_
+real_server_before_the_real_trading_day_logic_runs` mocks `run_trading_
+day` to make a real HTTP request to the live server from *inside* its
+own call, proving the server is already up and reachable by the time
+real trading-day logic would run — deterministic, safe on any real
+calendar day, never dependent on today actually being a trading day.
+
+### The fix
+
+`demo-live-link`'s CLI handler now does what it should have from the
+start: writes the demo state, sends the real notification, **then
+blocks in the foreground serving the real page** (`server.serve_
+forever()`, `Ctrl+C` to stop) — exactly like `live-status`, with an
+explicit printed message per the brief's own instruction:
+
+```
+Standalone demo mode: this command does NOT start the real trading day --
+the server below is what keeps the link above alive. Press Ctrl+C to stop
+(the demo state stays in the database until then, or until a real trade opens).
+```
+
+`main.demo_live_link()` itself (the function: write state + send
+notification) is unchanged and stays independently testable — only the
+CLI wrapper gained the real, persistent serving behavior.
+
+### The real test that would have caught this
+
+Per the brief's own explicit instruction: a real fetch from a
+**separate process**, not the same one that started the server.
+`test_demo_live_link_cli_keeps_a_real_server_running_reachable_from_a_
+separate_process` runs the real CLI as a genuine OS subprocess
+(`subprocess.Popen([sys.executable, "main.py", "demo-live-link"], ...)`)
+and polls it with real HTTP requests from the test process — a
+genuinely separate process, precisely reproducing how a real user's
+browser would connect. Confirms the real DEMO banner renders, then
+terminates the subprocess and confirms the real port is freed
+afterward — direct proof the server was tied to that specific process,
+not a coincidence of something else already listening.
+
+```
+$ python -m pytest tests/test_live_status_server.py -k "run_scheduled_day_starts or demo_live_link_cli_keeps" -v
+test_run_scheduled_day_starts_the_real_server_before_the_real_trading_day_logic_runs PASSED
+test_demo_live_link_cli_keeps_a_real_server_running_reachable_from_a_separate_process PASSED
+2 passed in 5.61s
+
+$ pytest -q
+440 passed in 103.62s
+$ ruff check .
+All checks passed!
+```
+
+### Plain answer to the brief's own question
+
+**`demo-live-link` had the gap; `start-day` did not.** `start-day`'s
+live-status server correctly stays up for the whole real trading day
+because it shares the same OS process as the real trading loop, which
+itself blocks for the whole real session — verified today with a real
+subprocess test, not just re-read from the code. `demo-live-link` is
+now fixed to behave as the standalone testing tool it was always meant
+to be: it says so explicitly, and it actually stays running until
+`Ctrl+C`.

@@ -731,15 +731,35 @@ def main() -> int:
             server.shutdown()
         return 0
     if args.command == "demo-live-link":
-        # Brief 26: writes a clearly-labeled DEMO position (never the
-        # real open_positions table) and sends a real Discord/Telegram
-        # notification with the real, working live-status link -- for
-        # verifying end-to-end delivery/rendering without a real trade.
-        result = demo_live_link(settings)
+        # Brief 27 fix: a real bug report confirmed demo_live_link()
+        # alone never started a server -- the real notification's link
+        # was dead the instant the command returned (ERR_CONNECTION_
+        # REFUSED immediately, not "after a few minutes"), unless some
+        # OTHER process happened to already be serving that port. This
+        # command is explicitly a standalone way to test the page
+        # without running the whole day (per the real bug report's own
+        # instruction) -- it now says so and actually stays up:
+        # writes the clearly-labeled DEMO position (never the real
+        # open_positions table), sends the real Discord/Telegram
+        # notification, then blocks in the foreground serving the real
+        # page (Ctrl+C to stop), exactly like `live-status`.
+        database = Database(settings.database_path)
+        database.initialize()
+        result = demo_live_link(settings, database=database)
         print(f"Demo position written (DEMO DATA, not a real trade): {result['mock_view']['symbol']}")
         print(f"Live status page: {result['live_status_url']}")
         print(f"Discord sent: {result['discord_sent']}  Telegram sent: {result['telegram_sent']}")
         print("(If neither channel is configured, this correctly reports False -- same as `notifications`.)")
+        print(
+            "Standalone demo mode: this command does NOT start the real trading day -- "
+            "the server below is what keeps the link above alive. Press Ctrl+C to stop "
+            "(the demo state stays in the database until then, or until a real trade opens)."
+        )
+        server = build_live_status_server(database, settings.live_status_port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            server.shutdown()
         return 0
     if args.command == "demo-trade":
         # Deliberately builds its own fully isolated Settings internally
