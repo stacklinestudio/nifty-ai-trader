@@ -4109,57 +4109,83 @@ gateable 1/7 case for the one input that genuinely has one.
 explicit `UNDEFINED` correlation state when there's no real variance to
 correlate (never fabricated as `0`, never silently dropped).
 
-**Real 42-day result** (same dataset and driver as Brief 12,
-`scan_interval_bars=5`, unchanged):
+**CORRECTED (2026-09-05, same day) — the figure originally reported here
+was wrong; this is the real, now-correctly-computed one.** The original
+version of this section reported `data_completeness = 42.9%` from
+`generate_report`, and separately reported `57.14%` from a
+`run_daily_backtest` cross-check, describing the second as "independently
+confirming" the first. **That was incorrect** — the two real figures
+disagreed by exactly one input's worth (`global_score`), and describing
+them as confirming each other was a real mistake in that write-up, not
+just an ambiguity. Root cause, found and fixed the same day:
+`reports/score_diagnostic.py::generate_report` had **no parameter for
+global-market data at all** — every real candidate it ever scored had
+`global_score` structurally marked unavailable, regardless of whether
+real global data existed for that day, because the function had no way
+to receive it. `backtest/daily_backtest.py::run_daily_backtest` already
+accepted `global_context_by_day`; `generate_report` didn't. Not a
+live-vs-backtest inconsistency — a real, one-sided gap in this specific
+report generator. Fixed by giving `generate_report` the identical real
+parameter `run_daily_backtest` already had (commit `ac72a87`), with a new
+regression test (`test_generate_report_actually_uses_real_supplied_global_context_by_day`)
+proving it now actually uses real supplied data — a ~14.3-point
+(1/7) real `mean_data_completeness` shift between a run with real global
+data supplied for every day vs. none, so this exact class of gap (a
+diagnostic tool silently omitting real available data) can't quietly
+reappear.
+
+**The real, correct 42-day result** (same dataset and driver as Brief 12,
+`scan_interval_bars=5`, real cached global-market history now supplied
+via the fixed `global_context_by_day` parameter):
 
 ```
 sessions (real trading days scanned): 42
 candidates (real structural setups scored): 1756
-data_completeness: median=42.9% mean=42.9%
+data_completeness: median=57.1% mean=57.1%
 data_completeness real distinct values (Brief 13 Part A, report-only):
-  42.9%: 1756 (100.0%)
+  57.1%: 1756 (100.0%)
 confidence vs. data_completeness correlation: UNDEFINED -- data_completeness has zero real variance in this dataset (every candidate has the same real completeness), so no correlation coefficient is computable, not silently reported as 0 or omitted.
 ```
 
-Runtime: 183.0s — also a real, if secondary, confirmation of the
-above-recapped performance fix: the *identical* 42-day/`scan_interval_bars=5`
-configuration that took 751.6s in Brief 12 now takes 183.0s (4.1x;
-smaller than the 12-month window's 156.6x, exactly as expected, since a
-42-day window's average accumulated history was always much shorter than
-a 12-month one's — the algorithmic gap the fix closes scales with window
-length).
+**57.1%, not 42.9%** — now genuinely matching the `run_daily_backtest`
+cross-check's 57.14% (the small residual decimal difference is real
+rounding: `generate_report`'s 1756-candidate multi-scan-per-day tally vs.
+`run_daily_backtest`'s single-decision-point-per-day 35-candidate tally,
+both landing on the same real 4/7 = 57.142857...% ratio). Every other
+real value in this report — candidate count, score distribution,
+median/mean confidence, counterfactual split — is **unchanged** by this
+fix, confirming it touched only completeness computation, nothing about
+scoring or rejection.
 
-**Cross-checked independently against the higher-fidelity `run_daily_backtest`
-path too** (which *does* supply real cached global-market data, unlike
-`generate_report`), to rule out this being an artifact of the simpler
-report generator specifically:
-
-```
-trading days evaluated: 42   candidates formed: 0   real signals persisted: 35
-real distinct data_completeness values: Counter({57.14: 35})
-```
-
-**Still constant** — 57.14% (4/7: technical, opening, global, risk_penalty
-real; volume, option, news unavailable) for all 35 real evaluations, via
-a completely independent real code path.
+Runtime: 166.3s for this corrected run (the original 42.9% run measured
+183.0s under the same configuration) — also a real, if secondary,
+confirmation of the earlier-recapped performance fix: the *identical*
+42-day/`scan_interval_bars=5` configuration that took 751.6s in Brief 12
+now takes well under three minutes either way (4.1–4.5x; smaller than the
+12-month window's 156.6x, exactly as expected, since a 42-day window's
+average accumulated history was always much shorter than a 12-month
+one's — the algorithmic gap that fix closes scales with window length).
 
 **The honest, real answer to "does confidence correlate with
-data_completeness the way the 99.6% finding suggests it should"**:
+data_completeness the way the 99.6% finding suggests it should"** stands
+unchanged by this correction, now on the correct real number:
 **cannot be tested within this specific 42-day window, by either real
 methodology available in this codebase.** `data_completeness` has *zero*
 real variance across the entire window — not low variance, zero — because
 the missing option-chain and news data is completely absent for the full
-42 real days, not merely usually absent. This is itself a real, useful
-finding, not a null result from a weak signal: it directly explains *why*
-Brief 13 Part 2's archiving job matters beyond "more data is nice" — only
-once real weeks with genuinely varying completeness exist (some with a
-real persisted option snapshot, some without) does this correlation even
-become a testable question. Not attempted to force a correlation from a
-constant value; reported honestly as `UNDEFINED` instead.
+42 real days, not merely usually absent (both real methodologies now
+agree at 4/7 = 57.1% real inputs available, every single day). This is
+itself a real, useful finding, not a null result from a weak signal: it
+directly explains *why* Brief 13 Part 2's archiving job matters beyond
+"more data is nice" — only once real weeks with genuinely varying
+completeness exist (some with a real persisted option snapshot, some
+without) does this correlation even become a testable question. Not
+attempted to force a correlation from a constant value; reported honestly
+as `UNDEFINED` instead.
 
 ```
 $ pytest -q
-309 passed in 58.55s
+310 passed in 79.91s
 $ ruff check .
 All checks passed!
 ```
