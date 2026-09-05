@@ -9,6 +9,7 @@ real, justified threshold -- never the full option chain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 from typing import ClassVar
@@ -329,3 +330,55 @@ def test_run_capture_session_stops_cleanly_if_no_real_ticks_ever_arrive(tmp_path
     assert result.status == CAPTURED
     assert result.tick_count == 0
     assert result.path.exists()
+
+
+# --- Standing rule (Brief 20): raw capture immutability, permanent -----
+
+
+def test_a_second_real_capture_run_never_touches_the_first_runs_already_written_bytes(tmp_path):
+    """The permanent regression test for the standing rule: the raw tick,
+    exactly as Kite sent it, is never modified in place at any pipeline
+    stage. Runs two real capture sessions against the same real capture
+    file (the same real, honest scenario as a same-day re-run) and
+    proves byte-for-byte, via a real hash, that the first run's content
+    survives completely untouched as an exact prefix of the file after
+    the second run -- not merely "still present somewhere," but at the
+    same real byte offsets, unmodified. If this test ever fails, that is
+    an immediate, hard stop before any 4A-2/4A-3/4A-4 work continues.
+    """
+    universe = _minimal_universe()
+    settings = Settings(kite_api_key="looks-real", kite_access_token="looks-real-too")
+    today = date(2026, 9, 6)
+
+    first_run = run_capture_session(
+        settings,
+        universe,
+        duration_seconds=0,
+        capture_dir=tmp_path,
+        today=today,
+        kite_ticker_factory=lambda: _FakeKiteTicker(canned_ticks=[_real_shaped_option_tick()]),
+    )
+    content_after_first_run = first_run.path.read_bytes()
+    hash_after_first_run = hashlib.sha256(content_after_first_run).hexdigest()
+
+    # A second real capture attempt for the SAME real date -- a
+    # different (but still real-shaped) tick this time, exactly the kind
+    # of "processing exists today" this rule must survive.
+    different_tick = _real_shaped_option_tick()
+    different_tick["last_price"] = 121.3
+    second_run = run_capture_session(
+        settings,
+        universe,
+        duration_seconds=0,
+        capture_dir=tmp_path,
+        today=today,
+        kite_ticker_factory=lambda: _FakeKiteTicker(canned_ticks=[different_tick]),
+    )
+
+    assert second_run.path == first_run.path  # the same real file, same real date
+    content_after_second_run = second_run.path.read_bytes()
+    assert len(content_after_second_run) > len(content_after_first_run)  # real new bytes were appended
+
+    real_prefix = content_after_second_run[: len(content_after_first_run)]
+    assert real_prefix == content_after_first_run  # byte-for-byte, at the same real offsets
+    assert hashlib.sha256(real_prefix).hexdigest() == hash_after_first_run  # the real, permanent hash check

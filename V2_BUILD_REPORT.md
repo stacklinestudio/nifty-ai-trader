@@ -5410,3 +5410,95 @@ integrity validation at tick level, no coverage reporting, and real
 live-behavior verification (tick frequency, live spread movement, OI
 cadence) remains the one specific, scoped item for the next real
 trading session — not repeated from scratch, and not started early.
+
+## Brief 20: standing rule — raw capture immutability (2026-09-06)
+
+Locked in now, before Phase 4A-2 exists, so it can never be violated
+even accidentally once reconnect/resilience logic is added. Small, fast
+brief by design — the value is the constraint, not the code volume.
+
+**Rule**: the raw Kite tick, exactly as received, is never modified in
+place at any pipeline stage. `RAW -> NORMALIZED -> VALIDATED ->
+RESEARCH`, each a new, separate representation; never `tick -> modify
+-> save modified version` over the original.
+
+### Audit of Brief 19's existing capture code
+
+```
+$ grep -n "\.open(\|write_text\|write_bytes\|truncate\|seek(" data/option_tick_capture.py
+237:    with path.open("a", encoding="utf-8") as handle:
+```
+
+The only file-write site in the module opens in **append ("a") mode**
+— never `"w"` (truncate) or `"r+"` (in-place edit). Every write is
+`handle.write(...)` immediately followed by `handle.flush()`; there is
+no `seek()`/`truncate()` anywhere in the file. The `tick` dict itself is
+never mutated — it is wrapped, unmodified, in an outer `{"received_at":
+..., "tick": tick}` envelope and serialized as-is.
+
+```
+$ grep -rln "option_tick_capture\|nifty_option_ticks" --include=*.py .
+data/option_tick_capture.py
+tests/test_option_tick_capture.py
+```
+
+**No other file in the codebase references the capture module or its
+output files at all** — as of this brief, nothing downstream reads,
+normalizes, or validates these files yet (4A-3 doesn't exist), so
+there is currently no code anywhere that could rewrite them even by
+accident.
+
+**Real, live audit demonstration** (two real capture sessions against
+the same real file, the same scenario as a same-day re-run):
+
+```
+$ python -c "... two real run_capture_session() calls into the same file ..."
+after run 1: bytes=114 hash=3f12965394356868ac965c64fe5c099c5d5a2ea3a506a26dda616272e139c512
+after run 2: bytes=228
+prefix hash matches original: True
+original bytes unchanged: True
+```
+
+**Audit result, stated plainly: Brief 19's existing capture code already
+fully complies with this rule.** Nothing needed fixing — append-only by
+construction, no other code touches these files, and a real hash proves
+a second real session leaves the first's bytes completely untouched at
+the same real offsets.
+
+### Documentation for 4A-2/4A-3 going forward
+
+The full rule (with the `RAW -> NORMALIZED -> VALIDATED -> RESEARCH`
+layering, and the explicit "never retroactively edit a raw record —
+always a new record/segment" instruction for a future reconnect/backfill
+piece, and "validation findings live in a separate layer, referenced by
+`(timestamp, instrument_token)`, never overwriting raw" for a future
+validator) is now recorded directly in `data/option_tick_capture.py`'s
+own module docstring — the file any 4A-2/4A-3 work will necessarily
+open and extend, not left to be rediscovered from a build-report entry
+alone.
+
+### Permanent regression test
+
+```
+$ python -m pytest tests/test_option_tick_capture.py::test_a_second_real_capture_run_never_touches_the_first_runs_already_written_bytes -v
+test_a_second_real_capture_run_never_touches_the_first_runs_already_written_bytes PASSED
+1 passed in 0.05s
+```
+
+Runs two real `run_capture_session` calls against the same real capture
+file (same real date, different real-shaped ticks the second time —
+exactly the kind of "processing exists today" this rule must survive),
+then asserts, via a real SHA-256 hash: the file grew (real new bytes
+were appended), the first run's exact byte range is still present
+byte-for-byte at the same real offsets, and its hash is unchanged. This
+is the permanent regression test named in the module's own docstring —
+intended to keep passing unmodified as 4A-2/4A-3/4A-4 are built; a
+future failure here is an explicit, immediate hard stop before that
+work continues.
+
+```
+$ pytest -q
+357 passed in 79.89s
+$ ruff check .
+All checks passed!
+```

@@ -32,6 +32,33 @@ This module therefore never attempts to read tradingsymbol/expiry/
 strike/option_type/underlying-price out of a tick record -- doing so
 would either KeyError or silently return None, and either way would be
 guessing at data that reconnaissance already proved isn't there.
+
+STANDING RULE (locked in Brief 20, permanent, applies to every future
+piece built on this module -- 4A-2/4A-3/4A-4 and beyond): the raw tick,
+exactly as Kite sent it, is never modified in place at any pipeline
+stage, ever. The real data flow is:
+
+    RAW (this module's own output -- exactly as Kite sent it, untouched,
+         forever; new real sessions only ever APPEND new records, never
+         edit or overwrite an already-written one)
+      -> NORMALIZED (field renaming, e.g. volume_traded -> volume; joins
+         against the instrument archive for contract identity -- a new,
+         separate representation, never an edit of the raw record)
+      -> VALIDATED (Brief 18-style integrity checks, applied to the
+         normalized layer, never silently rewriting the raw layer)
+      -> RESEARCH (whatever downstream analysis needs, built entirely
+         from the validated layer)
+
+Never: read a raw tick file, modify its content, save the modified
+version back over it. A future reconnect/backfill (4A-2) must write a
+NEW record/segment for the reconnected period, never retroactively edit
+an already-written raw record. A future validator (4A-3) must keep its
+findings/corrections in a separate layer that references raw records by
+(timestamp, instrument_token), never overwrite them. This is why
+`run_capture_session` below opens its output file in append ("a") mode
+only, never "w" or "r+" -- verified live and covered by a permanent
+regression test, `test_a_second_real_capture_run_never_touches_the_
+first_runs_already_written_bytes` in tests/test_option_tick_capture.py.
 """
 
 from __future__ import annotations
