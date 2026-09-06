@@ -7305,3 +7305,36 @@ All checks passed!
 ```
 
 476 real tests passing -- the same count as claimed before this bug report, now genuinely, freshly re-verified (not re-asserted from a stale run). One test file changed (`tests/test_live_status_server.py`, one fixed timestamp); no production code changed.
+
+## Usability fix: Ctrl+C responsiveness of start-day's blocking wait on Windows (2026-09-06)
+
+### 1. Confirmed -- and confirmed exactly which command was affected
+
+Checked every real blocking-wait mechanism in `main.py`: `start-day`'s own post-gate-failure block used a bare `threading.Event().wait()` with no timeout -- exactly the mechanism described. `live-status` and `demo-live-link` were **not** affected by this specific issue: both already use `server.serve_forever()`, whose stdlib implementation internally loops on `selector.select(poll_interval=0.5)` -- the same "wake up periodically and check" shape being asked for here -- so their Ctrl+C handling was never at risk from this class of bug.
+
+### 2. The real fix
+
+Replaced the bare indefinite wait with a loop of short-timeout waits:
+
+```python
+stop_event = threading.Event()
+try:
+    while not stop_event.wait(timeout=1):
+        pass
+except KeyboardInterrupt:
+    pass
+```
+
+`Event.wait(timeout=1)` returns control to the Python interpreter every real second, giving it a real chance to notice and raise a pending `KeyboardInterrupt` -- unlike an indefinite `Event().wait()`, which blocks on a real OS-level wait Windows does not reliably interrupt for a real Ctrl+C signal.
+
+```
+$ pytest -q
+476 passed in 128.40s
+
+$ ruff check .
+All checks passed!
+```
+
+### 3. Cannot be fully automated -- stated plainly
+
+This is real, interactive, Windows-console signal-delivery behavior. `tests/test_start_day.py`'s own real subprocess test (`test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure`) still passes, but it stops the subprocess with `proc.terminate()` (a hard `TerminateProcess` kill), which says nothing about Ctrl+C responsiveness specifically -- reliably delivering a real `CTRL_C_EVENT` to a Windows child process from an automated test requires `CREATE_NEW_PROCESS_GROUP`/`GenerateConsoleCtrlEvent` plumbing that is itself known to be fragile and console-session-dependent, and a false "pass" there would be worse than no automated test at all. **This fix has not been verified against a real Ctrl+C in a real interactive terminal, and should not be considered fully resolved until it is.** Manual confirmation needed: run `python main.py start-day` with no real Kite session, wait for "Press Ctrl+C to stop," press Ctrl+C in that real terminal, and confirm the process exits within about a second (rather than hanging or requiring multiple presses).

@@ -789,8 +789,24 @@ def main() -> int:
                     f"dashboard stays up: {dashboard_url(settings)} "
                     f"(live position page: {live_status_url(settings)}). Press Ctrl+C to stop."
                 )
+                # Real usability issue: a bare threading.Event().wait()
+                # with no timeout blocks on a real OS-level wait that
+                # Windows does not reliably interrupt for a real Ctrl+C
+                # -- the interpreter only gets a chance to notice a
+                # pending KeyboardInterrupt when it returns to running
+                # Python bytecode, which an indefinite wait may not do
+                # for a long time (if ever) on Windows. Looping on a
+                # short-timeout wait instead -- the same "wake up
+                # periodically" shape server.serve_forever() already
+                # uses internally (its own selector.select(poll_interval)
+                # loop, which is why live-status/demo-live-link's
+                # Ctrl+C handling was never affected by this) -- returns
+                # control to the interpreter every real second, so a
+                # real Ctrl+C is caught promptly and reliably.
+                stop_event = threading.Event()
                 try:
-                    threading.Event().wait()
+                    while not stop_event.wait(timeout=1):
+                        pass
                 except KeyboardInterrupt:
                     pass
             return 0
