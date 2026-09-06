@@ -7338,3 +7338,187 @@ All checks passed!
 ### 3. Cannot be fully automated -- stated plainly
 
 This is real, interactive, Windows-console signal-delivery behavior. `tests/test_start_day.py`'s own real subprocess test (`test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure`) still passes, but it stops the subprocess with `proc.terminate()` (a hard `TerminateProcess` kill), which says nothing about Ctrl+C responsiveness specifically -- reliably delivering a real `CTRL_C_EVENT` to a Windows child process from an automated test requires `CREATE_NEW_PROCESS_GROUP`/`GenerateConsoleCtrlEvent` plumbing that is itself known to be fragile and console-session-dependent, and a false "pass" there would be worse than no automated test at all. **This fix has not been verified against a real Ctrl+C in a real interactive terminal, and should not be considered fully resolved until it is.** Manual confirmation needed: run `python main.py start-day` with no real Kite session, wait for "Press Ctrl+C to stop," press Ctrl+C in that real terminal, and confirm the process exits within about a second (rather than hanging or requiring multiple presses).
+
+## Final Brief: Command Center visual redesign (2026-09-06)
+
+Presentation layer only, as scoped. `build_dashboard_view` -- the actual
+real data aggregation -- is completely untouched; confirmed by diffing
+the specific function boundaries, not just by intent:
+
+```
+$ git diff monitoring/live_status_server.py | grep -A5 "^@@" | grep "def build_dashboard_view\|def current_position_view\|def all_open_position_views\|def _position_view_from_state\|def check_nifty_ltp\|def find_latest_candle_csv\|def load_recent_candles"
+no diff hunks touch these data-layer functions
+```
+
+Two files changed: `monitoring/live_status_server.py` (rendering
+functions, plus one route line so `render_dashboard` receives
+`settings` for two purely-presentational reads -- `settings.
+trading_mode` for the sidebar mode pill, `settings.market_open`/
+`market_close` for the hero's open/closed label, both already-real,
+already-loaded config values, zero new computation) and `tests/
+test_dashboard.py` (tests only). No `agents/`, `execution/`,
+`storage/`, `risk/`, `data/`, `learning/`, `research/`, or `main.py`
+file touched.
+
+```
+$ git status --porcelain=v1
+ M monitoring/live_status_server.py
+ M tests/test_dashboard.py
+
+$ git diff --stat
+ monitoring/live_status_server.py | 467 +++++++++++++++++++++++++++++++--------
+ tests/test_dashboard.py          | 138 ++++++++++++
+ 2 files changed, 513 insertions(+), 92 deletions(-)
+```
+
+### Sections built (all reusing existing real data, per the brief's own list)
+
+1. **Sidebar** -- 9 real scroll-anchors (Overview, Market, Intelligence,
+   Candidate, Position, Health, Data Capture, Notifications, Events),
+   plain `#id` links (no routing, no JS), a real current mode indicator
+   read from `settings.trading_mode`, real Kite/AI status at the bottom
+   (both reused gate checks). A dedicated real end-to-end test proves
+   every sidebar `href="#x"` has a real matching `id="x"` element on
+   the same page, not a dead link.
+2. **Hero market header** -- real NIFTY LTP (or the explicit no-data
+   state), real market open/closed state (derived from `settings.
+   market_open`/`market_close` vs. the real render-time clock), real
+   Kite/AI/Capture/Health status inline as pips. Intraday change is
+   honestly labeled "not tracked yet" rather than fabricated -- no real
+   reference/previous price is plumbed anywhere in this project, and
+   computing one would have been new data this brief's own ground rules
+   forbid.
+3. **KPI row** -- today's real P&L, real trade count vs. the real
+   configured daily limit, real confidence, real EV (labeled per hard
+   requirement #2), real regime, real risk utilization -- each honestly
+   `NO REAL DATA YET` (hard requirement #1) when no real value exists
+   yet, real numbers (including real zeros) when it does.
+4. **Intelligence pipeline** -- unchanged real stage data
+   (Research/Signal/EV/Adversarial/Supervisor), EV now carries the
+   `MEASUREMENT ONLY` tag consistently.
+5. **Candidate card** -- the real 7-component `score_attribution` as
+   horizontal contribution bars instead of a plain table; same real
+   numbers, same real "not present" honesty for a component that hasn't
+   fired.
+6. **Position card** -- unchanged real fields (entry/LTP/stop/target/
+   P&L, real Kite chart link when a real instrument token exists); the
+   real, still-correct "No position currently open." empty-state text
+   is kept verbatim (not replaced) so the existing regression checks
+   for it stay meaningful, not just passing by coincidence.
+7. **Health panel** -- all 7 real checks with equal visual weight, the
+   real overall verdict prominent, and the real specific blocking
+   reasons listed underneath when blocked.
+8. **Events timeline** -- unchanged real data and the real three-way
+   badge distinction (hard requirement #3).
+9. **Data Capture & Foundation card** -- real option tick capture status
+   and real instrument archive validity (both reused gate checks) plus
+   two static, honest, permanent architectural facts: raw-tick
+   immutability (Brief 20, permanent) and the real current absence of
+   historical option P&L reconstruction / trade calibration data,
+   labeled exactly as the brief asked -- `NOT AVAILABLE YET` / `0 REAL
+   TRADES` -- stated plainly, not hidden.
+
+### Hard requirements -- real command output
+
+**#1, no real-looking zero for absent data** -- confidence/EV/regime
+render the explicit `NO REAL DATA YET` state, never a numeric 0.00,
+when nothing has been measured (verified per-KPI-tile, not just
+page-wide):
+
+```
+$ python -m pytest tests/test_dashboard.py::test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values -v
+test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values PASSED
+```
+
+**#2, EV always labeled MEASUREMENT ONLY** -- checked both when EV is
+genuinely absent and when a real value exists, in both real places it
+appears (KPI row, Intelligence pipeline):
+
+```
+$ python -m pytest tests/test_dashboard.py::test_hard_requirement_2_ev_always_carries_the_measurement_only_label -v
+test_hard_requirement_2_ev_always_carries_the_measurement_only_label PASSED
+```
+
+**#3, NO_TRADE vs. fill visually unmistakable** -- the existing badge
+distinction test still passes unchanged, plus a new dedicated test
+verifying the two badges' actual shipped CSS rules use genuinely
+different colors (green for fills, amber for NO_TRADE), not just
+different text:
+
+```
+$ python -m pytest tests/test_dashboard.py::test_hard_requirement_3_no_trade_and_fill_badges_have_genuinely_different_visual_treatment -v
+test_hard_requirement_3_no_trade_and_fill_badges_have_genuinely_different_visual_treatment PASSED
+```
+
+**#4, BLOCKED impossible to miss** -- a real, page-level `.blocked-
+banner` element (present only when genuinely BLOCKED) plus a real
+`<body class="blocked">` state change, verified never present when
+READY:
+
+```
+$ python -m pytest tests/test_dashboard.py::test_hard_requirement_4_blocked_verdict_shows_a_real_page_level_banner -v
+test_hard_requirement_4_blocked_verdict_shows_a_real_page_level_banner PASSED
+```
+
+Real, rendered banner from a live server with no real Kite credentials
+configured (a real BLOCKED verdict, not synthetic):
+
+```html
+<body class="blocked">
+...
+<div class="blocked-banner" role="alert">
+<strong>&#9888; SYSTEM HEALTH: BLOCKED</strong>
+<ul><li>kite_connection: no real Kite credentials configured</li>
+<li>ai_provider: AI provider unavailable (UnavailableProvider selected)</li>
+<li>instrument_archive: ...archived date 2026-09-06 is not a real NSE trading day</li>
+<li>data_completeness: no real signal recorded yet</li>
+<li>notifications: telegram=unreachable/not configured...</li></ul>
+</div>
+```
+
+### Real end-to-end smoke test against real injected data
+
+A live server, real open position (real instrument_token), real
+signal, real trade record, real events -- every section checked
+against the actual served HTML:
+
+```
+status/len: 50829
+sidebar brand: OK
+mode pill: OK
+all 9 sidebar anchors: OK
+hero LTP no-data (no kite creds): OK
+market session label: OK
+KPI row: OK
+EV measurement only: OK
+candidate bars: OK
+position card + kite link: OK
+health section id: OK
+data foundation facts: OK
+immutability fact: OK
+event badges: OK
+no form/button: OK
+```
+
+### Full regression
+
+The complete existing content-assertion suite passes unchanged (same
+real data in, same real data out -- only presentation differs), plus 5
+new tests (4 hard-requirement tests + the sidebar-anchor structural
+test):
+
+```
+$ pytest -q
+481 passed in 122.60s
+
+$ ruff check .
+All checks passed!
+```
+
+481 real tests passing (up from 476). Confirmed explicitly: this stays
+one single page (all 9 sidebar destinations are `#anchor` scroll
+targets inside the same `/dashboard` document, not separate routes --
+`/` and `/dashboard` still serve byte-identical output); read-only
+throughout (no new write handler, no `<form>`, no `<button>` anywhere
+in the redesigned markup); and the diff is scoped entirely to
+presentation, as shown above.

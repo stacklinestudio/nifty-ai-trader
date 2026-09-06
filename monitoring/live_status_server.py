@@ -549,13 +549,58 @@ def _check_row(check: Any) -> str:
     )
 
 
-def _render_gate_section(gate: Any) -> str:
+_NO_DATA_HTML = '<span class="no-data">NO REAL DATA YET</span>'
+_EV_TAG_HTML = '<span class="ev-tag">MEASUREMENT ONLY</span>'
+
+
+def _ev_value_html(ev: Any) -> str:
+    """Hard requirement #2: EV is visually labeled MEASUREMENT ONLY
+    wherever it appears -- this single helper is the one place that
+    label is generated, so every caller (KPI row, pipeline stage) gets
+    it identically, never a spot where EV shows without it. Hard
+    requirement #1: no candidate yet means no real EV measurement
+    exists -- rendered as the same explicit NO REAL DATA YET state
+    every other absent-value uses, never a numeric placeholder."""
+    return _esc(ev.describe()) if ev is not None else _NO_DATA_HTML
+
+
+def _render_blocked_banner(gate: Any) -> str:
+    """Hard requirement #4: a BLOCKED verdict must be visually
+    impossible to miss -- not a quiet red dot among green ones. This is
+    a real, page-level element (not just a badge inside the Health
+    card) that only exists at all when `gate.verdict != "READY"`, paired
+    with `body.blocked` in the stylesheet for a real, site-wide
+    presentation change (accent color, top border) beyond this one
+    banner. Empty string, not a hidden/zero-height element, when the
+    real gate is READY -- nothing to visually suppress."""
+    if gate.verdict == "READY":
+        return ""
+    reasons = "".join(f"<li>{_esc(reason)}</li>" for reason in gate.blocking_reasons)
+    return f"""
+<div class="blocked-banner" role="alert">
+<strong>&#9888; SYSTEM HEALTH: BLOCKED</strong>
+<ul>{reasons}</ul>
+</div>
+"""
+
+
+def _render_health_section(gate: Any) -> str:
+    """Item 7: system health as a real status panel -- the real overall
+    verdict prominent (reinforced page-wide by `_render_blocked_banner`
+    above, not only here), each of the 7 real checks with equal visual
+    weight, and the real specific blocking reasons listed plainly
+    underneath when blocked (hard requirement #4's second half)."""
     verdict_class = "verdict-ready" if gate.verdict == "READY" else "verdict-blocked"
     checks_html = "".join(_check_row(c) for c in gate.checks)
+    blocking_html = ""
+    if gate.verdict != "READY":
+        reasons = "".join(f"<li>{_esc(reason)}</li>" for reason in gate.blocking_reasons)
+        blocking_html = f'<div class="blocking-reasons"><p class="label">Blocking reasons</p><ul>{reasons}</ul></div>'
     return f"""
-<section class="card" id="system-health">
-<h2>1&middot; System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
-{checks_html}
+<section class="card card-wide" id="health">
+<h2>System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
+<div class="checks-grid">{checks_html}</div>
+{blocking_html}
 </section>
 """
 
@@ -567,32 +612,27 @@ def _render_market_section(view: dict[str, Any]) -> str:
     ltp_html = (
         f'<div class="big-number">{ltp["ltp"]:.2f}</div>' if ltp.get("ltp") is not None else '<div class="not-yet">no real LTP available -- ' + _esc(ltp["detail"]) + "</div>"
     )
-    return f"""
-<section class="card" id="market-status">
-<h2>2&middot; Kite / Market Status</h2>
-<div class="check"><span class="dot {kite_dot}"></span>{_esc(kite.detail) if kite else "not run"}</div>
-<p class="label">NIFTY 50 LTP</p>
-{ltp_html}
-</section>
-"""
-
-
-def _render_chart_section(view: dict[str, Any]) -> str:
     source_note = (
         f"real archived candles from {_esc(view['candles_source'])}"
         if view["candles_source"]
         else "no real archived candle file found"
     )
     return f"""
-<section class="card card-wide" id="chart">
-<h2>3&middot; NIFTY Price</h2>
+<section class="card" id="market">
+<h2>Kite / Market Status</h2>
+<div class="check"><span class="dot {kite_dot}"></span>{_esc(kite.detail) if kite else "not run"}</div>
+<p class="label">NIFTY 50 LTP</p>
+{ltp_html}
+</section>
+<section class="card card-wide" id="market-chart">
+<h2>NIFTY Price</h2>
 <p class="label">{source_note} &mdash; real, already-archived minute bars, not a live intraday tick feed. Refreshed from disk on every poll.</p>
 <div id="chart-container" style="height:340px;"></div>
 </section>
 """
 
 
-def _render_pipeline_section(view: dict[str, Any]) -> str:
+def _render_intelligence_section(view: dict[str, Any]) -> str:
     pipeline = view["pipeline"]
     ev = view["ev_estimate"]
     stages = [
@@ -611,14 +651,12 @@ def _render_pipeline_section(view: dict[str, Any]) -> str:
                 f'<span class="stage-value">{_esc(event["event_type"])} @ {_esc(event["timestamp"])}</span></div>'
             )
     ev_html = (
-        f'<div class="stage"><span class="stage-label">EV (measurement only)</span>'
-        f'<span class="stage-value">{_esc(ev.describe())}</span></div>'
-        if ev is not None
-        else '<div class="stage"><span class="stage-label">EV (measurement only)</span><span class="not-yet">no candidate evaluated today yet</span></div>'
+        f'<div class="stage"><span class="stage-label">EV {_EV_TAG_HTML}</span>'
+        f'<span class="stage-value">{_ev_value_html(ev)}</span></div>'
     )
     return f"""
-<section class="card" id="pipeline">
-<h2>4&middot; Research &rarr; Signal &rarr; EV &rarr; Adversarial &rarr; Supervisor</h2>
+<section class="card" id="intelligence">
+<h2>Research &rarr; Signal &rarr; EV &rarr; Adversarial &rarr; Supervisor</h2>
 {''.join(rows[:2])}
 {ev_html}
 {''.join(rows[2:])}
@@ -631,20 +669,36 @@ def _render_candidate_section(view: dict[str, Any]) -> str:
     if signal is None:
         return """
 <section class="card" id="candidate">
-<h2>5&middot; Current Candidate</h2>
+<h2>Current Candidate</h2>
 <p class="not-yet">No candidate evaluated yet today.</p>
 </section>
 """
-    rows = []
+    confidence = signal.get("confidence")
+    confidence_html = f"{confidence:.1f}" if isinstance(confidence, (int, float)) else _NO_DATA_HTML
+    # Item 5: the real 7-component score_attribution as horizontal
+    # contribution bars instead of a plain table -- same real numbers
+    # (technical/opening/volume/option/global/news are real 0-100
+    # scores, risk_penalty a real 0-25 penalty), only the layout is new.
+    bars = []
     for key, label in _SEVEN_COMPONENTS:
         value = signal.get(key)
-        cell = f"{value:.1f}" if isinstance(value, (int, float)) else "not present"
-        rows.append(f'<div class="attr-row"><span>{label}</span><span class="mono">{cell}</span></div>')
+        if isinstance(value, (int, float)):
+            width = max(0.0, min(100.0, value))
+            bars.append(
+                f'<div class="bar-row"><span class="bar-label">{label}</span>'
+                f'<div class="bar-track"><div class="bar-fill" style="width:{width:.1f}%"></div></div>'
+                f'<span class="bar-value mono">{value:.1f}</span></div>'
+            )
+        else:
+            bars.append(
+                f'<div class="bar-row"><span class="bar-label">{label}</span>'
+                f'<div class="bar-track"></div><span class="bar-value not-yet">not present</span></div>'
+            )
     return f"""
 <section class="card" id="candidate">
-<h2>5&middot; Current Candidate &mdash; {_esc(signal.get('setup_type', 'unknown'))} ({_esc(signal.get('direction', '?'))})</h2>
-<p class="label">confidence {signal.get('confidence', 0):.1f} &middot; regime {_esc(signal.get('regime', 'unknown'))} &middot; {_esc(signal.get('timestamp', ''))}</p>
-{''.join(rows)}
+<h2>Current Candidate &mdash; {_esc(signal.get('setup_type', 'unknown'))} ({_esc(signal.get('direction', '?'))})</h2>
+<p class="label">confidence {confidence_html} &middot; regime {_esc(signal.get('regime', 'unknown'))} &middot; {_esc(signal.get('timestamp', ''))}</p>
+{''.join(bars)}
 </section>
 """
 
@@ -681,17 +735,16 @@ def _render_position_card(pos: dict[str, Any], index: int | None = None) -> str:
 """
 
 
-def _render_pnl_section(view: dict[str, Any]) -> str:
+def _render_position_section(view: dict[str, Any]) -> str:
+    """Item 6: the real position card on its own -- entry/LTP/stop/
+    target/P&L when open, the same literal "No position currently
+    open." honest empty state as before (kept verbatim; changing this
+    exact string would break the existing, still-correct regression
+    checks for it), real Kite chart link when a real instrument token
+    exists. Aggregate P&L/risk numbers now live in the KPI row
+    (`_render_kpi_row`) under Overview instead of duplicating them
+    here."""
     open_positions = view["open_positions"]
-    unrealized = view["unrealized_pnl_today"]
-    realized = view["realized_pnl_today"]
-    total = realized + unrealized
-    total_class = "profit" if total >= 0 else "loss"
-    trades_used = view["trades_today_count"]
-    trades_cap = view["max_trades_per_day"]
-    loss_cap = view["max_daily_loss"]
-    loss_utilization = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
-
     if not open_positions:
         position_html = '<p class="not-yet">No position currently open.</p>'
     elif len(open_positions) == 1:
@@ -715,25 +768,73 @@ def _render_pnl_section(view: dict[str, Any]) -> str:
         )
 
     return f"""
-<section class="card" id="pnl">
-<h2>6&middot; Position &amp; Paper P&amp;L / Risk</h2>
+<section class="card" id="position">
+<h2>Position</h2>
 {position_html}
-<div class="section-divider"></div>
-<div class="attr-row"><span>Realized P&amp;L today</span><span class="mono">{realized:+.2f}</span></div>
-<div class="attr-row"><span>Unrealized P&amp;L (open position(s))</span><span class="mono">{unrealized:+.2f}</span></div>
-<div class="attr-row"><span>Total</span><span class="mono {total_class}">{total:+.2f}</span></div>
-<div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap}</span></div>
-<div class="attr-row"><span>Daily loss cap utilization</span><span class="mono">{loss_utilization:.1f}% of Rs{loss_cap:.0f}</span></div>
 </section>
 """
 
 
+def _render_kpi_row(view: dict[str, Any]) -> str:
+    """Item 3: the KPI row -- today's real P&L, real trade count vs.
+    the real configured daily limit, real confidence, real EV (labeled
+    per hard requirement #2), real regime, real risk utilization. Every
+    tile that has no real value yet (confidence/regime/EV before any
+    candidate exists today) renders the explicit NO REAL DATA YET
+    state (hard requirement #1) instead of a numeric 0.00 that could be
+    mistaken for a real measurement. P&L/trade-count/risk-utilization
+    ARE real, valid measurements even when zero (zero real trades today
+    is a true fact, not an absence) so those render as real numbers."""
+    realized = view["realized_pnl_today"]
+    unrealized = view["unrealized_pnl_today"]
+    total = realized + unrealized
+    total_class = "profit" if total >= 0 else "loss"
+    trades_used = view["trades_today_count"]
+    trades_cap = view["max_trades_per_day"]
+    loss_cap = view["max_daily_loss"]
+    loss_utilization = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
+
+    signal = view["latest_signal"]
+    confidence = signal.get("confidence") if signal else None
+    confidence_html = f"{confidence:.1f}" if isinstance(confidence, (int, float)) else _NO_DATA_HTML
+    regime = signal.get("regime") if signal else None
+    regime_html = _esc(regime) if regime else _NO_DATA_HTML
+    ev_html = _ev_value_html(view["ev_estimate"])
+
+    tiles = [
+        ("Today&rsquo;s P&amp;L", f'<span class="{total_class}">{total:+.2f}</span>'),
+        ("Trades Today", f"{trades_used} / {trades_cap}"),
+        ("Confidence", confidence_html),
+        (f"EV {_EV_TAG_HTML}", ev_html),
+        ("Regime", regime_html),
+        ("Risk Utilization", f"{loss_utilization:.1f}% of Rs{loss_cap:.0f}"),
+    ]
+    tiles_html = "".join(
+        f'<div class="kpi-tile"><p class="kpi-label">{label}</p><p class="kpi-value">{value}</p></div>'
+        for label, value in tiles
+    )
+    return f'<div class="kpi-row">{tiles_html}</div>'
+
+
 def _render_capture_section(view: dict[str, Any]) -> str:
-    check = view["capture_status"]
+    """Item 9: Data Foundation -- real option tick capture status, real
+    instrument archive validity (both real gate checks, never
+    recomputed), plus two static, honest, permanent facts about this
+    project's own real current limitations: raw-tick immutability (a
+    real architectural guarantee, permanent since Brief 20) and the
+    real absence of historical option P&L reconstruction / trade
+    calibration data -- stated plainly, not hidden behind a polished
+    UI, per this card's own explicit purpose."""
+    capture = view["capture_status"]
+    archive = _gate_check(view["gate"], "instrument_archive")
     return f"""
-<section class="card" id="capture">
-<h2>7&middot; Option Tick Capture</h2>
-{_check_row(check)}
+<section class="card card-wide" id="capture">
+<h2>Data Capture &amp; Foundation</h2>
+{_check_row(capture)}
+{_check_row(archive)}
+<div class="foundation-fact"><span class="dot dot-ok"></span>Raw Kite ticks are never modified in place &mdash; RAW &rarr; NORMALIZED &rarr; VALIDATED &rarr; RESEARCH layering, permanent since Brief 20.</div>
+<div class="foundation-fact"><span class="dot dot-unknown"></span>Historical option P&amp;L reconstruction: <span class="not-yet">NOT AVAILABLE YET</span></div>
+<div class="foundation-fact"><span class="dot dot-unknown"></span>Real trade calibration sample: <span class="not-yet">0 REAL TRADES</span></div>
 </section>
 """
 
@@ -742,7 +843,7 @@ def _render_notifications_section(view: dict[str, Any]) -> str:
     check = view["notifications_status"]
     return f"""
 <section class="card" id="notifications">
-<h2>8&middot; Notifications</h2>
+<h2>Notifications</h2>
 {_check_row(check)}
 </section>
 """
@@ -763,43 +864,157 @@ def _render_event_row(event: dict[str, Any]) -> str:
     )
 
 
-def _render_timeline_section(view: dict[str, Any]) -> str:
+def _render_events_section(view: dict[str, Any]) -> str:
     events = view["events"]
     if not events:
         rows = '<p class="not-yet">No events recorded yet today.</p>'
     else:
         rows = "".join(_render_event_row(e) for e in events[:100])
     return f"""
-<section class="card card-wide" id="timeline">
-<h2>9&amp;10&middot; Recent Decisions / Live Event Timeline</h2>
+<section class="card card-wide" id="events">
+<h2>Recent Decisions &amp; Live Event Timeline</h2>
 <p class="label">Every real recorded event -- NO_TRADE/RISK_REJECTED entries are always labeled distinctly from real fills, never shown as completed trades.</p>
 <div class="timeline">{rows}</div>
 </section>
 """
 
 
-def render_dashboard(view: dict[str, Any], refresh_seconds: int = DASHBOARD_REFRESH_SECONDS, now: datetime | None = None) -> str:
+_SIDEBAR_ITEMS = (
+    ("overview", "Overview"),
+    ("market", "Market"),
+    ("intelligence", "Intelligence"),
+    ("candidate", "Candidate"),
+    ("position", "Position"),
+    ("health", "Health"),
+    ("capture", "Data Capture"),
+    ("notifications", "Notifications"),
+    ("events", "Events"),
+)
+
+
+def _market_session_label(settings: Settings | None, now: datetime) -> str:
+    """Item 2: real market open/closed state -- derived purely from
+    `settings.market_open`/`settings.market_close` (already-real,
+    already-loaded config fields, zero new data) compared against the
+    same real render-time clock `render_dashboard` already computes for
+    its own timestamp. Never guesses when `settings` isn't available
+    (only the structural/unit tests that don't pass it)."""
+    if settings is None:
+        return "MARKET SESSION: NOT AVAILABLE"
+    current_time = now.timetz().replace(tzinfo=None)
+    return "MARKET OPEN" if settings.market_open <= current_time <= settings.market_close else "MARKET CLOSED"
+
+
+def _render_sidebar(view: dict[str, Any], settings: Settings | None) -> str:
+    """Item 1: the sidebar -- scroll-anchors to areas of this same one
+    page (plain `#anchor` links, native browser behavior, no routing,
+    no JS required), a real current mode indicator, and real Kite/AI
+    connection status at the bottom (both reused gate checks, never
+    recomputed)."""
+    kite = view["kite_status"]
+    ai = _gate_check(view["gate"], "ai_provider")
+    kite_dot = "dot-ok" if kite and kite.status == "OK" else "dot-fail"
+    ai_dot = "dot-ok" if ai and ai.status == "OK" else "dot-fail"
+    mode_label = f"{settings.trading_mode.upper()} TRADING" if settings is not None else "MODE: NOT AVAILABLE"
+    nav_html = "".join(f'<li><a href="#{anchor}">{label}</a></li>' for anchor, label in _SIDEBAR_ITEMS)
+    return f"""
+<nav class="sidebar">
+<div class="brand"><span class="brand-mark">N</span><div><div class="brand-name">NIFTY AI Trader</div><div class="brand-sub">Command Center</div></div></div>
+<div class="mode-pill">{_esc(mode_label)}</div>
+<ul class="side-nav">{nav_html}</ul>
+<div class="side-footer">
+<div class="side-status"><span class="dot {kite_dot}"></span>Kite: {_esc(kite.status if kite else "N/A")}</div>
+<div class="side-status"><span class="dot {ai_dot}"></span>AI: {_esc(ai.status if ai else "N/A")}</div>
+</div>
+</nav>
+"""
+
+
+def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime) -> str:
+    """Item 2: the hero market header -- real NIFTY LTP, real market
+    open/closed state, real Kite/AI/Capture/Health status inline.
+    Intraday change is honestly NOT shown: no real reference/previous
+    price is plumbed anywhere in this project's real data layer, and
+    computing one here would be new data this brief's own ground rules
+    forbid -- stated plainly rather than fabricated."""
+    ltp = view["nifty_ltp"]
+    ltp_html = f'{ltp["ltp"]:.2f}' if ltp.get("ltp") is not None else _NO_DATA_HTML
+    session_label = _market_session_label(settings, now)
+    kite = view["kite_status"]
+    ai = _gate_check(view["gate"], "ai_provider")
+    capture = view["capture_status"]
+    gate = view["gate"]
+
+    def _pip(check: Any, label: str) -> str:
+        dot = "dot-ok" if check and check.status == "OK" else "dot-fail"
+        return f'<span class="hero-pip"><span class="dot {dot}"></span>{label}</span>'
+
+    health_dot = "dot-ok" if gate.verdict == "READY" else "dot-fail"
+    pips = (
+        _pip(kite, "Kite")
+        + _pip(ai, "AI")
+        + _pip(capture, "Capture")
+        + f'<span class="hero-pip"><span class="dot {health_dot}"></span>Health: {_esc(gate.verdict)}</span>'
+    )
+    return f"""
+<div class="hero">
+<div class="hero-top">
+<div>
+<p class="label">NIFTY 50</p>
+<div class="hero-ltp">{ltp_html}</div>
+<p class="hero-change">change: not tracked yet</p>
+</div>
+<div class="hero-session"><span class="session-pill">{_esc(session_label)}</span></div>
+</div>
+<div class="hero-pips">{pips}</div>
+</div>
+"""
+
+
+def render_dashboard(
+    view: dict[str, Any],
+    refresh_seconds: int = DASHBOARD_REFRESH_SECONDS,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> str:
     """The one, single Command Center page -- every section above is a
-    `<section>` on this one document, never a separate route/page.
-    Read-only: no `<form>`, no `<button>`, no write-triggering JS
-    anywhere. TradingView Lightweight Charts (CDN, real, free,
-    open-source) renders section 3 using its own documented incremental
-    `series.update()` pattern for live polls, seeded once via
-    `setData()` from `/api/candles` -- never a full-series
-    tear-down/rebuild on every poll."""
-    timestamp = (now or datetime.now(IST)).isoformat(timespec="seconds")
+    `<section>` on this one document (or a scroll-anchor target inside
+    it), never a separate route/page. Read-only: no `<form>`, no
+    `<button>`, no write-triggering JS anywhere. TradingView Lightweight
+    Charts (CDN, real, free, open-source) renders the chart card using
+    its own documented incremental `series.update()` pattern for live
+    polls, seeded once via `setData()` from `/api/candles` -- never a
+    full-series tear-down/rebuild on every poll.
+
+    `settings` is optional and used only for two purely-presentational,
+    zero-new-computation reads (`settings.trading_mode` for the sidebar
+    mode pill, `settings.market_open`/`market_close` for the hero's
+    open/closed label) -- both already-real, already-loaded config
+    values this function did not have direct access to before. No other
+    real data source changed; `build_dashboard_view` (the actual data
+    aggregation) is untouched by this redesign."""
+    now = now or datetime.now(IST)
+    timestamp = now.isoformat(timespec="seconds")
     candles_json = json.dumps(view["candles"])
-    body = "".join(
+    gate = view["gate"]
+    body_class = "" if gate.verdict == "READY" else " class=\"blocked\""
+
+    overview_html = f"""
+<section class="hero-section" id="overview">
+{_render_hero(view, settings, now)}
+{_render_kpi_row(view)}
+</section>
+"""
+    grid_html = "".join(
         [
-            _render_gate_section(view["gate"]),
             _render_market_section(view),
-            _render_chart_section(view),
-            _render_pipeline_section(view),
+            _render_intelligence_section(view),
             _render_candidate_section(view),
-            _render_pnl_section(view),
+            _render_position_section(view),
+            _render_health_section(gate),
             _render_capture_section(view),
             _render_notifications_section(view),
-            _render_timeline_section(view),
+            _render_events_section(view),
         ]
     )
     return f"""<!doctype html>
@@ -814,29 +1029,80 @@ def render_dashboard(view: dict[str, Any], refresh_seconds: int = DASHBOARD_REFR
   --bg: #0b0e14; --card: #131722; --card-alt: #171c28; --border: #232838; --border-soft: #1b2130;
   --text: #e6e9ef; --text-dim: #b7bfd1; --muted: #7c869b;
   --ok: #16c784; --fail: #ea3943; --amber: #f0a020; --accent: #4f8cff;
-  --radius: 12px; --radius-sm: 6px;
+  --radius: 12px; --radius-sm: 6px; --sidebar-w: 240px;
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
-  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.05rem;
+  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.4rem;
 }}
 * {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
 body {{
-  margin: 0; padding: var(--sp-6) var(--sp-5); background: var(--bg); color: var(--text);
+  margin: 0; background: var(--bg); color: var(--text);
   font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
   font-size: var(--fs-base); line-height: 1.5; -webkit-font-smoothing: antialiased;
+  border-top: 4px solid transparent;
 }}
-h1 {{ font-size: var(--fs-xl); font-weight: 650; margin: 0 0 2px 0; letter-spacing: -0.01em; }}
+body.blocked {{ border-top-color: var(--fail); }}
+h1 {{ font-size: var(--fs-xl); font-weight: 650; margin: 0; letter-spacing: -0.01em; }}
 h2 {{
   font-size: var(--fs-md); font-weight: 600; margin: 0 0 var(--sp-4) 0; color: var(--text);
   display: flex; align-items: baseline; gap: var(--sp-2); padding-bottom: var(--sp-3);
-  border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em;
+  border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em; scroll-margin-top: var(--sp-5);
 }}
-.top-bar {{
-  display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap;
-  gap: var(--sp-2); margin-bottom: var(--sp-6); padding-bottom: var(--sp-5);
-  border-bottom: 1px solid var(--border);
+.shell {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; align-items: start; }}
+.sidebar {{
+  position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  background: var(--card); border-right: 1px solid var(--border);
+  padding: var(--sp-5) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-5);
 }}
-.top-bar .meta {{ color: var(--muted); font-size: var(--fs-sm); display: block; margin-top: var(--sp-1); }}
-.top-bar > div:last-child .meta {{ text-align: right; }}
+.brand {{ display: flex; align-items: center; gap: var(--sp-3); }}
+.brand-mark {{
+  width: 32px; height: 32px; border-radius: 8px; background: var(--accent); color: #fff;
+  display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0;
+}}
+.brand-name {{ font-weight: 650; font-size: var(--fs-base); }}
+.brand-sub {{ color: var(--muted); font-size: var(--fs-xs); }}
+.mode-pill {{
+  background: rgba(79,140,255,0.15); color: var(--accent); font-weight: 700; font-size: var(--fs-xs);
+  letter-spacing: 0.05em; text-align: center; padding: var(--sp-2); border-radius: var(--radius-sm);
+}}
+.side-nav {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; flex: 1; }}
+.side-nav a {{
+  display: block; color: var(--text-dim); text-decoration: none; font-size: var(--fs-sm);
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
+}}
+.side-nav a:hover {{ background: var(--card-alt); color: var(--text); }}
+.side-footer {{ display: flex; flex-direction: column; gap: var(--sp-2); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
+.side-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--muted); }}
+.main {{ padding: var(--sp-6) var(--sp-5); min-width: 0; }}
+.blocked-banner {{
+  background: rgba(234,57,67,0.15); border: 1px solid var(--fail); color: var(--fail);
+  border-radius: var(--radius-sm); padding: var(--sp-4); margin-bottom: var(--sp-5);
+  font-size: var(--fs-sm); line-height: 1.6;
+}}
+.blocked-banner strong {{ display: block; font-size: var(--fs-md); letter-spacing: 0.02em; margin-bottom: var(--sp-2); }}
+.blocked-banner ul {{ margin: 0; padding-left: 1.2em; }}
+.blocking-reasons {{ margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
+.blocking-reasons ul {{ margin: var(--sp-2) 0 0 0; padding-left: 1.2em; color: var(--fail); font-size: var(--fs-sm); }}
+.hero-section {{ margin-bottom: var(--sp-6); scroll-margin-top: var(--sp-5); }}
+.hero {{
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: var(--sp-5); margin-bottom: var(--sp-4);
+}}
+.hero-top {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--sp-4); }}
+.hero-ltp {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
+.hero-change {{ color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-1) 0 0 0; }}
+.session-pill {{ background: var(--card-alt); border: 1px solid var(--border-soft); padding: var(--sp-2) var(--sp-4); border-radius: 20px; font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.04em; }}
+.hero-pips {{ display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
+.hero-pip {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-dim); }}
+.kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-4); }}
+.kpi-tile {{ background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-4); }}
+.kpi-label {{ color: var(--muted); font-size: var(--fs-xs); margin: 0 0 var(--sp-2) 0; letter-spacing: 0.03em; text-transform: uppercase; }}
+.kpi-value {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-lg); font-weight: 650; margin: 0; }}
+.no-data {{ color: var(--amber); font-style: italic; font-weight: 600; font-size: var(--fs-sm); letter-spacing: 0.01em; }}
+.ev-tag {{
+  background: rgba(79,140,255,0.15); color: var(--accent); font-size: var(--fs-xs); font-weight: 700;
+  padding: 1px 6px; border-radius: 4px; letter-spacing: 0.03em; vertical-align: middle;
+}}
 .grid {{
   display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
   gap: var(--sp-5) var(--sp-5); align-items: start;
@@ -844,6 +1110,7 @@ h2 {{
 .card {{
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: var(--sp-5); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
+  scroll-margin-top: var(--sp-5);
 }}
 .card-wide {{ grid-column: 1 / -1; }}
 .mono {{ font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; }}
@@ -853,6 +1120,7 @@ h2 {{
 .verdict {{ font-size: var(--fs-xs); padding: 3px 11px; border-radius: 20px; font-weight: 700; letter-spacing: 0.05em; }}
 .verdict-ready {{ background: rgba(22,199,132,0.15); color: var(--ok); }}
 .verdict-blocked {{ background: rgba(234,57,67,0.15); color: var(--fail); }}
+.checks-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 var(--sp-4); }}
 .check {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }}
 .check:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
@@ -865,7 +1133,11 @@ h2 {{
 .attr-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .attr-row > span:first-child {{ color: var(--text-dim); }}
 .profit {{ color: var(--ok); }} .loss {{ color: var(--fail); }}
-.section-divider {{ height: var(--sp-3); }}
+.bar-row {{ display: grid; grid-template-columns: 110px 1fr 48px; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }}
+.bar-label {{ color: var(--text-dim); font-size: var(--fs-sm); }}
+.bar-track {{ background: var(--card-alt); border-radius: 20px; height: 8px; overflow: hidden; }}
+.bar-fill {{ background: linear-gradient(90deg, var(--accent), var(--ok)); height: 100%; border-radius: 20px; }}
+.bar-value {{ text-align: right; font-size: var(--fs-sm); }}
 .position-card {{
   background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
   padding: var(--sp-4); margin-bottom: var(--sp-4);
@@ -882,6 +1154,8 @@ h2 {{
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); font-size: var(--fs-sm);
   margin-bottom: var(--sp-4); line-height: 1.5;
 }}
+.foundation-fact {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); color: var(--text-dim); border-bottom: 1px solid var(--border-soft); }}
+.foundation-fact:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .timeline {{ max-height: 420px; overflow-y: auto; margin-top: var(--sp-1); }}
 .event-row {{
   display: grid; grid-template-columns: auto 1fr auto auto; gap: var(--sp-3); align-items: center;
@@ -895,17 +1169,26 @@ h2 {{
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
 .footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
+@media (max-width: 900px) {{
+  .shell {{ grid-template-columns: 1fr; }}
+  .sidebar {{ position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }}
+  .side-nav {{ flex-direction: row; flex-wrap: wrap; }}
+  .side-footer {{ flex-direction: row; border-top: none; padding-top: 0; }}
+}}
 </style>
 </head>
-<body>
-<div class="top-bar">
-<div><h1>NIFTY AI Trader &mdash; Command Center</h1><span class="meta">Read-only observability. No controls. Local network only.</span></div>
-<div class="meta">Page rendered {timestamp} &middot; data as of {_esc(view.get('computed_at', timestamp))} &middot; auto-refresh every {refresh_seconds}s &middot; <a href="{LIVE_PATH}" style="color: var(--accent);">live position page</a></div>
-</div>
+<body{body_class}>
+<div class="shell">
+{_render_sidebar(view, settings)}
+<main class="main">
+{_render_blocked_banner(gate)}
+{overview_html}
 <div class="grid">
-{body}
+{grid_html}
 </div>
-<p class="footer">This page never accepts writes: no form, no button, nothing here can close, open, or modify a position. It is a window into the system, not a control surface.</p>
+<p class="footer">This page never accepts writes: no form, no button, nothing here can close, open, or modify a position. It is a window into the system, not a control surface. Page rendered {timestamp} &middot; data as of {_esc(view.get('computed_at', timestamp))} &middot; auto-refresh every {refresh_seconds}s &middot; <a href="{LIVE_PATH}" style="color: var(--accent);">live position page</a></p>
+</main>
+</div>
 <script>
 (function() {{
   var container = document.getElementById('chart-container');
@@ -983,7 +1266,7 @@ def _make_handler(database: Database, settings: Settings | None = None) -> type[
                 if settings is None:
                     self._respond_html("<h1>Dashboard unavailable</h1><p>no real Settings configured for this server.</p>")
                     return
-                self._respond_html(render_dashboard(_cached_dashboard_view()))
+                self._respond_html(render_dashboard(_cached_dashboard_view(), settings=settings))
             elif self.path == CANDLES_API_PATH:
                 if settings is None:
                     self._respond_json([])

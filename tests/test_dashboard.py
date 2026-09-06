@@ -13,6 +13,7 @@ Telegram message.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -315,6 +316,122 @@ def test_timeline_labels_no_trade_and_fill_events_distinctly(tmp_path):
     assert "RISK_REJECTED" in rejected_row and "NO TRADE" in rejected_row and "REAL FILL/EXIT" not in rejected_row
 
 
+def test_hard_requirement_3_no_trade_and_fill_badges_have_genuinely_different_visual_treatment(tmp_path):
+    """Hard requirement #3: not just different text -- genuinely
+    different visual treatment, verified against the actual CSS rules
+    shipped in the page (not asserted from reading the code), so the
+    distinction really is unmistakable even in a fast skim, not just
+    technically different in the markup."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime.now(IST)
+    database.save_event(Event(EventType.RISK_REJECTED, "risk_manager", now, output_summary={}))
+    database.save_event(
+        Event(EventType.PAPER_FILL, "paper_broker", now + timedelta(seconds=1), output_summary={"order_id": "o1"})
+    )
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    html = render_dashboard(view)
+
+    fill_rule = html[html.index(".badge-fill {") : html.index(".badge-fill {") + 120]
+    no_trade_rule = html[html.index(".badge-no-trade {") : html.index(".badge-no-trade {") + 120]
+    assert fill_rule != no_trade_rule
+    assert "var(--ok)" in fill_rule  # real fills: the same green used for profit
+    assert "var(--amber)" in no_trade_rule  # NO_TRADE: the same amber used for warnings, never green
+
+
+# --- hard requirement #1: no real-looking zero for unmeasured values ----
+
+
+def test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values(tmp_path):
+    """Hard requirement #1: confidence/EV/regime must never render as a
+    real-looking 0.00/blank when nothing has actually been measured --
+    only the explicit NO REAL DATA YET state is acceptable. Trade
+    count/risk utilization ARE real, valid zeros here (zero real trades
+    today is a true measurement) so those are deliberately excluded
+    from this check."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    assert view["latest_signal"] is None
+    assert view["ev_estimate"] is None
+
+    html = render_dashboard(view)
+
+    tiles = html.split('class="kpi-tile"')[1:]
+    assert len(tiles) == 6  # P&L, Trades, Confidence, EV, Regime, Risk Utilization
+    _pnl, _trades, confidence_tile, ev_tile, regime_tile, _risk = tiles
+
+    for tile, name in ((confidence_tile, "confidence"), (ev_tile, "EV"), (regime_tile, "regime")):
+        assert "NO REAL DATA YET" in tile, f"{name} tile is missing the explicit no-data state"
+        assert "0.0<" not in tile and ">0.00<" not in tile, f"{name} tile shows a real-looking zero instead"
+
+
+# --- hard requirement #2: EV always carries its MEASUREMENT ONLY label --
+
+
+def test_hard_requirement_2_ev_always_carries_the_measurement_only_label(tmp_path):
+    """Hard requirement #2: EV is visually labeled MEASUREMENT ONLY
+    wherever it appears -- both when a real EV value exists and when
+    it's genuinely absent (no candidate yet). Checked in both real
+    places EV appears on the page: the KPI row and the Intelligence
+    pipeline stage."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    no_candidate_view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(no_candidate_view)
+    assert html.count("MEASUREMENT ONLY") >= 2  # KPI row + Intelligence pipeline stage
+
+    from storage.models import SignalRecord
+
+    today = datetime(2026, 9, 6, 10, 0, tzinfo=IST)
+    database.save_signal(
+        SignalRecord(
+            timestamp=today,
+            direction="CALL",
+            confidence=82.0,
+            features={
+                "setup_type": "MOMENTUM_CONTINUATION", "direction": "CALL", "regime": "TREND", "confidence": 82.0,
+                "technical_score": 75.0, "opening_score": 60.0, "volume_score": 40.0, "option_score": 0.0,
+                "global_score": 0.0, "news_score": 0.0, "risk_penalty": 0.0,
+            },
+        )
+    )
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=today.date())
+    html_with_candidate = render_dashboard(view)
+    assert html_with_candidate.count("MEASUREMENT ONLY") >= 2
+
+
+# --- hard requirement #4: a BLOCKED verdict is visually impossible to miss --
+
+
+def test_hard_requirement_4_blocked_verdict_shows_a_real_page_level_banner(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    blocked_view = build_dashboard_view(settings, database, gate=_blocked_gate(), today=date(2026, 9, 6))
+    ready_view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    blocked_html = render_dashboard(blocked_view)
+    ready_html = render_dashboard(ready_view)
+
+    assert 'class="blocked-banner"' in blocked_html
+    assert "SYSTEM HEALTH: BLOCKED" in blocked_html
+    assert "TokenException" in blocked_html  # the real specific blocking reason, not a generic label
+    assert 'class="blocked-banner"' not in ready_html  # never shown when genuinely READY
+
+    # A real, page-level presentation change beyond the banner itself --
+    # not just a quiet badge among green ones.
+    assert '<body class="blocked">' in blocked_html
+    assert "<body>" in ready_html
+    assert '<body class="blocked">' not in ready_html
+
+
 # --- chart: real incremental-update pattern, not full setData() on poll --
 
 
@@ -407,6 +524,27 @@ def test_root_and_dashboard_serve_the_same_single_page(dashboard_server):
     assert b"NIFTY AI Trader" in body_root
     assert b"Command Center" in body_root
     assert body_root == body_dash  # literally one page, served identically at both paths
+
+
+def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server):
+    """Item 1: the sidebar's 9 links (Overview/Market/Intelligence/
+    Candidate/Position/Health/Data Capture/Notifications/Events) are
+    real scroll-anchors into THIS one page (plain `#id` hrefs), never
+    separate routes. Confirms every real `href="#..."` in the sidebar
+    has a real matching `id="..."` element somewhere on the same real
+    page -- not a decorative link that goes nowhere."""
+    status, body = _fetch(dashboard_server, "/dashboard")
+    html = body.decode("utf-8")
+    assert status == 200
+
+    nav_start = html.index('class="side-nav"')
+    nav_end = html.index("</ul>", nav_start)
+    nav_html = html[nav_start:nav_end]
+    anchors = re.findall(r'href="#([a-z-]+)"', nav_html)
+
+    assert len(anchors) == 9  # Overview, Market, Intelligence, Candidate, Position, Health, Data Capture, Notifications, Events
+    for anchor in anchors:
+        assert f'id="{anchor}"' in html, f"sidebar links to #{anchor} but no element has id=\"{anchor}\""
 
 
 def test_live_path_is_unchanged_by_the_dashboard_addition(dashboard_server):
