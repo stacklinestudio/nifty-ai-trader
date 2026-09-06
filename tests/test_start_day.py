@@ -91,16 +91,22 @@ def test_a_real_kite_connection_failure_stops_the_whole_sequence(tmp_path, monke
     archive_runner = _CallTracker(return_value=None)
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
     )
 
     assert result["stopped_after_gate"] is True
     assert archive_runner.calls == []  # never even attempted
     assert capture_starter.calls == []
     assert scheduler_runner.calls == []
+    # Real bug report, now fixed: the dashboard must still have started
+    # even though the real kite_connection check fails and stops
+    # everything else -- it must never be gated behind a successful
+    # Kite login.
+    assert len(dashboard_starter.calls) == 1
     # The real gate result was still printed/notified regardless of outcome.
     assert len(_RecordingDiscord.instances) == 1
     severity, message, category = _RecordingDiscord.instances[0].calls[0]
@@ -116,10 +122,11 @@ def test_a_blocked_gate_without_a_kite_failure_still_runs_the_whole_sequence(tmp
     archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_TRADING_DAY,
     )
 
     assert result["stopped_after_gate"] is False
@@ -138,10 +145,11 @@ def test_a_real_ready_gate_runs_the_whole_sequence(tmp_path, monkeypatch):
     archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_TRADING_DAY,
     )
 
     assert result["gate"]["verdict"] == "READY"
@@ -160,10 +168,11 @@ def test_a_non_kite_failure_eg_tick_capture_lets_the_rest_proceed_with_the_failu
     archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
     capture_starter = _CallTracker(raises=RuntimeError("simulated real tick-capture setup failure"))
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_TRADING_DAY,
     )
 
     # The one real failure is reported clearly...
@@ -183,10 +192,11 @@ def test_an_archive_failure_lets_capture_and_scheduler_still_proceed(tmp_path, m
     archive_runner = _CallTracker(raises=RuntimeError("simulated real archive failure"))
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_TRADING_DAY,
     )
 
     assert result["archive"]["status"] == "FAILED"
@@ -205,9 +215,11 @@ def test_a_real_health_gate_is_computed_when_none_is_injected(tmp_path, monkeypa
     archive_runner = _CallTracker(return_value=None)
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
-        settings, archive_runner=archive_runner, capture_starter=capture_starter, scheduler_runner=scheduler_runner
+        settings, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
     )
 
     # No real credentials configured -- the real gate's own kite_connection
@@ -215,6 +227,9 @@ def test_a_real_health_gate_is_computed_when_none_is_injected(tmp_path, monkeypa
     assert result["gate"]["verdict"] == "BLOCKED"
     assert result["stopped_after_gate"] is True
     assert archive_runner.calls == []
+    # The dashboard must still have started, even though the real gate
+    # genuinely fails and stops everything else.
+    assert len(dashboard_starter.calls) == 1
 
 
 def test_capture_is_skipped_not_started_on_a_real_non_trading_day(tmp_path, monkeypatch):
@@ -230,10 +245,11 @@ def test_capture_is_skipped_not_started_on_a_real_non_trading_day(tmp_path, monk
     archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
     capture_starter = _CallTracker(return_value=None)
     scheduler_runner = _CallTracker(return_value={"day_ran": False, "day_reason": "not_a_trading_day"})
+    dashboard_starter = _CallTracker(return_value=None)
 
     result = main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_NON_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_NON_TRADING_DAY,
     )
 
     assert result["capture"]["status"] == "SKIPPED"
@@ -263,13 +279,53 @@ def test_the_real_capture_thread_is_joined_before_start_day_returns(tmp_path, mo
     fake_thread = _FakeThread()
     capture_starter = _CallTracker(return_value=fake_thread)
     scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
 
     main.start_day(
         settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
-        scheduler_runner=scheduler_runner, today=_A_REAL_TRADING_DAY,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter, today=_A_REAL_TRADING_DAY,
     )
 
     assert fake_thread.joined is True
+
+
+def test_the_real_dashboard_is_reachable_before_a_real_kite_login_even_completes(tmp_path, monkeypatch):
+    """The real, end-to-end proof (not just a unit-level call-count
+    assertion): a real kite_connection failure stops archiving/capture/
+    the scheduler completely, yet a real HTTP GET to the real dashboard
+    -- served by the REAL default `dashboard_starter`, not a stub --
+    still succeeds and shows an honest "nothing yet" state. This is the
+    exact real scenario the bug report described: Kite login not even
+    completed, no candidate ever evaluated, no trade ever entered."""
+    import urllib.request
+
+    _patch_notifiers(monkeypatch)
+    port = 8793  # a real, free local port distinct from every other test in this suite
+    settings = Settings(database_path=tmp_path / "paper.db", live_status_port=port)
+    gate = _gate("BLOCKED", kite_status="FAIL", kite_detail="real session invalid: TokenException")
+    archive_runner = _CallTracker(return_value=None)
+    capture_starter = _CallTracker(return_value=None)
+    scheduler_runner = _CallTracker(return_value={"day_ran": True})
+
+    result = main.start_day(
+        settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner,  # dashboard_starter NOT injected -- the real one runs
+    )
+
+    assert result["stopped_after_gate"] is True  # Kite login genuinely never completed
+    assert archive_runner.calls == [] and capture_starter.calls == [] and scheduler_runner.calls == []
+
+    # A generous real timeout: the real dashboard's first build includes a
+    # real, uncached parse of the archived candle CSV (a real disk read,
+    # occasionally a couple of real seconds on a cold cache) -- this test
+    # is proving real reachability, not asserting a latency budget.
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=20) as response:
+        status, body = response.status, response.read().decode("utf-8")
+    assert status == 200
+    assert "No candidate evaluated yet today" in body
+    assert "No position currently open." in body
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/live", timeout=20) as response:
+        assert "No open position" in response.read().decode("utf-8")
 
 
 def test_start_option_tick_capture_in_background_uses_a_real_nsecalendar_by_default():

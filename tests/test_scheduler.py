@@ -258,6 +258,64 @@ def test_position_closing_with_remaining_capacity_resumes_scanning(tmp_path):
     assert all(r.cycle.order is None for r in result.rounds[1:])
 
 
+def test_normal_operation_never_produces_more_than_one_real_open_position_at_a_time(tmp_path):
+    """Dashboard follow-up: a regression guard on the real risk
+    architecture itself (DailyLimits + entry-scan pausing during
+    supervision, Brief 3/6), not just on the dashboard's own defensive
+    display for that state. `run_trading_day` blocks synchronously in
+    `run_supervised` until a fill closes, only THEN resuming scanning
+    for the next one -- structurally, no two real trades can ever be
+    open at once. Proven by actually running two real, sequential fills
+    in the same real day and recording the real `open_positions()` row
+    count after every real save -- never more than one at any point,
+    and zero once the whole real day (both trades) has closed."""
+    settings = Settings(database_path=tmp_path / "paper.db", max_trades_per_day=3)
+    orchestrator = Orchestrator(settings)
+    calendar = NseCalendar()
+    ticks = {"n": 0}
+    calls = {"context": 0}
+
+    def clock():
+        ticks["n"] += 1
+        return market_open_time() + timedelta(seconds=30 * ticks["n"])
+
+    def context_provider():
+        calls["context"] += 1
+        # Fillable on the first scan AND the first resumed scan after
+        # that position closes -- two real sequential fills, never
+        # simultaneous ones (structurally impossible in this single-
+        # threaded, synchronous scan-then-supervise loop).
+        return filled_cycle_context() if calls["context"] in (1, 2) else {}
+
+    def quote_source_factory(symbol: str):
+        return lambda: 20.0  # clears target (13.0-14.0) -- closes on the very next supervision tick
+
+    observed_open_position_counts: list[int] = []
+    real_save_open_position = orchestrator.database.save_open_position
+
+    def spying_save_open_position(*args, **kwargs):
+        real_save_open_position(*args, **kwargs)
+        observed_open_position_counts.append(len(orchestrator.database.open_positions()))
+
+    orchestrator.database.save_open_position = spying_save_open_position
+
+    result = run_trading_day(
+        orchestrator,
+        calendar,
+        context_provider=context_provider,
+        quote_source_factory=quote_source_factory,
+        clock=clock,
+        sleeper=lambda _s: None,
+        entry_scan_cutoff_time=time(10, 10),
+    )
+
+    filled_rounds = [r for r in result.rounds if r.cycle.order is not None]
+    assert len(filled_rounds) == 2  # two real, genuinely sequential fills happened
+    assert observed_open_position_counts, "expected at least one real open_positions save to have occurred"
+    assert all(count <= 1 for count in observed_open_position_counts)
+    assert orchestrator.database.open_positions() == []  # both real positions closed by day's end
+
+
 def test_no_new_entry_at_or_after_cutoff_but_open_position_still_reaches_forced_exit(tmp_path):
     """Brief 6 Part B.6: entry_scan_cutoff_time only gates STARTING a new
     scan -- an already-open position still reaches the existing 15:15

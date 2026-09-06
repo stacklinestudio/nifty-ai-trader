@@ -84,6 +84,7 @@ def position_state_to_dict(state: PositionState) -> dict[str, Any]:
         "entry_order_id": state.entry_order_id,
         "entry_score_attribution": state.entry_score_attribution,
         "entry_validation_reasons": list(state.entry_validation_reasons),
+        "entry_instrument_token": state.entry_instrument_token,
     }
 
 
@@ -106,4 +107,5 @@ def position_state_from_dict(data: dict[str, Any]) -> PositionState:
         # crash recovery must not fail on an older real record.
         data.get("entry_score_attribution"),
         tuple(data.get("entry_validation_reasons", ())),
+        data.get("entry_instrument_token"),
     )

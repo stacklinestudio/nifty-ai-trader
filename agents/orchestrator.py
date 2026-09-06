@@ -74,6 +74,23 @@ class CycleResult:
     # separate DB read/join. None whenever supplied_context never went
     # through the live-context pipeline (see the save_signal guard above).
     score_attribution: dict[str, Any] | None = None
+    # Final Brief follow-up: the same real instrument_token _on_risk_
+    # decision uses for the notification's Kite chart link, exposed here
+    # too so open_position can carry it into PositionState the same way
+    # score_attribution above is carried through -- letting the
+    # dashboard's own current-position card build the identical real
+    # kite_chart_url() for an open position, not just the notification.
+    instrument_token: int | None = None
+
+
+def _selected_option_instrument_token(context: dict[str, Any]) -> int | None:
+    """The real instrument_token of whatever option OptionsAgent most
+    recently selected for this cycle (`context["selected_option"]`,
+    Brief 5's option_selector.py), or None when no real option was ever
+    selected -- e.g. the no-candidate/backtest paths, which never
+    populate this key. Never fabricated."""
+    selected_option = context.get("selected_option")
+    return selected_option.quote.instrument.instrument_token if selected_option else None
 
 
 @dataclass
@@ -317,6 +334,7 @@ class Orchestrator:
             state.risk_approved,
             state.order,
             attribution,
+            _selected_option_instrument_token(state.context),
         )
 
     def _on_research_complete(self, event: Event) -> None:
@@ -423,10 +441,7 @@ class Orchestrator:
             self._event(
                 EventType.PAPER_ORDER_SENT, {"order_id": order["order_id"]}, 100, execution.agent
             )
-            selected_option = state.context.get("selected_option")
-            instrument_token = (
-                selected_option.quote.instrument.instrument_token if selected_option else None
-            )
+            instrument_token = _selected_option_instrument_token(state.context)
             paper_fill_summary = {
                 "order_id": order["order_id"],
                 "fill_price": order["fill_price"],
@@ -507,6 +522,7 @@ class Orchestrator:
             cycle.order["order_id"],
             cycle.score_attribution,
             cycle.validation.reasons,
+            cycle.instrument_token,
         )
         self.database.save_open_position(
             state.entry_order_id, state.opened_at.isoformat(), position_state_to_dict(state)

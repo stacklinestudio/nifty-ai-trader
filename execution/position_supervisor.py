@@ -52,6 +52,16 @@ class PositionState:
     # Not used by any decision logic; purely for later real reporting.
     entry_score_attribution: dict[str, Any] | None = None
     entry_validation_reasons: tuple[str, ...] = ()
+    # Final Brief follow-up: the real instrument_token known at entry
+    # time (state.context["selected_option"], same real source
+    # agents/orchestrator.py::_on_risk_decision already uses for the
+    # notification's Kite chart link) -- carried through so the
+    # dashboard's own current-position card can build the identical
+    # real kite_chart_url() for an open position, not just the outbound
+    # notification. Not used by any decision logic; purely for later
+    # real reporting, same as entry_score_attribution above. None
+    # whenever no real option was ever selected (e.g. no candidate).
+    entry_instrument_token: int | None = None
 
     @classmethod
     def opening(
@@ -65,11 +75,12 @@ class PositionState:
         entry_order_id: str | None = None,
         entry_score_attribution: dict[str, Any] | None = None,
         entry_validation_reasons: tuple[str, ...] = (),
+        entry_instrument_token: int | None = None,
     ) -> PositionState:
         return cls(
             thesis, opened_at, thesis.stop, thesis.entry, opened_at, 0.0, 0.0,
             entry_regime, entry_volatility_regime, entry_consensus, entry_agent_directions,
-            entry_order_id, entry_score_attribution, entry_validation_reasons,
+            entry_order_id, entry_score_attribution, entry_validation_reasons, entry_instrument_token,
         )
 
     def observe(self, ltp: float, now: datetime, trail_pct: float) -> None:

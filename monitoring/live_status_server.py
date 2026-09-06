@@ -138,12 +138,67 @@ def build_mock_demo_position(now: datetime | None = None) -> dict[str, Any]:
     }
 
 
+def _position_view_from_state(state: Any) -> dict[str, Any]:
+    """Shapes one real `PositionState` into the dict both `/live` and
+    the dashboard render. `instrument_token` (Final Brief follow-up):
+    the same real value the PAPER_FILL notification's Kite chart link
+    is built from -- carried through PositionState/its persistence so
+    the dashboard's own position card can build the identical real
+    `kite_chart_url()`, not just the outbound notification."""
+    unrealized_pnl = (state.last_valid_ltp - state.thesis.entry) * state.thesis.quantity
+    return {
+        "open": True,
+        "is_demo": False,
+        "symbol": state.thesis.symbol,
+        "direction": state.thesis.candidate.direction,
+        "setup_type": state.thesis.candidate.setup_type,
+        "entry": state.thesis.entry,
+        "current_ltp": state.last_valid_ltp,
+        "current_stop": state.current_stop,
+        "original_stop": state.thesis.stop,
+        "stop_was_trailed": state.current_stop != state.thesis.stop,
+        "target": state.thesis.target,
+        "quantity": state.thesis.quantity,
+        "unrealized_pnl": unrealized_pnl,
+        "opened_at": state.opened_at.isoformat(),
+        "last_quote_at": state.last_quote_at.isoformat(),
+        "mae": state.mae,
+        "mfe": state.mfe,
+        "instrument_token": state.entry_instrument_token,
+        "order_id": state.entry_order_id,
+    }
+
+
+def all_open_position_views(database: Database) -> list[dict[str, Any]]:
+    """Every real row currently in `open_positions`, most-recently-opened
+    first. Defensive-only: the real architecture (DailyLimits + entry-
+    scan pausing during supervision, since Brief 3/6) only ever allows
+    ONE real open position at a time -- this returning more than one
+    entry is NOT an expected scenario, and Monday's real session should
+    never actually exercise that path. This exists purely so the
+    dashboard can render safely (show every real row plainly) rather
+    than silently dropping all but one, or crashing, if that invariant
+    were ever violated. Never includes demo data -- callers that want
+    the demo fallback handle it themselves (see
+    `current_position_view`/`build_dashboard_view`)."""
+    from execution.position_persistence import position_state_from_dict
+
+    rows = database.open_positions()
+    views = [_position_view_from_state(position_state_from_dict(row["state"])) for row in rows]
+    return list(reversed(views))
+
+
 def current_position_view(database: Database) -> dict[str, Any]:
     """The real, current open-position state, read directly from the
     real, already-existing `open_positions` table -- no new data
     source. `{"open": False}` plainly whenever nothing real is open and
     no real demo state exists, never stale data from the last real
-    trade.
+    trade. If more than one real row somehow exists (see
+    `all_open_position_views`'s own docstring -- not an expected
+    scenario), this returns only the most recently opened, matching
+    `/live`'s single-position display; the dashboard's own position
+    card uses `all_open_position_views` directly so it can render every
+    real row instead.
 
     Brief 26: a real open position ALWAYS takes priority over demo/mock
     data -- checked first, and if present, demo state is never even
@@ -151,43 +206,21 @@ def current_position_view(database: Database) -> dict[str, Any]:
     link` run) can never mask or be confused with a real position; at
     worst it fills in for the "no open position" case until cleared.
 
-    `position_state_from_dict` is imported here, not at module level --
-    it pulls in execution.position_persistence -> agents.contracts, and
-    `agents/__init__.py` eagerly imports agents.orchestrator, which
-    itself now imports this module (for `live_status_url`). Importing
-    at module level here would create a real circular import that only
-    fails depending on which module happens to be imported first --
-    confirmed live (`python -c "from monitoring.live_status_server
-    import live_status_url"` failed before this fix, while `python
-    main.py ...` happened to work only because main.py's own import
-    order loads agents.orchestrator first by chance). Deferring this
-    import avoids depending on import order at all."""
-    from execution.position_persistence import position_state_from_dict
-
-    rows = database.open_positions()
-    if rows:
-        row = rows[-1]  # this project holds at most one real open position at a time
-        state = position_state_from_dict(row["state"])
-        unrealized_pnl = (state.last_valid_ltp - state.thesis.entry) * state.thesis.quantity
-        return {
-            "open": True,
-            "is_demo": False,
-            "symbol": state.thesis.symbol,
-            "direction": state.thesis.candidate.direction,
-            "setup_type": state.thesis.candidate.setup_type,
-            "entry": state.thesis.entry,
-            "current_ltp": state.last_valid_ltp,
-            "current_stop": state.current_stop,
-            "original_stop": state.thesis.stop,
-            "stop_was_trailed": state.current_stop != state.thesis.stop,
-            "target": state.thesis.target,
-            "quantity": state.thesis.quantity,
-            "unrealized_pnl": unrealized_pnl,
-            "opened_at": state.opened_at.isoformat(),
-            "last_quote_at": state.last_quote_at.isoformat(),
-            "mae": state.mae,
-            "mfe": state.mfe,
-        }
+    `position_state_from_dict` (via `all_open_position_views`) is
+    imported lazily, not at module level -- it pulls in execution.
+    position_persistence -> agents.contracts, and `agents/__init__.py`
+    eagerly imports agents.orchestrator, which itself now imports this
+    module (for `live_status_url`). Importing at module level here
+    would create a real circular import that only fails depending on
+    which module happens to be imported first -- confirmed live
+    (`python -c "from monitoring.live_status_server import
+    live_status_url"` failed before this fix, while `python main.py
+    ...` happened to work only because main.py's own import order loads
+    agents.orchestrator first by chance). Deferring this import avoids
+    depending on import order at all."""
+    views = all_open_position_views(database)
+    if views:
+        return views[0]
     demo = database.demo_position()
     if demo is not None:
         return demo  # already real-shaped, with is_demo=True baked in by _mock_demo_position
@@ -442,7 +475,20 @@ def build_dashboard_view(
         ("MARKET_RESEARCH_COMPLETE", "SIGNAL_CREATED", "TRADE_VALIDATED", "RISK_APPROVED", "RISK_REJECTED"),
     )
 
-    position = current_position_view(database)
+    # Defensive-only (see all_open_position_views' own docstring): the
+    # real architecture never allows more than one real open position at
+    # a time, so `real_positions` normally has 0 or 1 entries. Demo data
+    # is used only when there are genuinely zero real ones, matching
+    # current_position_view's own real-always-wins rule.
+    real_positions = all_open_position_views(database)
+    if real_positions:
+        open_positions = real_positions
+    else:
+        demo = database.demo_position()
+        open_positions = [demo] if demo is not None else []
+    position = open_positions[0] if open_positions else {"open": False}
+    unrealized_pnl_today = sum(p["unrealized_pnl"] for p in open_positions)
+
     all_trades = memory.recent(memory_type="trade", limit=1000)
     todays_trades = [t for t in all_trades if _is_same_real_day(t.get("timestamp"), today)]
     realized_pnl_today = sum(float(t["payload"].get("pnl") or 0.0) for t in todays_trades)
@@ -458,6 +504,8 @@ def build_dashboard_view(
         "ev_estimate": ev_estimate,
         "pipeline": pipeline,
         "position": position,
+        "open_positions": open_positions,
+        "unrealized_pnl_today": unrealized_pnl_today,
         "trades_today_count": len(todays_trades),
         "realized_pnl_today": realized_pnl_today,
         "max_trades_per_day": settings.max_trades_per_day,
@@ -601,9 +649,41 @@ def _render_candidate_section(view: dict[str, Any]) -> str:
 """
 
 
+def _render_position_card(pos: dict[str, Any], index: int | None = None) -> str:
+    """One real open position's own detail card, including the real
+    Kite chart link (Final Brief follow-up) built from the same real
+    `kite_chart_url()` the outbound PAPER_FILL notification uses --
+    here fed by the position's own persisted `instrument_token`
+    (`PositionState.entry_instrument_token`), not just at fill time.
+    `index` is set only in the defensive multi-position fallback (see
+    `_render_pnl_section`) so each real row is distinguishable."""
+    chart_url = kite_chart_url("NFO", pos.get("symbol", ""), pos.get("instrument_token"))
+    chart_row = (
+        f'<div class="attr-row"><span>Kite chart</span>'
+        f'<a class="kite-link" href="{_esc(chart_url)}" target="_blank" rel="noopener">open chart &#8599;</a></div>'
+        if chart_url
+        else '<div class="attr-row"><span>Kite chart</span><span class="not-yet">no real instrument token known</span></div>'
+    )
+    demo_tag = ' <span class="demo-tag">DEMO</span>' if pos.get("is_demo") else ""
+    label = f"Position {index} of several (defensive)" if index is not None else "Current position"
+    trailed_note = " (trailed)" if pos.get("stop_was_trailed") else ""
+    pnl = pos["unrealized_pnl"]
+    pnl_class = "profit" if pnl >= 0 else "loss"
+    return f"""
+<div class="position-card">
+<p class="label">{label}{demo_tag}</p>
+<div class="attr-row"><span>Symbol</span><span class="mono">{_esc(pos.get('symbol', ''))} ({_esc(pos.get('direction', ''))})</span></div>
+<div class="attr-row"><span>Entry / current LTP</span><span class="mono">{pos['entry']:.2f} / {pos['current_ltp']:.2f}</span></div>
+<div class="attr-row"><span>Stop{trailed_note} / target</span><span class="mono">{pos['current_stop']:.2f} / {pos['target']:.2f}</span></div>
+<div class="attr-row"><span>Unrealized P&amp;L</span><span class="mono {pnl_class}">{pnl:+.2f}</span></div>
+{chart_row}
+</div>
+"""
+
+
 def _render_pnl_section(view: dict[str, Any]) -> str:
-    position = view["position"]
-    unrealized = position["unrealized_pnl"] if position.get("open") else 0.0
+    open_positions = view["open_positions"]
+    unrealized = view["unrealized_pnl_today"]
     realized = view["realized_pnl_today"]
     total = realized + unrealized
     total_class = "profit" if total >= 0 else "loss"
@@ -611,11 +691,36 @@ def _render_pnl_section(view: dict[str, Any]) -> str:
     trades_cap = view["max_trades_per_day"]
     loss_cap = view["max_daily_loss"]
     loss_utilization = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
+
+    if not open_positions:
+        position_html = '<p class="not-yet">No position currently open.</p>'
+    elif len(open_positions) == 1:
+        position_html = _render_position_card(open_positions[0])
+    else:
+        # Defensive-only fallback -- see all_open_position_views' own
+        # docstring. NOT an expected real scenario: the real risk
+        # architecture (DailyLimits + entry-scan pausing during
+        # supervision, Brief 3/6) only ever allows one open position at
+        # a time. Rendered plainly, labeled as a safety fallback, never
+        # silently hidden or crashed on.
+        warning = (
+            '<div class="multi-position-warning">&#9888; '
+            f"{len(open_positions)} real open positions found at once &mdash; this should "
+            "never happen under this project's real risk architecture (one position "
+            "at a time by construction). Showing all of them as a safety fallback, "
+            "not expected behavior.</div>"
+        )
+        position_html = warning + "".join(
+            _render_position_card(pos, index=i + 1) for i, pos in enumerate(open_positions)
+        )
+
     return f"""
 <section class="card" id="pnl">
-<h2>6&middot; Paper P&amp;L / Risk</h2>
+<h2>6&middot; Position &amp; Paper P&amp;L / Risk</h2>
+{position_html}
+<div class="section-divider"></div>
 <div class="attr-row"><span>Realized P&amp;L today</span><span class="mono">{realized:+.2f}</span></div>
-<div class="attr-row"><span>Unrealized P&amp;L (open position)</span><span class="mono">{unrealized:+.2f}</span></div>
+<div class="attr-row"><span>Unrealized P&amp;L (open position(s))</span><span class="mono">{unrealized:+.2f}</span></div>
 <div class="attr-row"><span>Total</span><span class="mono {total_class}">{total:+.2f}</span></div>
 <div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap}</span></div>
 <div class="attr-row"><span>Daily loss cap utilization</span><span class="mono">{loss_utilization:.1f}% of Rs{loss_cap:.0f}</span></div>
@@ -706,47 +811,90 @@ def render_dashboard(view: dict[str, Any], refresh_seconds: int = DASHBOARD_REFR
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root {{
-  --bg: #0b0e14; --card: #131722; --border: #232838; --text: #e6e9ef; --muted: #8b93a7;
+  --bg: #0b0e14; --card: #131722; --card-alt: #171c28; --border: #232838; --border-soft: #1b2130;
+  --text: #e6e9ef; --text-dim: #b7bfd1; --muted: #7c869b;
   --ok: #16c784; --fail: #ea3943; --amber: #f0a020; --accent: #4f8cff;
+  --radius: 12px; --radius-sm: 6px;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.05rem;
 }}
 * {{ box-sizing: border-box; }}
 body {{
-  margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+  margin: 0; padding: var(--sp-6) var(--sp-5); background: var(--bg); color: var(--text);
   font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: var(--fs-base); line-height: 1.5; -webkit-font-smoothing: antialiased;
 }}
-h1 {{ font-size: 1.4em; margin: 0 0 4px 0; }}
-h2 {{ font-size: 1.0em; margin: 0 0 12px 0; color: var(--text); display: flex; align-items: center; gap: 10px; }}
-.top-bar {{ display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; }}
-.top-bar .meta {{ color: var(--muted); font-size: 0.85em; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }}
-.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }}
+h1 {{ font-size: var(--fs-xl); font-weight: 650; margin: 0 0 2px 0; letter-spacing: -0.01em; }}
+h2 {{
+  font-size: var(--fs-md); font-weight: 600; margin: 0 0 var(--sp-4) 0; color: var(--text);
+  display: flex; align-items: baseline; gap: var(--sp-2); padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em;
+}}
+.top-bar {{
+  display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap;
+  gap: var(--sp-2); margin-bottom: var(--sp-6); padding-bottom: var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}}
+.top-bar .meta {{ color: var(--muted); font-size: var(--fs-sm); display: block; margin-top: var(--sp-1); }}
+.top-bar > div:last-child .meta {{ text-align: right; }}
+.grid {{
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: var(--sp-5) var(--sp-5); align-items: start;
+}}
+.card {{
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: var(--sp-5); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
+}}
 .card-wide {{ grid-column: 1 / -1; }}
-.mono {{ font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }}
-.label {{ color: var(--muted); font-size: 0.82em; margin: 0 0 10px 0; }}
-.big-number {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: 2em; font-weight: 600; }}
-.not-yet {{ color: var(--muted); font-style: italic; }}
-.verdict {{ font-size: 0.7em; padding: 3px 10px; border-radius: 20px; font-weight: 700; letter-spacing: 0.04em; }}
+.mono {{ font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; }}
+.label {{ color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-3) 0; letter-spacing: 0.01em; }}
+.big-number {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
+.not-yet {{ color: var(--muted); font-style: italic; font-size: var(--fs-sm); }}
+.verdict {{ font-size: var(--fs-xs); padding: 3px 11px; border-radius: 20px; font-weight: 700; letter-spacing: 0.05em; }}
 .verdict-ready {{ background: rgba(22,199,132,0.15); color: var(--ok); }}
 .verdict-blocked {{ background: rgba(234,57,67,0.15); color: var(--fail); }}
-.check {{ display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 0.88em; border-bottom: 1px solid var(--border); }}
-.check:last-child {{ border-bottom: none; }}
+.check {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }}
+.check:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
 .dot-ok {{ background: var(--ok); }} .dot-fail {{ background: var(--fail); }} .dot-unknown {{ background: var(--muted); }}
-.stage {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.88em; }}
-.stage:last-child {{ border-bottom: none; }}
+.stage {{ display: flex; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
+.stage:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .stage-label {{ color: var(--muted); }}
-.attr-row {{ display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 0.9em; }}
-.attr-row:last-child {{ border-bottom: none; }}
+.stage-value {{ text-align: right; }}
+.attr-row {{ display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
+.attr-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
+.attr-row > span:first-child {{ color: var(--text-dim); }}
 .profit {{ color: var(--ok); }} .loss {{ color: var(--fail); }}
-.timeline {{ max-height: 420px; overflow-y: auto; }}
-.event-row {{ display: grid; grid-template-columns: auto 1fr auto auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.85em; }}
-.badge {{ font-size: 0.68em; font-weight: 700; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.03em; white-space: nowrap; }}
+.section-divider {{ height: var(--sp-3); }}
+.position-card {{
+  background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: var(--sp-4); margin-bottom: var(--sp-4);
+}}
+.position-card .attr-row, .position-card .label {{ margin-bottom: 0; }}
+.demo-tag {{
+  background: rgba(240,160,32,0.18); color: var(--amber); font-size: var(--fs-xs); font-weight: 700;
+  padding: 1px 6px; border-radius: 4px; letter-spacing: 0.04em; vertical-align: middle;
+}}
+.kite-link {{ color: var(--accent); text-decoration: none; font-size: var(--fs-sm); font-weight: 600; }}
+.kite-link:hover {{ text-decoration: underline; }}
+.multi-position-warning {{
+  background: rgba(240,160,32,0.12); border: 1px solid rgba(240,160,32,0.35); color: var(--amber);
+  border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); font-size: var(--fs-sm);
+  margin-bottom: var(--sp-4); line-height: 1.5;
+}}
+.timeline {{ max-height: 420px; overflow-y: auto; margin-top: var(--sp-1); }}
+.event-row {{
+  display: grid; grid-template-columns: auto 1fr auto auto; gap: var(--sp-3); align-items: center;
+  padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm);
+}}
+.event-row:last-child {{ border-bottom: none; }}
+.badge {{ font-size: var(--fs-xs); font-weight: 700; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.03em; white-space: nowrap; }}
 .badge-fill {{ background: rgba(22,199,132,0.18); color: var(--ok); }}
 .badge-no-trade {{ background: rgba(240,160,32,0.18); color: var(--amber); }}
 .badge-system {{ background: rgba(139,147,167,0.18); color: var(--muted); }}
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
-.footer {{ margin-top: 20px; color: var(--muted); font-size: 0.8em; }}
+.footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
 </style>
 </head>
 <body>

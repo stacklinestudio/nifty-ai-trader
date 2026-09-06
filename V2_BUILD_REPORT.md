@@ -7095,3 +7095,112 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Dashboard follow-up: reachability, position-card Kite link, multi-position safety, visual polish (2026-09-06)
+
+Four items, addressed in order.
+
+### 1. Dashboard reachable from the very start of `start-day` -- NEEDED FIXING, now fixed
+
+**Direct answer: it was NOT already true.** Confirmed by inspection before touching anything: `main.start_day()` ran (1) the System Health Gate -- including a real, live `check_kite_connection` API call and real Discord/Telegram probe sends -- then (2) instrument archiving, then (3) capture starting, and only inside step (4) (`run_scheduled_day`, called last) did the dashboard server ever start. Worse: on a real `kite_connection` failure, `start_day` returns immediately after the gate (`stopped_after_gate=True`) and step 4 is **never reached at all** -- meaning the dashboard never started, in exactly the scenario (a bad/expired Kite session) where a person would most want to check it.
+
+**Fix:** extracted the server startup into a shared `_start_live_status_server_in_background_safely(settings)` (also initializes the database, so a real request never hits a missing-table error) and call it as **step 0**, first, unconditionally, before the health gate even runs. `run_scheduled_day` keeps its own call too, for its own standalone `python main.py run` entry point -- when both run in the same real process, the second real bind attempt harmlessly no-ops (port already in use, caught and logged, never fatal).
+
+Real, end-to-end proof -- not just a call-count assertion -- using the REAL default `dashboard_starter` (not a stub), with a real, failing `kite_connection` check that stops everything else:
+
+```
+$ python -m pytest tests/test_start_day.py -k dashboard -v
+test_the_real_dashboard_is_reachable_before_a_real_kite_login_even_completes PASSED
+1 passed in 5.96s
+```
+
+That test: injects a `BLOCKED`/`kite_connection=FAIL` gate, confirms `archive_runner`/`capture_starter`/`scheduler_runner` were **never called** (`stopped_after_gate=True`, Kite login genuinely never completed), then makes a real `urllib.request` GET to `http://127.0.0.1:<port>/dashboard` and confirms `200` with `"No candidate evaluated yet today"` and `"No position currently open."` -- an honest "nothing yet" state, not an error or stale data. A companion unit-level assertion was added to the existing kite-failure test:
+
+```
+$ python -m pytest tests/test_start_day.py::test_a_real_kite_connection_failure_stops_the_whole_sequence -v
+test_a_real_kite_connection_failure_stops_the_whole_sequence PASSED
+1 passed in 0.80s
+```
+(asserts `dashboard_starter.calls == 1` even though the gate genuinely fails and stops everything else). All 8 pre-existing `test_start_day.py` tests were updated to inject a tracking `dashboard_starter` stub (matching the existing `archive_runner`/`capture_starter`/`scheduler_runner` injection pattern) so they stay fast and isolated rather than each binding a real port.
+
+Honest aside, found while writing the real end-to-end test: the very first real dashboard poll after a cold start can take ~1-2 real seconds, because `load_recent_candles` parses the full archived candle CSV (currently 5.8MB) with `parse_dates` before tailing to the last 300 rows. Not a correctness bug and not one of the four items asked here, but worth noting for Monday -- the page is genuinely reachable and correct immediately, just not sub-100ms on that first real poll.
+
+### 2. Real Kite chart link on the dashboard's own position card
+
+The dashboard's position card previously showed no Kite chart link at all -- and couldn't have, because the real `instrument_token` was never carried anywhere past the moment of fill (it lived only in the orchestrator's in-memory cycle state, used solely to build the notification's link). Fixed by threading it all the way through real persistence:
+
+- `agents/orchestrator.py::CycleResult` gained a real `instrument_token` field, populated via a new shared helper `_selected_option_instrument_token(context)` (also now reused by `_on_risk_decision`'s own notification-link code, removing the small duplication that existed there).
+- `execution/position_supervisor.py::PositionState` gained `entry_instrument_token` (same "not used by any decision logic, purely for later real reporting" treatment as the existing `entry_score_attribution` field).
+- `execution/position_persistence.py` persists/restores it (`.get()` with a `None` default, so a position saved before this change still loads cleanly).
+- `monitoring/live_status_server.py`'s position-shaping logic (`_position_view_from_state`) now includes it, and the dashboard's position card builds the real link via the exact same `kite_chart_url()` the outbound notification already uses.
+
+Real evidence -- an actual open position with a real instrument_token, dashboard rendered end to end:
+
+```html
+<div class="position-card">
+<p class="label">Current position</p>
+<div class="attr-row"><span>Symbol</span><span class="mono">NIFTY24CE (CALL)</span></div>
+<div class="attr-row"><span>Entry / current LTP</span><span class="mono">100.00 / 108.00</span></div>
+<div class="attr-row"><span>Stop (trailed) / target</span><span class="mono">102.50 / 115.00</span></div>
+<div class="attr-row"><span>Unrealized P&amp;L</span><span class="mono profit">+520.00</span></div>
+<div class="attr-row"><span>Kite chart</span><a class="kite-link" href="https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194" target="_blank" rel="noopener">open chart &#8599;</a></div>
+</div>
+```
+
+No open position means no card and no link at all (never a blank/broken link):
+
+```
+$ python -m pytest tests/test_dashboard.py -k "kite_chart_link or no_kite_link or no_position_card" -v
+test_dashboard_position_card_includes_a_real_kite_chart_link_when_instrument_token_known PASSED
+test_dashboard_position_card_shows_no_kite_chart_link_without_a_real_instrument_token PASSED
+test_dashboard_shows_no_position_card_and_no_kite_link_when_nothing_is_open PASSED
+3 passed
+```
+
+### 3. Defensive-only multi-position rendering + a real regression guard on the risk architecture
+
+**Explicitly not an expected scenario.** The real architecture (`DailyLimits` + entry-scan pausing during supervision, Brief 3/6) only ever allows one real open position at a time: `run_trading_day` blocks synchronously in `run_supervised` until a fill closes, and only then resumes scanning for the next one -- structurally, two real trades can never be open simultaneously in this single-threaded, synchronous design. Monday's real session should never exercise the fallback below.
+
+Two separate, real tests were added, deliberately at two different levels:
+
+**(a) A real regression guard on the risk architecture itself** (not the display) -- runs an actual `run_trading_day` with two real sequential fills (fill, close on target, resume scanning, fill again, close again) and records the real `open_positions()` row count after every real save:
+
+```
+$ python -m pytest tests/test_scheduler.py::test_normal_operation_never_produces_more_than_one_real_open_position_at_a_time -v
+test_normal_operation_never_produces_more_than_one_real_open_position_at_a_time PASSED
+1 passed in 1.37s
+```
+Asserts: two real fills genuinely happened, the real open-position count was never above 1 at any recorded point, and 0 real open positions remain once the day ends.
+
+**(b) A synthetic test proving the dashboard's own DISPLAY handles the (never-expected) multi-position state safely**, rather than silently dropping a row or crashing -- `all_open_position_views(database)` now returns every real row (not just the most recent, which `current_position_view`/`/live` still use, unchanged), and the dashboard renders all of them behind a plain amber warning:
+
+```html
+<div class="multi-position-warning">&#9888; 2 real open positions found at once &mdash; this should
+never happen under this project's real risk architecture (one position at a time by construction).
+Showing all of them as a safety fallback, not expected behavior.</div>
+<div class="position-card"><p class="label">Position 1 of several (defensive)</p> ... NIFTY24PE ... </div>
+<div class="position-card"><p class="label">Position 2 of several (defensive)</p> ... NIFTY24CE ... </div>
+```
+
+```
+$ python -m pytest tests/test_dashboard.py::test_dashboard_renders_multiple_real_open_positions_safely_as_a_defensive_fallback -v
+test_dashboard_renders_multiple_real_open_positions_safely_as_a_defensive_fallback PASSED
+1 passed in ~1s
+```
+Confirms: both synthetic rows surface (`len(view["open_positions"]) == 2`, neither silently dropped), the warning text and both real Kite chart links render, `render_dashboard` never raises, and the page stays read-only (no `<form>`/`<button>`) even in this fallback state.
+
+### 4. Visual polish pass -- presentation only, no data/computation change
+
+Reworked the dashboard's `<style>` block (the `/live` position page's own separate stylesheet is untouched): a real spacing scale (`--sp-1` through `--sp-6`), a real type scale (`--fs-xs` through `--fs-2xl`) replacing ad hoc `em` values, section headers given a consistent bottom border and baseline-aligned numbering for clearer hierarchy, card padding/radius/shadow made consistent across all ten sections, the top bar restructured with a bottom border and right-aligned metadata for a real alignment grid, table-style rows (`attr-row`/`stage`/`check`) given consistent vertical rhythm and a dimmer left-column color for real visual hierarchy between label and value, and new component styles for the position card, the demo tag, the Kite chart link (hover-underline), and the multi-position warning banner introduced by items 2/3 above. No section's data, computation, or text content changed -- confirmed by the full existing content-assertion test suite passing unchanged (below).
+
+### Full regression
+
+```
+$ pytest -q
+475 passed in 110.35s
+
+$ ruff check .
+All checks passed!
+```
+
+475 real tests passing (up from 469): 1 new in `tests/test_scheduler.py` (the risk-architecture regression guard), 2 new + 8 updated in `tests/test_start_day.py`, 4 new in `tests/test_dashboard.py`. No existing test's assertions were weakened to make this pass.

@@ -178,6 +178,31 @@ def sync_obsidian_knowledge_layer(settings: Settings) -> None:
     exporter.sync_system_docs()
 
 
+def _start_live_status_server_in_background_safely(settings: Settings) -> None:
+    """Real, shared startup for the live-status/dashboard server, used
+    both by `run_scheduled_day` (its own direct entry point, e.g.
+    `python main.py run`) and by `start_day` (called first, before
+    anything else -- see that function's own docstring for why).
+
+    Initializes the database here (not just relies on a caller having
+    already done so) so the dashboard's own real reads
+    (`open_positions`, `events`, etc.) never hit a missing-table error
+    if this is genuinely the first real thing to touch the database
+    this run. `CREATE TABLE IF NOT EXISTS` makes this idempotent with
+    any other real `database.initialize()` call elsewhere in the same
+    process.
+
+    A real bind failure (e.g. the configured port already in use) must
+    never prevent the rest of a real day from proceeding.
+    """
+    try:
+        database = Database(settings.database_path)
+        database.initialize()
+        run_live_status_server_in_background(database, settings, settings.live_status_port)
+    except OSError as exc:
+        logger.warning("live_status_server_start_failed error=%s", exc)
+
+
 def run_scheduled_day(settings: Settings) -> dict:
     """Entry point for unattended daily operation (Brief 3, Part A1).
 
@@ -238,17 +263,14 @@ def run_scheduled_day(settings: Settings) -> dict:
     """
     database = Database(settings.database_path)
     database.initialize()
-    # Brief 25: the real, local, read-only live position status page --
-    # started once per real day, reads the same real open_positions
-    # table this Orchestrator maintains (opens its own real, separate
-    # Database(settings.database_path) connection, not this one, so it
-    # never needs to share an in-memory object with the trading loop).
-    # A real bind failure (e.g. the configured port already in use) must
-    # never prevent the real trading day from starting.
-    try:
-        run_live_status_server_in_background(Database(settings.database_path), settings, settings.live_status_port)
-    except OSError as exc:
-        logger.warning("live_status_server_start_failed error=%s", exc)
+    # Brief 25/Final Brief: the real, local, read-only live status page +
+    # Command Center dashboard -- started once per real day, reads the
+    # same real open_positions table this Orchestrator maintains (opens
+    # its own real, separate Database(settings.database_path)
+    # connection, not this one, so it never needs to share an in-memory
+    # object with the trading loop). Kept here (not just in start_day)
+    # for `python main.py run`'s own direct call to this function.
+    _start_live_status_server_in_background_safely(settings)
     orchestrator = Orchestrator(settings, database)
     calendar = NseCalendar()
     kite = build_kite_session(settings)
@@ -481,14 +503,32 @@ def start_day(
     archive_runner=None,
     capture_starter=None,
     scheduler_runner=None,
+    dashboard_starter=None,
     calendar: NseCalendar | None = None,
     today: datetime.date | None = None,
 ) -> dict:
-    """`python main.py start-day`: everything after the real Kite login,
-    in one shot, in order -- (1) System Health Gate, (2) instrument
-    archiving, (3) start real option tick capture in the background,
-    (4) start the real main trading scheduler in the foreground
-    (blocking, same as `python main.py run`).
+    """`python main.py start-day`: (0) start the real Command Center
+    dashboard, (1) System Health Gate, (2) instrument archiving, (3)
+    start real option tick capture in the background, (4) start the
+    real main trading scheduler in the foreground (blocking, same as
+    `python main.py run`).
+
+    Real bug report, confirmed by direct inspection: the dashboard used
+    to only start inside step 4 (`run_scheduled_day`) -- meaning a real
+    kite_connection failure in step 1 (which stops this whole sequence
+    immediately, see below) meant the dashboard NEVER started at all,
+    and even on a real success path it wasn't reachable until after
+    steps 1-3 had already run. Fixed: the dashboard now starts first,
+    unconditionally, before the health gate's own real Kite login
+    attempt -- reachable from the very start of this real sequence,
+    showing an honest "no open position"/"no candidate yet" (or an
+    honest BLOCKED gate) rather than being gated behind a successful
+    Kite connection or a trade ever entering. `scheduler_runner`'s
+    default (`run_scheduled_day`) also starts the dashboard itself (for
+    its own standalone/`run` entry point) -- when both run in the same
+    real process, the second real bind attempt harmlessly no-ops (the
+    port is already in use; caught, logged, never fatal), so no double
+    dashboard is required to avoid duplicating this call.
 
     Real finding from actually running this end to end (not assumed):
     on a real non-trading day, `run_scheduled_day` returns almost
@@ -516,15 +556,20 @@ def start_day(
     Steps 2-4 are independent: a real failure in one is caught, reported
     clearly in the returned result (and printed), and does not prevent
     the remaining steps from being attempted. `gate`/`archive_runner`/
-    `capture_starter`/`scheduler_runner` are injectable (default to the
-    real functions) purely so this can be tested deterministically
-    without live network calls -- production callers never pass them.
+    `capture_starter`/`scheduler_runner`/`dashboard_starter` are
+    injectable (default to the real functions) purely so this can be
+    tested deterministically without live network calls -- production
+    callers never pass them.
     """
     archive_runner = archive_runner or run_daily_archive
     capture_starter = capture_starter or _start_option_tick_capture_in_background
     scheduler_runner = scheduler_runner or run_scheduled_day
+    dashboard_starter = dashboard_starter or _start_live_status_server_in_background_safely
     calendar = calendar or NseCalendar()
     today = today or datetime.datetime.now(IST).date()
+
+    # Step 0, first, unconditionally -- see the docstring above.
+    dashboard_starter(settings)
 
     result: dict = {"gate": None, "stopped_after_gate": False, "archive": None, "capture": None, "scheduler": None}
 

@@ -142,6 +142,99 @@ def test_build_dashboard_view_reflects_a_real_open_position(tmp_path):
     assert "+520.00" in html  # (108-100)*65 unrealized, from the real open position's P&L card
 
 
+def _open_real_position(
+    database: Database, order_id: str, symbol: str = "NIFTY26SEP24000CE", instrument_token: int | None = None
+):
+    from agents.contracts import TradeCandidate, TradeThesis
+    from execution.position_persistence import position_state_to_dict
+    from execution.position_supervisor import PositionState
+
+    candidate = TradeCandidate(
+        direction="CALL", setup_type="MOMENTUM_CONTINUATION", underlying="NIFTY", confidence=80.0,
+        evidence=("e",), invalidations=(), entry_zone=(99.5, 100.5), stop_zone=(94.5, 95.5),
+        target_zone=(114.5, 115.5),
+    )
+    thesis = TradeThesis(candidate, symbol, 100.0, 95.0, 115.0, 65, 325.0, 80.0, ("e",), ())
+    opened_at = datetime.now(IST)
+    state = PositionState.opening(
+        thesis, opened_at, entry_order_id=order_id, entry_instrument_token=instrument_token
+    )
+    state.observe(108.0, opened_at + timedelta(minutes=5), 0.15)
+    database.save_open_position(order_id, opened_at.isoformat(), position_state_to_dict(state))
+    return opened_at
+
+
+# --- Part 2: real Kite chart link on the dashboard's own position card --
+
+
+def test_dashboard_position_card_includes_a_real_kite_chart_link_when_instrument_token_known(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    opened_at = _open_real_position(database, "order-1", "NIFTY24CE", instrument_token=17512194)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=opened_at.date())
+    html = render_dashboard(view)
+
+    assert kite_chart_url("NFO", "NIFTY24CE", 17512194) in html
+    assert 'class="kite-link"' in html
+
+
+def test_dashboard_position_card_shows_no_kite_chart_link_without_a_real_instrument_token(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    opened_at = _open_real_position(database, "order-1", "NIFTY24CE", instrument_token=None)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=opened_at.date())
+    html = render_dashboard(view)
+
+    assert "kite.zerodha.com" not in html  # never a fabricated/partial link
+    assert "no real instrument token known" in html
+
+
+def test_dashboard_shows_no_position_card_and_no_kite_link_when_nothing_is_open(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert "No position currently open." in html
+    assert "kite.zerodha.com" not in html
+
+
+# --- Part 3: defensive-only multi-position fallback ----------------------
+
+
+def test_dashboard_renders_multiple_real_open_positions_safely_as_a_defensive_fallback(tmp_path):
+    """Synthetic multi-position data, deliberately constructed here since
+    the real risk architecture (see tests/test_scheduler.py::
+    test_normal_operation_never_produces_more_than_one_real_open_
+    position_at_a_time) never actually produces this state -- this
+    proves the dashboard's DISPLAY handles it safely (never crashes,
+    never silently drops a row) if it were somehow ever violated, not
+    that the scenario is expected."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    opened_at = _open_real_position(database, "order-1", "NIFTY24CE", instrument_token=111)
+    _open_real_position(database, "order-2", "NIFTY24PE", instrument_token=222)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=opened_at.date())
+    assert len(view["open_positions"]) == 2  # both real rows surfaced, neither silently dropped
+
+    html = render_dashboard(view)  # must not raise
+
+    assert "2 real open positions found at once" in html
+    assert "should never happen" in html
+    assert "NIFTY24CE" in html and "NIFTY24PE" in html
+    assert kite_chart_url("NFO", "NIFTY24CE", 111) in html
+    assert kite_chart_url("NFO", "NIFTY24PE", 222) in html
+    assert "<form" not in html.lower() and "<button" not in html.lower()  # still read-only
+
+
 # --- honest "not yet" states, tested explicitly, not just happy path -----
 
 
