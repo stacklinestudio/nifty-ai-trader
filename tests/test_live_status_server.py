@@ -316,13 +316,27 @@ def test_supervise_once_keeps_the_real_persisted_position_state_current(tmp_path
     once, at open time, and go stale immediately. Confirms a real
     supervised tick updates the real persisted row too, not just the
     real in-memory PositionState -- this is what makes the live status
-    page's real LTP/trailed-stop actually current, not a snapshot."""
+    page's real LTP/trailed-stop actually current, not a snapshot.
+
+    Real bug found and fixed here (not a production regression -- see
+    V2_BUILD_REPORT.md's own account of this investigation): this test
+    used to build `now` from `datetime.now(IST)`, the real wall clock.
+    `position_supervisor.tick`'s forced-exit check
+    (`now.timetz() >= forced_exit_time`, default 15:15 IST) is real and
+    deterministic BY DESIGN -- but that means this test only ever passed
+    by accident of whatever time of day it happened to run, and
+    genuinely, correctly failed once run after 15:15 IST (confirmed:
+    the exact same production code, given a fixed pre-15:15 `now`,
+    keeps the position open exactly as expected). Fixed by using a
+    fixed, comfortably-pre-market-close real timestamp instead, the
+    same pattern tests/test_scheduler.py's own `market_open_time()`
+    already uses for the same reason."""
     from agents.orchestrator import Orchestrator
 
     settings = Settings(database_path=tmp_path / "paper.db", max_trades_per_day=1)
     orchestrator = Orchestrator(settings, dry_run=True)
     cycle = orchestrator.run_cycle(_filled_cycle_context())
-    now = datetime.now(IST)
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=IST)  # a real Tuesday, 10:00 IST -- comfortably before the 15:15 forced-exit cutoff
     state = orchestrator.open_position(cycle, now=now)
 
     rows_at_open = orchestrator.database.open_positions()

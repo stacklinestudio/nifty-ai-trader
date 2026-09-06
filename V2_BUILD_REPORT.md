@@ -7256,3 +7256,52 @@ $ pytest -q
 $ ruff check .
 All checks passed!
 ```
+
+## Bug report: a real, standalone test failure -- confirmed, root-caused, fixed (2026-09-06)
+
+### 1. Confirmed by re-running the full suite fresh
+
+```
+$ pytest -q
+.........................................................F.............. [ 45%]
+...
+FAILED tests/test_live_status_server.py::test_supervise_once_keeps_the_real_persisted_position_state_current
+1 failed, 475 passed in 129.48s
+```
+
+Real, reproduced exactly as reported: `assert 0 == 1` -- `open_positions()` returned 0 rows after a single `supervise_once` tick that should have kept the position open.
+
+### 2. Real root cause -- NOT a regression in 78fd137's position-persistence/supervisor changes
+
+Isolated by re-running the exact same production code path with a fixed, controlled `now` instead of the test's own `datetime.now(IST)`:
+
+```
+>>> now = datetime(2026, 9, 8, 10, 0, tzinfo=IST)  # 10:00 IST, well before market close
+>>> orchestrator.supervise_once(state, state.thesis.entry + 1.0, now + timedelta(minutes=1))
+TickResult(should_exit=False, reason=None, exit_price=None, notify_stale=False)
+rows after tick: 1
+```
+
+**The real production mechanism is correct.** The test itself was the bug: it built `now = datetime.now(IST)` -- the real wall clock -- and fed it into `supervise_once`. `execution/position_supervisor.py::tick`'s forced-exit check (`now.timetz() >= forced_exit_time`, default 15:15 IST) is real and deterministic *by design* -- it is supposed to force-close any open position at that time regardless of price. The real wall-clock time in this environment when the suite was run was **15:32 IST** -- already past 15:15 -- so the test's own "the position should stay open" tick instead tripped a real, correct FORCED_EXIT, closing the position for an entirely unrelated (and entirely correct) reason. This test happened to pass in every earlier run today purely because those runs occurred before 15:15 IST; nothing in `78fd137`/`1fb499a` broke it, and `git log -- tests/test_live_status_server.py` confirms neither commit touched this file (last real change: `37c9ff5`).
+
+### 3. The real fix -- the test, not the production code
+
+`state.thesis`/`position_persistence`/`position_supervisor` production logic is untouched. Fixed the test's own `now` to a fixed real timestamp comfortably before the forced-exit cutoff (`datetime(2026, 9, 8, 10, 0, tzinfo=IST)`, a real Tuesday), matching the same pattern `tests/test_scheduler.py::market_open_time()` already uses for exactly this reason. The test's own expectation -- a normal, in-range tick keeps the position open -- was correct and is unchanged; only its time-of-day dependence was removed. Checked the rest of `tests/test_live_status_server.py` and every other test file touching `supervise_once`/`tick`/`run_supervised` for the same fragility (any other real-wall-clock `now` feeding a "should stay open" tick) -- none found; every other such call either doesn't route through `tick`'s forced-exit check at all (e.g. `PositionState.observe()` calls) or already fixes its own time explicitly.
+
+```
+$ python -m pytest tests/test_live_status_server.py::test_supervise_once_keeps_the_real_persisted_position_state_current -v
+test_supervise_once_keeps_the_real_persisted_position_state_current PASSED
+1 passed in 1.01s
+```
+
+### 4. Full suite re-run after the fix, confirmed
+
+```
+$ pytest -q
+476 passed in 124.56s
+
+$ ruff check .
+All checks passed!
+```
+
+476 real tests passing -- the same count as claimed before this bug report, now genuinely, freshly re-verified (not re-asserted from a stale run). One test file changed (`tests/test_live_status_server.py`, one fixed timestamp); no production code changed.
