@@ -7682,3 +7682,94 @@ been eyeballed in a real browser and should be checked before Monday.**
 To do that: run `python main.py live-status` (or `demo-live-link` for
 synthetic data) and open `http://localhost:8765/dashboard` in a real
 browser on this machine.
+
+## Bug report: "redesign looked visually unchanged" -- staleness ruled out, real structural pass done anyway (2026-09-06)
+
+Real report: the redesign was said to look visually unchanged.
+Instructed to rule out staleness first -- the same real class of issue
+found repeatedly tonight (dead links, stale position data) -- before
+assuming the redesign itself had failed.
+
+### 1. Real, visible build marker added
+
+`real_git_commit_hash()` runs a real `git rev-parse --short HEAD`
+against this repo (cached for the process's lifetime -- the commit a
+running process started from cannot change without a restart, so
+re-running this on every single render would only add latency for no
+new information), rendered in two real places on every page load:
+
+- The footer: `build {hash} &middot; generated {real render timestamp}`.
+- The sidebar footer (visible without scrolling): `build {hash}`.
+
+Both computed fresh on every real `render_dashboard()` call -- never
+cached alongside the page itself. Real test:
+
+```
+$ python -m pytest tests/test_dashboard.py::test_footer_shows_a_real_build_marker_with_commit_hash_and_timestamp -v
+test_footer_shows_a_real_build_marker_with_commit_hash_and_timestamp PASSED
+```
+
+### 2. Honest self-assessment: this WAS a genuine shortfall, not (only) staleness
+
+Rather than wait for another round-trip to confirm "still looks the
+same," the diff itself was inspected honestly: the prior UI/UX pass
+(`e9d81dc`) was real but comparatively incremental -- fonts, color
+restraint, small highlight grids, a CSS-only pipeline line, border
+accents -- layered on the SAME skeleton the earlier structural redesign
+(`2d6f680`) had already built (sidebar, hero, KPI row, card grid). At a
+glance, especially without the Google Fonts actually loading, that kind
+of change is genuinely easy to read as "the same page." Per the
+acceptance test this brief was measured against -- if it still looks
+the same, the task failed -- this was treated as a real shortfall, not
+defended. Real structural changes made this round, not incremental CSS:
+
+- **Hero header dominance**: real LTP font size raised from 2.5rem to
+  4.2rem (`--fs-hero`, responsive down to 2.4rem on narrow viewports), a
+  real gradient background band (accent/purple wash) replacing the flat
+  card background, larger padding.
+- **Health command panel**: the System Health section now renders
+  **immediately after Overview** -- before Market/Intelligence/
+  Candidate/Position -- a real DOM-order change (`test_health_section_
+  is_the_first_real_section_after_overview`), not just a style tweak,
+  plus a real blocked-state background tint (`.health-command-blocked`)
+  and a larger verdict badge.
+- **Chart size**: real height raised from 340px to 480px, both the
+  container and the actual `LightweightCharts` config (`test_chart_
+  container_uses_the_real_larger_height` checks both).
+- **Sidebar**: every one of the 9 real nav items now carries a real,
+  distinct inline SVG icon (`test_sidebar_nav_items_carry_real_icons`)
+  -- zero external requests, `currentColor`-based so they inherit the
+  link's real hover/active color.
+
+### 3. Fresh, timestamped snapshot -- regenerated and resent
+
+See the chat message accompanying this commit for the real regenerated
+file, its real, current file timestamp, and the real build marker
+visible in the page itself confirming which commit produced it.
+
+### 4. Font rendering -- honestly re-confirmed, not assumed
+
+**Not verified in a real browser.** Only re-confirmed what was already
+true: the `<link>` tags for Google Fonts (Inter, JetBrains Mono) and
+the `font-family: var(--font-ui)` / `var(--font-mono)` CSS rules are
+present in the real served HTML -- that is a **declaration**, not proof
+of **rendering**. `chromium-cli` remains unavailable on this machine;
+Playwright's Chromium download still requires external network access
+this sandboxed environment does not have. Whether the fonts actually
+render as Inter/JetBrains Mono (vs. silently falling back to a system
+font if the CDN request fails in the viewer's own browser) can only be
+confirmed by opening the page in a real browser -- stated plainly
+again rather than assumed to have worked.
+
+### Full regression
+
+```
+$ pytest -q
+490 passed in 131.14s
+
+$ ruff check .
+All checks passed!
+```
+
+490 real tests passing (up from 486): 4 new this round, all prior
+tests (including every hard-requirement test) pass unchanged.

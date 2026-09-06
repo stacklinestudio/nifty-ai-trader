@@ -478,6 +478,78 @@ def test_dashboard_chart_uses_the_real_incremental_update_pattern(tmp_path):
     assert "series.update(last)" in poll_body
 
 
+def test_chart_container_uses_the_real_larger_height(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert 'id="chart-container" style="height:480px;"' in html
+    assert "height: 480," in html  # the real chart JS config, not just the container's own CSS
+
+
+# --- real bug report: staleness vs. genuine redesign shortfall -----------
+
+
+def test_footer_shows_a_real_build_marker_with_commit_hash_and_timestamp(tmp_path):
+    """A real bug report: a redesign was reported as visually unchanged.
+    This build marker exists specifically to make staleness (an old
+    cached page, a server still running a previous build) immediately,
+    visibly obvious -- computed fresh on every real render, never
+    cached alongside the page itself."""
+    import re as _re
+
+    from monitoring.live_status_server import real_git_commit_hash
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime(2026, 9, 6, 16, 45, 12, tzinfo=IST)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    html = render_dashboard(view, now=now)
+
+    real_hash = real_git_commit_hash()
+    assert real_hash != "unknown"  # this real checkout has real git history
+    assert _re.fullmatch(r"[0-9a-f]{6,}", real_hash)
+    assert f"build {real_hash}" in html
+    assert "2026-09-06T16:45:12" in html  # the exact real render timestamp, not a stale one
+    assert 'class="build-marker"' in html
+    assert 'class="side-build"' in html  # visible at the top of the page too, not just the footer
+
+
+def test_health_section_is_the_first_real_section_after_overview(tmp_path):
+    """A real structural change (not just CSS): System Health now
+    renders immediately after Overview -- before Market/Intelligence/
+    Candidate/Position -- so system status is the first thing a person
+    sees below the hero."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    overview_idx = html.index('id="overview"')
+    health_idx = html.index('id="health"')
+    market_idx = html.index('id="market"')
+    assert overview_idx < health_idx < market_idx
+
+
+def test_sidebar_nav_items_carry_real_icons(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert html.count('class="nav-icon"') == 9  # one per real sidebar anchor
+    assert html.count("<svg") >= 9
+
+
 # --- kite chart URL -------------------------------------------------------
 
 

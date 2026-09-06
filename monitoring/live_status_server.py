@@ -70,6 +70,40 @@ DASHBOARD_REFRESH_SECONDS = 30
 CANDLE_DATA_DIR = Path("data/private")
 
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_cached_git_commit_hash: str | None = None
+
+
+def real_git_commit_hash() -> str:
+    """The real current git commit this server is running from -- a
+    real, visible build marker (rendered in the page footer) so
+    staleness -- an old cached page, a browser tab that never reloaded,
+    a server process still running a previous build -- is immediately
+    obvious, the same way the DEMO DATA banner already makes demo mode
+    unmistakable. A real bug report tonight (a redesign that looked
+    unchanged) turned out to need exactly this: no prior way existed to
+    tell, from the page itself, whether what's on screen was actually
+    built from the current code. A real `git rev-parse` subprocess
+    call, cached for this process's lifetime (the commit a running
+    process was started from cannot change without restarting it, so
+    re-running this every single render would only add real latency for
+    no real new information) -- honestly "unknown" if git or a real
+    checkout isn't available, never a fabricated hash."""
+    global _cached_git_commit_hash
+    if _cached_git_commit_hash is None:
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=3, cwd=_REPO_ROOT, check=False,
+            )
+            _cached_git_commit_hash = result.stdout.strip() if result.returncode == 0 else "unknown"
+        except (OSError, subprocess.SubprocessError):
+            _cached_git_commit_hash = "unknown"
+    return _cached_git_commit_hash
+
+
 def real_local_ip() -> str:
     """The machine's real local network address -- never a public IP,
     never localhost, so a link handed to another real device on the
@@ -623,8 +657,9 @@ def _render_health_section(gate: Any) -> str:
     if gate.verdict != "READY":
         reasons = "".join(f"<li>{_esc(reason)}</li>" for reason in gate.blocking_reasons)
         blocking_html = f'<div class="blocking-reasons"><p class="label">Blocking reasons</p><ul>{reasons}</ul></div>'
+    command_class = " health-command-blocked" if gate.verdict != "READY" else ""
     return f"""
-<section class="card card-wide" id="health">
+<section class="card card-wide health-command{command_class}" id="health">
 <h2>System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
 <div class="health-highlights">{highlights_html}</div>
 <div class="checks-grid">{checks_html}</div>
@@ -655,7 +690,7 @@ def _render_market_section(view: dict[str, Any]) -> str:
 <section class="card card-wide" id="market-chart">
 <h2>NIFTY Price</h2>
 <p class="label">{source_note} &mdash; real, already-archived minute bars, not a live intraday tick feed. Refreshed from disk on every poll.</p>
-<div id="chart-container" style="height:340px;"></div>
+<div id="chart-container" style="height:480px;"></div>
 </section>
 """
 
@@ -951,6 +986,21 @@ _SIDEBAR_GROUPS = (
     ("Operations", (("health", "System Health"), ("capture", "Data Capture"), ("notifications", "Notifications"), ("events", "Events"))),
 )
 
+# Simple, single-color (currentColor) 16x16 stroke icons -- inline SVG,
+# zero external requests, zero new dependencies. Purely decorative
+# navigation aids; never a real data source.
+_NAV_ICONS = {
+    "overview": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.6" y="1.6" width="5.6" height="5.6" rx="1"/><rect x="8.8" y="1.6" width="5.6" height="5.6" rx="1"/><rect x="1.6" y="8.8" width="5.6" height="5.6" rx="1"/><rect x="8.8" y="8.8" width="5.6" height="5.6" rx="1"/></svg>',
+    "market": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 13.5 5 8l3 3 5.5-7"/><path d="M10 4h3.5v3.5"/></svg>',
+    "intelligence": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><path d="M8 4.5v3.5l2.2 2.2" stroke-linecap="round"/></svg>',
+    "candidate": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.3"/></svg>',
+    "position": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.6" y="5" width="12.8" height="8.4" rx="1.2"/><path d="M5.5 5V3.6a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V5"/></svg>',
+    "health": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 13.6S1.8 9.9 1.8 5.9a3 3 0 0 1 5.5-1.7l.7.9.7-.9a3 3 0 0 1 5.5 1.7C14.2 9.9 8 13.6 8 13.6Z"/></svg>',
+    "capture": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><ellipse cx="8" cy="3.3" rx="5.4" ry="1.7"/><path d="M2.6 3.3v9.4c0 .95 2.4 1.7 5.4 1.7s5.4-.75 5.4-1.7V3.3"/><path d="M2.6 8c0 .95 2.4 1.7 5.4 1.7s5.4-.75 5.4-1.7"/></svg>',
+    "notifications": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 6.5a4 4 0 0 1 8 0c0 3 1.2 4 1.2 4H2.8s1.2-1 1.2-4Z"/><path d="M6.3 12.5a1.8 1.8 0 0 0 3.4 0"/></svg>',
+    "events": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h8"/></svg>',
+}
+
 
 def _market_session_label(settings: Settings | None, now: datetime) -> str:
     """Item 2: real market open/closed state -- derived purely from
@@ -983,7 +1033,10 @@ def _render_sidebar(view: dict[str, Any], settings: Settings | None) -> str:
     # anchors) while still giving the two-group visual hierarchy.
     nav_html = "".join(
         f'<li class="nav-group-label">{_esc(group_label)}</li>'
-        + "".join(f'<li><a href="#{anchor}">{label}</a></li>' for anchor, label in items)
+        + "".join(
+            f'<li><a href="#{anchor}"><span class="nav-icon">{_NAV_ICONS[anchor]}</span>{label}</a></li>'
+            for anchor, label in items
+        )
         for group_label, items in _SIDEBAR_GROUPS
     )
     return f"""
@@ -994,6 +1047,7 @@ def _render_sidebar(view: dict[str, Any], settings: Settings | None) -> str:
 <div class="side-footer">
 <div class="side-status"><span class="dot {kite_dot}"></span>Kite: {_esc(kite.status if kite else "N/A")}</div>
 <div class="side-status"><span class="dot {ai_dot}"></span>AI: {_esc(ai.status if ai else "N/A")}</div>
+<div class="side-build">build {_esc(real_git_commit_hash())}</div>
 </div>
 </nav>
 """
@@ -1029,7 +1083,7 @@ def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime)
 <div class="hero">
 <div class="hero-top">
 <div>
-<p class="label">NIFTY 50</p>
+<div class="hero-label-row"><span class="hero-eyebrow">NIFTY 50</span></div>
 <div class="hero-ltp">{ltp_html}</div>
 <p class="hero-change">change: not tracked yet</p>
 </div>
@@ -1067,6 +1121,15 @@ def render_dashboard(
     candles_json = json.dumps(view["candles"])
     gate = view["gate"]
     body_class = "" if gate.verdict == "READY" else " class=\"blocked\""
+    # Real bug report: a redesign was reported as visually unchanged --
+    # rule out staleness (an old cached page, a browser tab that never
+    # reloaded, a server still running a previous build) before ever
+    # assuming the redesign itself failed. A real, visible build marker
+    # -- the real current git commit + a real generation timestamp,
+    # computed fresh on every real render -- makes that unambiguous
+    # going forward, the same way the DEMO DATA banner already makes
+    # demo mode unmistakable.
+    build_marker = f"build {_esc(real_git_commit_hash())} &middot; generated {timestamp}"
 
     overview_html = f"""
 <section class="hero-section" id="overview">
@@ -1074,13 +1137,21 @@ def render_dashboard(
 {_render_kpi_row(view)}
 </section>
 """
+    # Structural ordering, not just styling: System Health renders
+    # immediately after Overview -- before Market/Intelligence/
+    # Candidate/Position -- so "is the system even OK" is the first
+    # real thing a person sees below the hero, matching its own
+    # sidebar description as a command panel. The sidebar's own nav
+    # grouping (Primary vs. Operations) is a separate, intentional
+    # organizational grouping and is unaffected by this real page-order
+    # choice -- anchors work identically regardless of DOM order.
     grid_html = "".join(
         [
+            _render_health_section(gate),
             _render_market_section(view),
             _render_intelligence_section(view),
             _render_candidate_section(view),
             _render_position_section(view),
-            _render_health_section(gate),
             _render_capture_section(view),
             _render_notifications_section(view),
             _render_events_section(view),
@@ -1105,7 +1176,7 @@ def render_dashboard(
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --radius: 12px; --radius-sm: 8px; --sidebar-w: 252px;
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
-  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.5rem;
+  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.5rem; --fs-hero: 4.2rem;
 }}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
@@ -1146,11 +1217,12 @@ h2 {{
 }}
 .nav-group-label:first-child {{ padding-top: 0; }}
 .side-nav a {{
-  display: block; color: var(--text-dim); text-decoration: none; font-size: var(--fs-sm);
+  display: flex; align-items: center; gap: var(--sp-3); color: var(--text-dim); text-decoration: none; font-size: var(--fs-sm);
   padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm); border-left: 2px solid transparent;
   transition: background-color 0.12s ease, color 0.12s ease;
 }}
 .side-nav a:hover {{ background: var(--card-alt); color: var(--text); border-left-color: var(--accent); }}
+.nav-icon {{ display: inline-flex; flex-shrink: 0; opacity: 0.85; }}
 .side-footer {{ display: flex; flex-direction: column; gap: var(--sp-2); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
 .side-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--muted); }}
 .main {{ padding: var(--sp-6) var(--sp-5); min-width: 0; }}
@@ -1165,15 +1237,18 @@ h2 {{
 .blocking-reasons ul {{ margin: var(--sp-2) 0 0 0; padding-left: 1.2em; color: var(--fail); font-size: var(--fs-sm); }}
 .hero-section {{ margin-bottom: var(--sp-6); scroll-margin-top: var(--sp-5); }}
 .hero {{
-  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: var(--sp-5); margin-bottom: var(--sp-4);
+  background: linear-gradient(135deg, rgba(91,140,255,0.12), rgba(156,123,255,0.05) 45%, var(--card) 80%);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: var(--sp-6) var(--sp-6); margin-bottom: var(--sp-4); position: relative; overflow: hidden;
 }}
-.hero-top {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--sp-4); }}
-.hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
-.hero-change {{ color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-1) 0 0 0; }}
+.hero-top {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--sp-5); }}
+.hero-label-row {{ display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-2) 0; }}
+.hero-eyebrow {{ color: var(--muted); font-size: var(--fs-sm); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }}
+.hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-hero); font-weight: 700; letter-spacing: -0.02em; line-height: 1; }}
+.hero-change {{ color: var(--muted); font-size: var(--fs-base); margin: var(--sp-2) 0 0 0; }}
 .session-pill {{ background: var(--card-alt); border: 1px solid var(--border-soft); padding: var(--sp-2) var(--sp-4); border-radius: 20px; font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.04em; }}
-.hero-pips {{ display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
-.hero-pip {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-dim); }}
+.hero-pips {{ display: flex; flex-wrap: wrap; gap: var(--sp-5); margin-top: var(--sp-5); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); position: relative; }}
+.hero-pip {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-dim); font-weight: 500; }}
 .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-4); }}
 .kpi-tile {{
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-4);
@@ -1201,9 +1276,12 @@ h2 {{
 .label {{ color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-3) 0; letter-spacing: 0.01em; }}
 .big-number {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
 .not-yet {{ color: var(--muted); font-style: italic; font-size: var(--fs-sm); }}
-.verdict {{ font-size: var(--fs-xs); padding: 3px 11px; border-radius: 20px; font-weight: 700; letter-spacing: 0.05em; }}
+.verdict {{ font-size: var(--fs-sm); padding: 4px 14px; border-radius: 20px; font-weight: 700; letter-spacing: 0.06em; }}
 .verdict-ready {{ background: rgba(30,203,140,0.15); color: var(--ok); }}
 .verdict-blocked {{ background: rgba(240,69,79,0.15); color: var(--fail); }}
+.health-command {{ border-width: 1.5px; }}
+.health-command h2 {{ font-size: var(--fs-lg); }}
+.health-command-blocked {{ border-color: rgba(240,69,79,0.5); background: linear-gradient(180deg, rgba(240,69,79,0.06), var(--card) 40%); }}
 .health-highlights {{
   display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-4);
   margin-bottom: var(--sp-5);
@@ -1277,6 +1355,8 @@ h2 {{
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
 .footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
+.build-marker {{ margin: var(--sp-2) 0 0 0; color: var(--muted); font-size: var(--fs-xs); font-family: var(--font-mono); letter-spacing: 0.02em; }}
+.side-build {{ font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); opacity: 0.7; margin-top: var(--sp-1); }}
 @media (max-width: 900px) {{
   .shell {{ grid-template-columns: 1fr; }}
   .sidebar {{ position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }}
@@ -1284,10 +1364,13 @@ h2 {{
   .nav-group-label {{ display: none; }}
   .side-footer {{ flex-direction: row; border-top: none; padding-top: 0; }}
 }}
+@media (max-width: 900px) {{
+  :root {{ --fs-hero: 3rem; }}
+}}
 @media (max-width: 560px) {{
   .main {{ padding: var(--sp-4); }}
   .hero-top {{ flex-direction: column; }}
-  :root {{ --fs-2xl: 1.9rem; }}
+  :root {{ --fs-2xl: 1.9rem; --fs-hero: 2.4rem; }}
 }}
 </style>
 </head>
@@ -1301,6 +1384,7 @@ h2 {{
 {grid_html}
 </div>
 <p class="footer">This page never accepts writes: no form, no button, nothing here can close, open, or modify a position. It is a window into the system, not a control surface. Page rendered {timestamp} &middot; data as of {_esc(view.get('computed_at', timestamp))} &middot; auto-refresh every {refresh_seconds}s &middot; <a href="{LIVE_PATH}" style="color: var(--accent);">live position page</a></p>
+<p class="build-marker">{build_marker}</p>
 </main>
 </div>
 <script>
@@ -1318,7 +1402,7 @@ h2 {{
     rightPriceScale: {{ borderColor: '#232838' }},
     timeScale: {{ borderColor: '#232838', timeVisible: true }},
     width: container.clientWidth,
-    height: 340,
+    height: 480,
   }});
   var series = chart.addCandlestickSeries({{
     upColor: '#1ecb8c', downColor: '#f0454f', borderVisible: false,
