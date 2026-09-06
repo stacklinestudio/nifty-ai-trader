@@ -767,7 +767,32 @@ def main() -> int:
             print(json.dumps({"error": str(exc)}))
             return 1
         try:
-            start_day(settings)
+            result = start_day(settings)
+            if result.get("stopped_after_gate"):
+                # Real bug report, the same class as demo-live-link's
+                # dead-on-arrival link: start_day's own dashboard starts
+                # as its very first step (before the health gate),
+                # specifically so it stays reachable through a real Kite
+                # login failure -- but this CLI handler used to just
+                # `return 0` right after, which exits the real OS
+                # process and kills that server's daemon thread along
+                # with it, undoing the entire point of starting it
+                # first. Confirmed via a real subprocess run: the
+                # process genuinely exited (code 0) within seconds of
+                # printing "STOPPED". Fixed by blocking here instead of
+                # returning -- the real server thread (already running,
+                # started inside start_day itself) is never touched
+                # again; this only keeps the enclosing process alive so
+                # it isn't torn down.
+                print(
+                    "start-day stopped early after a real health-gate failure -- the real "
+                    f"dashboard stays up: {dashboard_url(settings)} "
+                    f"(live position page: {live_status_url(settings)}). Press Ctrl+C to stop."
+                )
+                try:
+                    threading.Event().wait()
+                except KeyboardInterrupt:
+                    pass
             return 0
         finally:
             lock.release()

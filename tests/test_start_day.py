@@ -328,6 +328,102 @@ def test_the_real_dashboard_is_reachable_before_a_real_kite_login_even_completes
         assert "No open position" in response.read().decode("utf-8")
 
 
+def test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure(tmp_path):
+    """The exact bug class demo-live-link had, re-checked here on purpose:
+    the previous test above calls `main.start_day()` in-process, which
+    can prove the dashboard STARTS but can never prove the real OS
+    PROCESS stays alive afterward -- exactly the blind spot that let
+    demo-live-link's dead link ship unnoticed. This runs the REAL CLI
+    (`python main.py start-day`) as a genuinely separate OS subprocess,
+    with no real Kite credentials (so kite_connection fails fast and
+    deterministically), and makes a real HTTP request from THIS process
+    (a separate one) while it's still running.
+
+    Real, confirmed root cause before this fix: the CLI handler called
+    `start_day(settings)` then `return 0` unconditionally -- `main()`'s
+    return value drives `raise SystemExit(main())`, so the whole real
+    process exited right after printing "STOPPED", tearing down the
+    dashboard's daemon thread with it. Confirmed via a real subprocess
+    run: exit code 0, ~6s elapsed (dominated by the real, empty-webhook
+    notifications probe's retry backoff), process already gone by the
+    time a request could be made.
+
+    All Discord/Telegram env vars are explicitly blanked (not just the
+    single fallback) so this real subprocess run never sends a real
+    notification via any real category webhook a local .env.local might
+    have configured -- this project's own real, deliberate setup uses
+    exactly that pattern (see the System Health Gate's `notifications`
+    check bug report), and a test must not depend on, or trigger real
+    side effects through, whatever real credentials happen to be
+    present on the machine running it.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    port = 8795  # a real, free local port distinct from every other test in this suite
+    env = dict(os.environ)
+    env["LIVE_STATUS_PORT"] = str(port)
+    env["DATABASE_PATH"] = str(tmp_path / "start_day_cli.db")
+    env["KITE_API_KEY"] = ""
+    env["KITE_ACCESS_TOKEN"] = ""
+    env["DISCORD_WEBHOOK_URL"] = ""
+    env["DISCORD_WEBHOOK_MARKET_RESEARCH"] = ""
+    env["DISCORD_WEBHOOK_SIGNALS"] = ""
+    env["DISCORD_WEBHOOK_TRADES"] = ""
+    env["DISCORD_WEBHOOK_RISK"] = ""
+    env["DISCORD_WEBHOOK_SYSTEM"] = ""
+    env["DISCORD_WEBHOOK_DAILY_REPORT"] = ""
+    env["TELEGRAM_BOT_TOKEN"] = ""
+    env["TELEGRAM_CHAT_ID"] = ""
+
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(
+        [sys.executable, "main.py", "start-day"],
+        cwd=str(repo_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        body = None
+        for _ in range(60):
+            if proc.poll() is not None:
+                break  # the real process already exited -- stop polling, fail below with its real output
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=1) as response:
+                    body = response.read().decode("utf-8")
+                    break
+            except Exception:  # noqa: BLE001 - any connection-not-ready error is expected while polling for real startup.
+                time.sleep(0.25)
+
+        # The real, decisive assertion: the process must still be alive.
+        assert proc.poll() is None, (
+            f"the real start-day process already exited (code {proc.poll()}) -- "
+            f"the dashboard died with it. Real output:\n{proc.stdout.read()}"
+        )
+        assert body is not None, f"real dashboard never became reachable; process output so far:\n{proc.stdout.read()}"
+        assert "No candidate evaluated yet today" in body
+        assert "No position currently open." in body
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # After the real process is gone, the real port must be free again --
+    # confirms the server was genuinely tied to this specific process.
+    time.sleep(0.5)
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=1)
+        raise AssertionError("expected the real port to be freed once the real process exited")
+    except urllib.error.URLError:
+        pass
+
+
 def test_start_option_tick_capture_in_background_uses_a_real_nsecalendar_by_default():
     """Sanity check that the real NseCalendar this brief relies on
     behaves as expected for the two real dates used throughout these

@@ -7204,3 +7204,55 @@ All checks passed!
 ```
 
 475 real tests passing (up from 469): 1 new in `tests/test_scheduler.py` (the risk-architecture regression guard), 2 new + 8 updated in `tests/test_start_day.py`, 4 new in `tests/test_dashboard.py`. No existing test's assertions were weakened to make this pass.
+
+## Bug report: start-day's own process exited right after "STOPPED" -- same class as demo-live-link (2026-09-06)
+
+Real suspected bug, confirmed exactly as suspected: item 1's own new test above (`test_the_real_dashboard_is_reachable_before_a_real_kite_login_even_completes`) calls `main.start_day()` **in-process**, from inside the test itself -- so it can prove the dashboard *starts*, but structurally cannot prove the real OS *process* stays alive afterward. That is exactly the blind spot that let the original demo-live-link bug (Brief 27) ship unnoticed.
+
+### 1. Confirmed directly, via a real subprocess -- not reasoned from the code
+
+```
+$ python main.py start-day   # real subprocess, no real Kite credentials, real timing measured
+exit code: 0
+elapsed: 6.36 s
+--- stdout (last few lines) ---
+...
+start-day STOPPED: real kite_connection check failed (no real Kite credentials configured) -- nothing else can meaningfully run.
+```
+
+**Yes** -- the real process exits (code 0) and returns to the shell prompt within seconds of printing "STOPPED". Root cause, confirmed by direct inspection: the CLI handler called `start_day(settings)` then `return 0` unconditionally; `if __name__ == "__main__": raise SystemExit(main())` at the bottom of `main.py` means that `return 0` becomes a real `sys.exit(0)`, tearing down every thread in the process -- including the dashboard's daemon thread that item 1's own fix had just started as `start_day`'s very first step.
+
+Honest side note from this verification: the first real subprocess run (before I'd thought to blank Telegram/Discord env vars) inherited this machine's real `.env.local` credentials and caused the System Health Gate's real `notifications` check to actually send one real, harmless "System Health Gate check; no trade." INFO message to the real configured Telegram chat -- flagging this plainly rather than omitting it. Every subsequent verification run in this fix explicitly blanks all Discord/Telegram env vars first.
+
+### 2. The real fix
+
+The CLI's `start-day` handler now checks `result["stopped_after_gate"]`; if true, it prints an explicit message (the real dashboard/live URLs, "Press Ctrl+C to stop") and blocks the process on `threading.Event().wait()` instead of returning -- exactly the same shape as the fix already applied to `demo-live-link`. No second server is started here: the real one is already running (started inside `start_day` itself, per item 1's fix); this only keeps the enclosing OS process alive so that thread is never torn down. `start_day()` the function itself is unchanged and stays synchronously testable -- only the CLI wrapper gained the blocking behavior, same split as the demo-live-link fix.
+
+### 3. Verified with a real subprocess test, not another in-process call
+
+`test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure` runs the actual `python main.py start-day` as a genuinely separate OS subprocess (`subprocess.Popen`), with `KITE_API_KEY`/`KITE_ACCESS_TOKEN` blanked so the failure is fast and deterministic, and every Discord/Telegram env var blanked so it can never trigger a real send. It polls `/dashboard` with a real HTTP request from this test process (a separate one), then asserts the real decisive fact this bug was about -- `proc.poll() is None`, i.e. the process is still alive -- before checking the response body and finally terminating it and confirming the port frees.
+
+```
+$ python -m pytest tests/test_start_day.py::test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure -v
+test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure PASSED
+1 passed in 5.03s
+```
+
+Proven to actually catch the original bug (not just pass trivially): reverting the CLI fix and re-running this exact test fails with the real, precise diagnosis --
+
+```
+AssertionError: the real start-day process already exited (code 0) -- the dashboard died with it. Real output:
+...
+start-day STOPPED: real kite_connection check failed (no real Kite credentials configured) -- nothing else can meaningfully run.
+assert 0 is None
+```
+
+-- then passes again once the fix is restored, confirmed with the full suite:
+
+```
+$ pytest -q
+476 passed in 123.41s
+
+$ ruff check .
+All checks passed!
+```
