@@ -6906,3 +6906,82 @@ no real money at risk; no new decision logic, no new AI authority, no
 new EV gate, no strategy changes anywhere in this brief — only a real,
 honest window into a system that was already making its own real
 decisions.
+
+## Final Brief follow-up: demo notification parity + dashboard as the primary link (2026-09-06)
+
+Real bug report: `demo-live-link`'s real notification didn't include a
+Kite chart link, unlike the real PAPER_FILL path (confirmed by
+comparing the two output_summary shapes directly). Two real fixes:
+
+**1. `demo-live-link` now exercises the exact same `kite_chart_url()`
+call the real PAPER_FILL path makes.** `build_mock_demo_position()`
+gained a real-shaped but obviously-fake `instrument_token` (`999999999`
+— not a real Kite token anywhere in this project's real archived
+instrument dumps), and `main.demo_live_link()` now builds a real Kite
+chart URL from the mock position's own symbol/token, exactly the way
+`agents/orchestrator.py::_on_risk_decision` does for a real fill:
+
+```
+>>> result['kite_chart_url']
+'https://kite.zerodha.com/chart/ext/tvc/NFO/DEMO-NIFTY00000CE/999999999'
+```
+
+**2. The notification's primary link now points at `/dashboard`, not
+`/live`.** `/live` is unchanged and still real/reachable (same route,
+same 31-test suite passing unchanged) — it's just no longer the default
+link a person clicks from a notification, since the dashboard is now
+the fuller, better view. Both the real PAPER_FILL path
+(`agents/orchestrator.py`) and `demo-live-link` (`main.py`) now attach
+a `dashboard_url` field alongside the existing `live_status_url`;
+`integrations/discord.py`/`integrations/telegram.py::_links_line` was
+updated to label `dashboard_url` (falling back to `live_status_url`
+only if `dashboard_url` is ever absent) as "Our dashboard" in the
+human-readable notification text.
+
+Real, end-to-end evidence — a real `demo_live_link()` run (Discord/
+Telegram calls intercepted, since no real webhook/token is configured
+in this shell) — showing the complete real event payload:
+
+```
+dashboard_url: http://192.168.1.2:8765/dashboard
+live_status_url: http://192.168.1.2:8765/live
+kite_chart_url: https://kite.zerodha.com/chart/ext/tvc/NFO/DEMO-NIFTY00000CE/999999999
+event output_summary: {'order_id': 'DEMO-ORDER', 'fill_price': 100.0,
+  'dashboard_url': 'http://192.168.1.2:8765/dashboard',
+  'live_status_url': 'http://192.168.1.2:8765/live',
+  'kite_chart_url': 'https://kite.zerodha.com/chart/ext/tvc/NFO/DEMO-NIFTY00000CE/999999999',
+  'note': 'DEMO DATA, NOT A REAL TRADE -- sent by python main.py demo-live-link'}
+```
+
+Test: demo's notification proven to match the real PAPER_FILL shape
+exactly (same 3 real link fields, same values traced back to the same
+real functions), and proven to label the dashboard link as primary in
+the actual rendered notification text:
+
+```
+$ python -m pytest tests/test_live_status_server.py -k "matches_the_real_paper_fill_format or labels_the_dashboard_as_the_primary_link" -v
+test_demo_live_link_notification_matches_the_real_paper_fill_format_exactly PASSED
+test_demo_live_link_notification_labels_the_dashboard_as_the_primary_link PASSED
+2 passed
+
+$ python -m pytest tests/test_v2_system.py -k kite_chart_link -v
+test_paper_fill_event_includes_the_real_kite_chart_link_when_instrument_token_known PASSED
+test_paper_fill_event_omits_kite_chart_link_without_a_real_instrument_token PASSED
+2 passed
+```
+
+Full regression:
+
+```
+$ pytest -q
+466 passed in 109.24s
+
+$ ruff check .
+All checks passed!
+```
+
+466 real tests passing (up from 464), 2 new in `tests/test_live_status_
+server.py` (now 31, all pre-existing ones unchanged); the two existing
+kite-chart-link tests in `tests/test_v2_system.py` were extended
+in-place to also assert the new `dashboard_url` field, since they
+already covered the exact real event this field was added to.

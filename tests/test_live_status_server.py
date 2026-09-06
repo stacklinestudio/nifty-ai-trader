@@ -566,6 +566,83 @@ def test_demo_live_link_sends_a_real_notification_with_the_real_working_link(tmp
     assert result["live_status_url"].endswith(f":{settings.live_status_port}/live")
 
 
+def test_demo_live_link_notification_matches_the_real_paper_fill_format_exactly(tmp_path, monkeypatch):
+    """Follow-up bug report: the real PAPER_FILL path already includes a
+    real Kite chart link (Final Brief Part B) and a real dashboard link
+    as the primary link; demo-live-link's notification was missing the
+    Kite chart link and still pointed its primary link at /live. Both
+    now match the real PAPER_FILL event's shape exactly."""
+    import main
+    from monitoring.live_status_server import kite_chart_url
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    sent_messages = []
+
+    class _RecordingNotifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send_event(self, event):
+            sent_messages.append(event)
+            return True
+
+    monkeypatch.setattr(main, "DiscordNotifier", _RecordingNotifier)
+    monkeypatch.setattr(main, "TelegramNotifier", _RecordingNotifier)
+
+    result = main.demo_live_link(settings, database=database)
+
+    assert result["dashboard_url"].endswith(f":{settings.live_status_port}/dashboard")
+    assert result["kite_chart_url"] == kite_chart_url(
+        "NFO", result["mock_view"]["symbol"], result["mock_view"]["instrument_token"]
+    )
+    for event in sent_messages:
+        summary = event.output_summary
+        # Same 4 real keys the real PAPER_FILL path's output_summary
+        # carries (order_id/fill_price plus these 3 real links) -- same
+        # shape, real demo values.
+        assert summary["dashboard_url"] == result["dashboard_url"]
+        assert summary["live_status_url"] == result["live_status_url"]
+        assert summary["kite_chart_url"] == result["kite_chart_url"]
+
+
+def test_demo_live_link_notification_labels_the_dashboard_as_the_primary_link(tmp_path, monkeypatch):
+    """The notification's own human-readable text -- not just the raw
+    JSON payload -- must point a person at /dashboard, not /live."""
+    import main
+    from integrations.discord import DiscordNotifier
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(tmp_path / "paper.db")
+    database.initialize()
+    sent_calls = []
+
+    class _RealFormattingDiscord(DiscordNotifier):
+        def send_embed(self, title, description, severity="INFO", category=None):
+            sent_calls.append(description)
+            return True
+
+    monkeypatch.setattr(main, "DiscordNotifier", _RealFormattingDiscord)
+
+    class _NoopTelegram:
+        def __init__(self, *a, **k):
+            pass
+
+        def send_event(self, event):
+            return False
+
+    monkeypatch.setattr(main, "TelegramNotifier", _NoopTelegram)
+
+    result = main.demo_live_link(settings, database=database)
+
+    description = sent_calls[0]
+    assert f"Our dashboard: {result['dashboard_url']}" in description
+    assert f"Kite chart: {result['kite_chart_url']}" in description
+    # /live must still be reachable data, just not the clicked-through link.
+    assert result["dashboard_url"] != result["live_status_url"]
+
+
 # --- Brief 27: a real bug report -- the link was dead on arrival -------
 
 

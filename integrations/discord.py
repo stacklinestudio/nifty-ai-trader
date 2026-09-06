@@ -58,7 +58,11 @@ def _links_line(event: Event) -> str:
     or when neither real link is present on this one."""
     if event.event_type != EventType.PAPER_FILL:
         return ""
-    dashboard_link = event.output_summary.get("live_status_url")
+    # dashboard_url is the primary link -- the fuller Command Center
+    # view -- with live_status_url (the older, narrower /live position
+    # card) as a fallback for any event built before dashboard_url
+    # existed.
+    dashboard_link = event.output_summary.get("dashboard_url") or event.output_summary.get("live_status_url")
     kite_link = event.output_summary.get("kite_chart_url")
     parts = []
     if dashboard_link:

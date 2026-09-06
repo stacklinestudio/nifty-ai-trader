@@ -41,7 +41,7 @@ from integrations.discord import DiscordNotifier, webhooks_by_category_from_sett
 from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
-from monitoring.live_status_server import kite_chart_url, live_status_url
+from monitoring.live_status_server import dashboard_url, kite_chart_url, live_status_url
 from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
@@ -430,12 +430,16 @@ class Orchestrator:
             paper_fill_summary = {
                 "order_id": order["order_id"],
                 "fill_price": order["fill_price"],
-                # Brief 25: a real link to the local, read-only live
-                # position status page -- the real machine's local
-                # network address (never a public URL), so it only
-                # resolves for a device already on the same real
-                # local network. real_local_ip() itself never raises
-                # (falls back to 127.0.0.1 on any real socket error).
+                # Follow-up to Brief 25/Final Brief: the dashboard is now
+                # the fuller, better view (10 real sections vs. one
+                # position card), so it -- not /live -- is the primary
+                # link a person actually clicks from a notification.
+                # /live stays real and reachable for anything that still
+                # wants just the position card. Same real machine local
+                # network address for both (never a public URL);
+                # real_local_ip() itself never raises (falls back to
+                # 127.0.0.1 on any real socket error).
+                "dashboard_url": dashboard_url(self.settings),
                 "live_status_url": live_status_url(self.settings),
             }
             # Final Brief Part B: the real Kite web chart for this exact

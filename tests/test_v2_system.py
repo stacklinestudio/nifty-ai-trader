@@ -128,6 +128,10 @@ def test_paper_fill_event_includes_the_real_kite_chart_link_when_instrument_toke
     summary = fills[0].output_summary
     assert summary["kite_chart_url"] == "https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194"
     assert "live_status_url" in summary
+    # Follow-up bug report: /dashboard, not /live, is the primary link a
+    # person actually clicks from the notification.
+    assert summary["dashboard_url"].endswith("/dashboard")
+    assert summary["dashboard_url"] != summary["live_status_url"]
 
 
 def test_paper_fill_event_omits_kite_chart_link_without_a_real_instrument_token(tmp_path: Path):

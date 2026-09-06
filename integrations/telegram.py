@@ -19,7 +19,7 @@ def _links_line(event: Event) -> str:
     present."""
     if event.event_type != EventType.PAPER_FILL:
         return ""
-    dashboard_link = event.output_summary.get("live_status_url")
+    dashboard_link = event.output_summary.get("dashboard_url") or event.output_summary.get("live_status_url")
     kite_link = event.output_summary.get("kite_chart_url")
     parts = []
     if dashboard_link:

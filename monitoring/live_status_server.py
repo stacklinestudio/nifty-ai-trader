@@ -111,6 +111,14 @@ def build_mock_demo_position(now: datetime | None = None) -> dict[str, Any]:
     entry, current_ltp, quantity = 100.0, 108.5, 65
     return {
         "open": True,
+        # A real-shaped, obviously-fake instrument_token -- present so
+        # `demo-live-link` can exercise the exact same kite_chart_url()
+        # call the real PAPER_FILL path makes, without ever pointing at
+        # a real, tradeable contract. 999999999 is not a real Kite
+        # instrument_token in this project's real archived instrument
+        # dumps; the resulting URL is clearly a demo, not a working
+        # chart link.
+        "instrument_token": 999999999,
         "is_demo": True,
         "symbol": "DEMO-NIFTY00000CE",
         "direction": "CALL",

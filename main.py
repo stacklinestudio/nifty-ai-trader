@@ -46,6 +46,7 @@ from monitoring.live_status_server import (
     build_live_status_server,
     build_mock_demo_position,
     dashboard_url,
+    kite_chart_url,
     live_status_url,
     run_live_status_server_in_background,
 )
@@ -430,7 +431,15 @@ def demo_live_link(settings: Settings, database: Database | None = None) -> dict
     mock_view = build_mock_demo_position(now)
     database.save_demo_position(mock_view, now)
 
-    url = live_status_url(settings)
+    dashboard_link = dashboard_url(settings)
+    live_link = live_status_url(settings)
+    # Follow-up to the real bug report: the real PAPER_FILL path also
+    # includes a real Kite chart link (agents/orchestrator.py::_on_risk_
+    # decision). This exercises the exact same kite_chart_url() call
+    # against the mock position's own (obviously fake) instrument data,
+    # so this command visibly proves that real behavior too -- not just
+    # the dashboard link.
+    chart_link = kite_chart_url("NFO", mock_view["symbol"], mock_view.get("instrument_token"))
     # The exact same real formatting the real PAPER_FILL entry
     # notification uses (agents/orchestrator.py::_on_risk_decision) --
     # a real Event run through the same real send_event() Discord/
@@ -443,7 +452,9 @@ def demo_live_link(settings: Settings, database: Database | None = None) -> dict
         output_summary={
             "order_id": "DEMO-ORDER",
             "fill_price": mock_view["entry"],
-            "live_status_url": url,
+            "dashboard_url": dashboard_link,
+            "live_status_url": live_link,
+            "kite_chart_url": chart_link,
             "note": "DEMO DATA, NOT A REAL TRADE -- sent by python main.py demo-live-link",
         },
         confidence=100,
@@ -456,7 +467,9 @@ def demo_live_link(settings: Settings, database: Database | None = None) -> dict
     telegram_sent = telegram.send_event(event)
     return {
         "mock_view": mock_view,
-        "live_status_url": url,
+        "dashboard_url": dashboard_link,
+        "live_status_url": live_link,
+        "kite_chart_url": chart_link,
         "discord_sent": discord_sent,
         "telegram_sent": telegram_sent,
     }
@@ -749,7 +762,9 @@ def main() -> int:
         database.initialize()
         result = demo_live_link(settings, database=database)
         print(f"Demo position written (DEMO DATA, not a real trade): {result['mock_view']['symbol']}")
+        print(f"Command Center dashboard: {result['dashboard_url']}")
         print(f"Live status page: {result['live_status_url']}")
+        print(f"Kite chart (demo, not a real instrument): {result['kite_chart_url']}")
         print(f"Discord sent: {result['discord_sent']}  Telegram sent: {result['telegram_sent']}")
         print("(If neither channel is configured, this correctly reports False -- same as `notifications`.)")
         print(
