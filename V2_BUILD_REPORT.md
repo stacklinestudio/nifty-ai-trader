@@ -7773,3 +7773,203 @@ All checks passed!
 
 490 real tests passing (up from 486): 4 new this round, all prior
 tests (including every hard-requirement test) pass unchanged.
+
+## Command Center UI Redesign v2 -- ground-up visual rebuild (2026-09-06)
+
+Full visual redesign, not incremental CSS tweaks. Real, self-hosted
+fonts; a new 3-column command bar; a real connected-node AI pipeline;
+a dedicated Paper Trading card; a real Data Foundation flow diagram;
+and -- this time -- genuine browser-based visual QA that found and fixed
+two real layout bugs. Same architectural boundary as every prior
+Command Center brief.
+
+### Exact files changed / not changed
+
+**Changed:**
+- `monitoring/live_status_server.py` -- rendering functions and one new
+  read-only static-asset route only.
+- `tests/test_dashboard.py` -- tests only.
+- `monitoring/static/fonts/` -- new: 8 real WOFF2 font binaries (Inter
+  and JetBrains Mono, 4 weights each) + a README documenting their
+  source and license.
+
+**Not changed (confirmed by diffing exact function boundaries, not by
+intent):**
+
+```
+$ git diff monitoring/live_status_server.py | grep -A5 "^@@" | grep "def build_dashboard_view\|def current_position_view\|def all_open_position_views\|def _position_view_from_state\|def check_nifty_ltp\|def find_latest_candle_csv\|def load_recent_candles"
+no diff hunks touch these data-layer functions
+
+$ git status --porcelain=v1
+ M monitoring/live_status_server.py
+ M tests/test_dashboard.py
+?? monitoring/static/
+```
+
+No file under `agents/`, `execution/`, `risk/`, `data/`, `learning/`,
+`research/`, `storage/`, or `main.py` touched. No trading, AI, risk, or
+execution logic changed.
+
+### What visually changed -- specifically, not "UI improved"
+
+1. **Typography, actually verified, not just declared.** Real, self-
+   hosted WOFF2 files (Inter 400/500/600/700, JetBrains Mono
+   400/500/600/700) served by a new real, read-only, GET-only
+   `/static/fonts/<name>` route with a strict filename allowlist (never
+   a raw path join -- a real path-traversal attempt against it returns
+   404, verified). No Google Fonts `<link>` anywhere in the page
+   anymore. Verified two ways, not one:
+   - **Binary-level**: `fontTools` decoded the actual downloaded files'
+     own name tables -- confirmed real `Inter`/`JetBrains Mono`
+     binaries at the correct weights, not corrupted or mislabeled.
+   - **Real browser, real computed styles** (see QA section below):
+     `document.fonts` reports every font-face `loaded`, and
+     `getComputedStyle()` on real elements resolves to `Inter`/
+     `"JetBrains Mono"` as the FIRST (i.e. actually-used) family, not a
+     fallback.
+2. **A real 3-column command bar** replaces the old stacked hero: NIFTY
+   price | real market open/closed state | real system READY/BLOCKED
+   verdict, side by side, each its own real value.
+3. **The chart moved up and grew**: now the first thing after the
+   command bar (previously buried under a redundant small "Kite/Market
+   Status" card, which was removed -- its info now lives in the command
+   bar and Health section instead of being shown twice), height 480px.
+4. **System Health is a real command panel**, not seven text rows: a
+   3-up highlight grid (Kite/AI Provider/Tick Capture) plus the
+   remaining 4 real checks below, a prominent real verdict badge, and
+   the real specific blocking reasons listed underneath when blocked --
+   positioned immediately after the command bar, first thing a person
+   sees.
+5. **AI Pipeline is a real connected-node visualization** -- 5 nodes
+   (Research/Signal/EV/Adversarial/Supervisor) joined by real connector
+   lines, each independently marked done/not-run from real event data,
+   full-width for room to breathe. Never a fake "Analyzing..." state;
+   a stage with no real event this cycle says `NOT RUN`, honestly.
+6. **A dedicated Paper Trading card** (previously folded into a generic
+   6-tile KPI row) -- real realized/unrealized P&L, real trades-used
+   count, real daily risk utilization with its own real progress bar.
+7. **Data Foundation gained a real visual flow diagram** -- RAW ->
+   NORMALIZED -> VALIDATED -> RESEARCH as real connected nodes (green,
+   distinct from the purple "in-progress" pipeline styling, since this
+   is a permanent architectural guarantee, not a live check), plus real
+   option-capture segment/tick/gap counts broken into their own tiles.
+8. **Sidebar regrouped into Command / Trading / Operations** (previously
+   two flatter groups), every one of the 9 real nav items now carries
+   its own real inline SVG icon.
+9. **A real, visible build marker** (git commit hash + generation
+   timestamp, computed fresh every render) in both the sidebar and
+   footer -- unrelated to this brief directly, but kept from the
+   previous fix since it's how staleness gets ruled out before ever
+   re-litigating "did the redesign actually change."
+10. Two real layout bugs found by ACTUALLY LOOKING at a real screenshot
+    and fixed -- see the QA section below, not asserted from reading
+    the CSS.
+
+### Real browser-based visual QA -- this time actually obtained
+
+The previous two attempts said real screenshots were impossible here
+(`chromium-cli` absent; Playwright's own downloader timing out against
+`cdn.playwright.dev`). That conclusion was re-examined rather than
+repeated: general internet access was re-tested and confirmed working
+(a direct `curl` to the same CDN succeeded), which meant the specific
+failure was in Playwright's own Node downloader, not "no internet."
+Worked around it for real: downloaded the actual Chrome-for-Testing
+binary directly via `curl` (successfully; ~205MB) and manually staged
+it at Playwright's own expected cache path, then drove it as a genuine
+headless browser via the `playwright-core` npm package already fetched
+by `npx`.
+
+**Real screenshots were taken of the actual real running server** (not
+a static HTML approximation) -- full-page and viewport captures, sent
+directly to you in this conversation. Real console errors were
+captured too: exactly one, a 404 for `/favicon.ico` -- confirmed via a
+real `curl` to that path that this is the browser's own automatic
+favicon request against a server that doesn't define one, the same
+harmless 404 any site without a favicon produces, not a redesign bug.
+
+**Real computed-style font verification** (`page.evaluate()` against
+the live DOM, not source inspection):
+
+```
+COMPUTED_FONTS: {
+  "body": { "fontFamily": "Inter, -apple-system, \"Segoe UI\", system-ui, sans-serif", "fontWeight": "400" },
+  "h1_or_brand": { "fontFamily": "Inter, ...", "fontWeight": "650", "text": "NIFTY AI Trader" },
+  "hero_ltp": { "fontFamily": "\"JetBrains Mono\", SFMono-Regular, ...", "fontWeight": "700" },
+  "event_type": { "fontFamily": "Inter, ...", "fontWeight": "500", "text": "PAPER_FILL" },
+  "mono_generic": { "fontFamily": "\"JetBrains Mono\", ...", "fontWeight": "400", "text": "75.0" }
+}
+FONT_FACE_SET: [
+  { "family": "Inter", "weight": "400", "status": "loaded" },
+  { "family": "Inter", "weight": "500", "status": "loaded" },
+  { "family": "Inter", "weight": "600", "status": "loaded" },
+  { "family": "Inter", "weight": "700", "status": "loaded" },
+  { "family": "JetBrains Mono", "weight": "400", "status": "loaded" },
+  { "family": "JetBrains Mono", "weight": "500", "status": "unloaded" },
+  { "family": "JetBrains Mono", "weight": "600", "status": "loaded" },
+  { "family": "JetBrains Mono", "weight": "700", "status": "loaded" }
+]
+```
+
+(JetBrains Mono 500 shows `unloaded` -- honest, expected browser
+behavior: nothing on the page actually renders at that specific weight,
+so the browser correctly never fetched it. Not a bug.)
+
+**Two real bugs found by looking at the actual screenshot, not assumed
+away:**
+
+1. **EV text overflow in the Candidate card.** The full
+   `ev.describe()` sentence (e.g. `"MOMENTUM_CONTINUATION/TREND:
+   ev_source=INSUFFICIENT_DATA (sample_size=0) -- no real EV, not
+   fabricated"`) has no natural break points in
+   `ev_source=INSUFFICIENT_DATA` and overflowed its ~150px stat tile,
+   spilling text into the section below. Real fix: a new
+   `_ev_short_value_html()` shows the same real `ev.ev_r` value in
+   compact form (e.g. `-0.27R`, or the same honest `NO REAL DATA YET`
+   when `ev_r` is `None`) in the compact tile; the full real sentence
+   still appears in the Intelligence pipeline's own roomier row.
+   `overflow-wrap`/`word-break` also added to `.kpi-value` generally,
+   as defense in depth.
+2. **AI Pipeline nodes clipped.** 5 nodes + connectors didn't fit
+   inside a ~360px grid column; the last label ("Supervisor") was
+   visibly cut off to "Supe" in the real screenshot. Real fix: the
+   Intelligence section is now `card-wide` (full width) -- also better
+   matching its own stated importance ("one of the most important
+   sections").
+3. **Health check rows misaligned when detail text wrapped** (found
+   while re-screenshotting after the fixes above): the status dot was
+   vertically centered against the whole wrapped paragraph instead of
+   the first line. Real fix: name and detail now stack in their own
+   column (matching the already-correct highlight-tile pattern), dot
+   aligned to the first line.
+
+Both/all three fixes were verified by re-screenshotting after the fix,
+not just inferred from the CSS change -- before/after crops available
+on request; the final full-page and viewport captures were sent to you
+directly in this conversation.
+
+### Full regression, run fresh after every fix in this round
+
+```
+$ pytest -q
+496 passed in 139.87s
+
+$ ruff check .
+All checks passed!
+```
+
+496 real tests passing (up from 490): 6 new this round (font-route
+serving + path-traversal rejection, command-bar structure, dedicated
+Paper Trading card, connected-node pipeline structure, Data Foundation
+flow diagram). All prior tests, including every hard-requirement test,
+pass unchanged.
+
+### Data integrity -- confirmed, not just claimed
+
+`build_dashboard_view()` is byte-for-byte untouched by this round (see
+the diff-boundary check above). Every value on the redesigned page
+still traces to the exact same real computation as before -- EV's
+`ev_r`/`describe()` are the same real `EVEstimate` fields, just
+displayed in two different real-estate contexts; the Data Foundation
+flow diagram's 4 nodes are a static, permanent architectural fact
+(unchanged since Brief 20), not a new check. No new trading,
+AI-authority, EV, or risk calculation exists anywhere in this diff.

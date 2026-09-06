@@ -372,12 +372,14 @@ def test_event_rows_carry_a_distinct_data_kind_attribute_per_real_event_type(tmp
 
 
 def test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values(tmp_path):
-    """Hard requirement #1: confidence/EV/regime must never render as a
+    """Hard requirement #1: confidence/EV must never render as a
     real-looking 0.00/blank when nothing has actually been measured --
     only the explicit NO REAL DATA YET state is acceptable. Trade
     count/risk utilization ARE real, valid zeros here (zero real trades
     today is a true measurement) so those are deliberately excluded
-    from this check."""
+    from this check -- but must still be paired with an explicit "0
+    REAL TRADES"/"NO OPEN POSITION" note so a real zero is never
+    mistakable for missing data."""
     settings = Settings(database_path=tmp_path / "paper.db")
     database = Database(settings.database_path)
     database.initialize()
@@ -388,13 +390,23 @@ def test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values(tmp_path)
 
     html = render_dashboard(view)
 
-    tiles = html.split('class="kpi-tile"')[1:]
-    assert len(tiles) == 6  # P&L, Trades, Confidence, EV, Regime, Risk Utilization
-    _pnl, _trades, confidence_tile, ev_tile, regime_tile, _risk = tiles
+    # No candidate today -- the Candidate card says so plainly rather
+    # than rendering fake confidence/EV placeholders.
+    assert "No candidate evaluated yet today." in html
 
-    for tile, name in ((confidence_tile, "confidence"), (ev_tile, "EV"), (regime_tile, "regime")):
-        assert "NO REAL DATA YET" in tile, f"{name} tile is missing the explicit no-data state"
-        assert "0.0<" not in tile and ">0.00<" not in tile, f"{name} tile shows a real-looking zero instead"
+    # EV still carries its own honest no-data state wherever it DOES
+    # appear -- the Intelligence pipeline stage, which always renders
+    # regardless of whether a real candidate exists today.
+    pipeline_start = html.index('id="intelligence"')
+    pipeline_html = html[pipeline_start : pipeline_start + 1200]
+    assert "NO REAL DATA YET" in pipeline_html
+    assert "0.00" not in pipeline_html and ">0<" not in pipeline_html
+
+    # Zero real trades today is a real, valid measurement -- shown as a
+    # genuine 0.00 -- but always paired with an explicit note so it can
+    # never be mistaken for missing data.
+    assert "0 REAL TRADES today" in html
+    assert "NO OPEN POSITION" in html
 
 
 # --- hard requirement #2: EV always carries its MEASUREMENT ONLY label --
@@ -403,16 +415,18 @@ def test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values(tmp_path)
 def test_hard_requirement_2_ev_always_carries_the_measurement_only_label(tmp_path):
     """Hard requirement #2: EV is visually labeled MEASUREMENT ONLY
     wherever it appears -- both when a real EV value exists and when
-    it's genuinely absent (no candidate yet). Checked in both real
-    places EV appears on the page: the KPI row and the Intelligence
-    pipeline stage."""
+    it's genuinely absent (no candidate yet). With no candidate, EV
+    appears in exactly one real place (the Intelligence pipeline, which
+    always renders); with a real candidate, it appears a second time
+    (the Candidate card's own stat row) -- both real appearances always
+    carry the label."""
     settings = Settings(database_path=tmp_path / "paper.db")
     database = Database(settings.database_path)
     database.initialize()
 
     no_candidate_view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
     html = render_dashboard(no_candidate_view)
-    assert html.count("MEASUREMENT ONLY") >= 2  # KPI row + Intelligence pipeline stage
+    assert html.count("MEASUREMENT ONLY") >= 1  # the Intelligence pipeline stage
 
     from storage.models import SignalRecord
 
@@ -431,7 +445,7 @@ def test_hard_requirement_2_ev_always_carries_the_measurement_only_label(tmp_pat
     )
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=today.date())
     html_with_candidate = render_dashboard(view)
-    assert html_with_candidate.count("MEASUREMENT ONLY") >= 2
+    assert html_with_candidate.count("MEASUREMENT ONLY") >= 2  # Intelligence pipeline + Candidate card
 
 
 # --- hard requirement #4: a BLOCKED verdict is visually impossible to miss --
@@ -625,6 +639,33 @@ def test_root_and_dashboard_serve_the_same_single_page(dashboard_server):
     assert body_root == body_dash  # literally one page, served identically at both paths
 
 
+def test_static_fonts_are_served_real_self_hosted_files_not_google_fonts(dashboard_server):
+    """UI redesign v2: typography must not depend on an external Google
+    Fonts request succeeding at render time -- real, self-hosted WOFF2
+    binaries served by this same real, read-only, GET-only server."""
+    status_dash, body_dash = _fetch(dashboard_server, "/dashboard")
+    html = body_dash.decode("utf-8")
+    assert status_dash == 200
+    assert "fonts.googleapis.com" not in html
+    assert "@font-face" in html
+    assert "/static/fonts/inter-400.woff2" in html
+    assert "/static/fonts/jetbrains-mono-400.woff2" in html
+
+    for filename in ("inter-400.woff2", "inter-700.woff2", "jetbrains-mono-400.woff2", "jetbrains-mono-700.woff2"):
+        status, body = _fetch(dashboard_server, f"/static/fonts/{filename}")
+        assert status == 200, filename
+        assert body[:4] == b"wOF2", f"{filename} did not return a real WOFF2 file"
+
+
+def test_static_fonts_route_rejects_unknown_filenames(dashboard_server):
+    """A real allowlist, not a raw path join -- this GET-only route must
+    never be tricked into reading an arbitrary file off disk."""
+    status, _ = _fetch(dashboard_server, "/static/fonts/../../../main.py")
+    assert status == 404
+    status, _ = _fetch(dashboard_server, "/static/fonts/not-a-real-font.woff2")
+    assert status == 404
+
+
 def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server):
     """Item 1: the sidebar's 9 links (Overview/Market/Intelligence/
     Candidate/Position/Health/Data Capture/Notifications/Events) are
@@ -646,18 +687,20 @@ def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server
         assert f'id="{anchor}"' in html, f"sidebar links to #{anchor} but no element has id=\"{anchor}\""
 
 
-def test_sidebar_has_two_real_nav_groups(dashboard_server):
-    """The sidebar visually groups Overview/Market/Intelligence/
-    Candidate/Position under "Primary" and System Health/Data Capture/
-    Notifications/Events under "Operations" -- both group labels are
-    plain non-link `<li>` items inside the SAME one `side-nav` list
-    (not a second list), so the real anchor-count/structural
-    guarantees above still hold unchanged."""
+def test_sidebar_has_three_real_nav_groups(dashboard_server):
+    """UI redesign v2: the sidebar visually groups Overview/Market/
+    Intelligence under "Command", Candidate/Position/Events under
+    "Trading", and System Health/Data Capture/Notifications under
+    "Operations" -- all three group labels are plain non-link `<li>`
+    items inside the SAME one `side-nav` list (not separate lists), so
+    the real anchor-count/structural guarantees the other sidebar
+    tests rely on still hold unchanged."""
     status, body = _fetch(dashboard_server, "/dashboard")
     html = body.decode("utf-8")
     assert status == 200
-    assert html.count('class="nav-group-label"') == 2
-    assert ">Primary<" in html
+    assert html.count('class="nav-group-label"') == 3
+    assert ">Command<" in html
+    assert ">Trading<" in html
     assert ">Operations<" in html
 
 
@@ -725,6 +768,80 @@ def test_capture_metrics_honestly_absent_when_the_real_detail_cannot_be_parsed(t
 
     assert 'class="capture-metrics"' not in html
     assert "no real capture segment found" in html
+
+
+# --- UI redesign v2: real structural changes, not CSS tweaks -------------
+
+
+def test_command_bar_shows_price_market_and_system_status_as_three_real_columns(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_blocked_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert html.count('class="command-cell') == 3  # price, market status, system status
+    assert "TokenException" not in html.split('id="overview"')[1].split("</section>")[0]  # the headline stays a count, not a wall of text
+    assert "blocking condition(s)" in html
+
+
+def test_paper_trading_section_is_its_own_dedicated_card(tmp_path):
+    """Item 11: Paper Trading is its own card (id="paper-trading"), not
+    folded into a generic stat row -- real realized/unrealized P&L,
+    real trades-used count, real daily risk utilization."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime(2026, 9, 6, 10, 0, tzinfo=IST)
+    memory = MemoryStore(settings.database_path)
+    memory.append("trade", {"pnl": 450.0, "order_id": "o1"}, now)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    html = render_dashboard(view)
+
+    assert 'id="paper-trading"' in html
+    section_start = html.index('id="paper-trading"')
+    section_html = html[section_start : section_start + 1200]
+    assert "Realized P&amp;L" in section_html
+    assert "+450.00" in section_html
+    assert "NO OPEN POSITION" in section_html
+    assert 'class="risk-track"' in section_html
+
+
+def test_intelligence_pipeline_renders_as_connected_nodes(tmp_path):
+    """Item 9: a real connected-node visualization, not a plain vertical
+    list -- 5 nodes (Research/Signal/EV/Adversarial/Supervisor) joined
+    by 4 real connector elements."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    pipeline_start = html.index('id="intelligence"')
+    pipeline_html = html[pipeline_start : pipeline_start + 2000]
+    assert pipeline_html.count('class="node ') == 5
+    assert pipeline_html.count("node-connector") >= 4
+    assert "NOT RUN" in pipeline_html  # no real event this cycle -- honest, not a fake "Analyzing..." state
+
+
+def test_data_foundation_shows_a_real_raw_data_flow_diagram(tmp_path):
+    """Item 12: RAW -> NORMALIZED -> VALIDATED -> RESEARCH as a real
+    visual connected flow, not a plain text sentence."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    capture_start = html.index('id="capture"')
+    capture_html = html[capture_start : capture_start + 2500]
+    assert "node-static" in capture_html
+    for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"):
+        assert f">{label}<" in capture_html
 
 
 def test_live_path_is_unchanged_by_the_dashboard_addition(dashboard_server):

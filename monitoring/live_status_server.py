@@ -50,6 +50,19 @@ REFRESH_SECONDS = 7
 LIVE_PATH = "/live"
 DASHBOARD_PATHS = ("/", "/dashboard")
 CANDLES_API_PATH = "/api/candles"
+STATIC_FONTS_PREFIX = "/static/fonts/"
+
+# UI redesign v2: real, self-hosted WOFF2 font binaries (see
+# monitoring/static/fonts/README.md) -- the dashboard's typography must
+# not depend on an external Google Fonts request succeeding at render
+# time. Served by a real, read-only, GET-only route below; never a new
+# write path. Filename allowlist, not a free-form path join, so this
+# route can never be tricked into reading an arbitrary file off disk.
+STATIC_FONTS_DIR = Path(__file__).resolve().parent / "static" / "fonts"
+STATIC_FONT_FILES = {
+    "inter-400.woff2", "inter-500.woff2", "inter-600.woff2", "inter-700.woff2",
+    "jetbrains-mono-400.woff2", "jetbrains-mono-500.woff2", "jetbrains-mono-600.woff2", "jetbrains-mono-700.woff2",
+}
 
 # Final Brief: the dashboard's own real System Health Gate call makes a
 # real live Kite API request AND sends real Discord/Telegram probe
@@ -575,12 +588,20 @@ def _esc(value: Any) -> str:
 
 
 def _check_row(check: Any) -> str:
+    """A real bug found from an actual browser screenshot: with the dot
+    and name+detail all on one flex line, a real long detail string
+    wrapping onto several lines left the dot vertically centered
+    against the whole wrapped paragraph instead of aligned with the
+    name -- name and detail now stack in their own column so the dot
+    aligns with the first line, matching the health highlight tiles'
+    already-correct pattern."""
     if check is None:
-        return '<div class="check"><span class="dot dot-unknown"></span>not run</div>'
+        return '<div class="check"><span class="dot dot-unknown"></span><span class="check-body"><strong>not run</strong></span></div>'
     dot = "dot-ok" if check.status == "OK" else "dot-fail"
     return (
         f'<div class="check"><span class="dot {dot}"></span>'
-        f"<strong>{_esc(check.name)}</strong> &mdash; {_esc(check.detail)}</div>"
+        f'<span class="check-body"><strong>{_esc(check.name)}</strong>'
+        f'<span class="check-detail">{_esc(check.detail)}</span></span></div>'
     )
 
 
@@ -591,12 +612,30 @@ _EV_TAG_HTML = '<span class="ev-tag">MEASUREMENT ONLY</span>'
 def _ev_value_html(ev: Any) -> str:
     """Hard requirement #2: EV is visually labeled MEASUREMENT ONLY
     wherever it appears -- this single helper is the one place that
-    label is generated, so every caller (KPI row, pipeline stage) gets
-    it identically, never a spot where EV shows without it. Hard
+    label is generated, so every caller (Intelligence pipeline stage)
+    gets it identically, never a spot where EV shows without it. Hard
     requirement #1: no candidate yet means no real EV measurement
     exists -- rendered as the same explicit NO REAL DATA YET state
-    every other absent-value uses, never a numeric placeholder."""
+    every other absent-value uses, never a numeric placeholder. The
+    real, full `ev.describe()` sentence -- used here, in the roomier
+    pipeline row -- is genuinely too long for a compact stat tile (see
+    `_ev_short_value_html` for that context)."""
     return _esc(ev.describe()) if ev is not None else _NO_DATA_HTML
+
+
+def _ev_short_value_html(ev: Any) -> str:
+    """The same real EV, compacted for a narrow stat tile (Candidate
+    card) -- a real bug found from an actual browser screenshot: the
+    full `ev.describe()` sentence (e.g. "MOMENTUM_CONTINUATION/TREND:
+    ev_source=INSUFFICIENT_DATA (sample_size=0) -- no real EV, not
+    fabricated") overflowed a ~150px tile. `ev.ev_r` is the same real
+    number `describe()` itself reports, just without the surrounding
+    real prose -- never a different, recomputed value. None (tier 3,
+    INSUFFICIENT_DATA) still renders the same honest NO REAL DATA YET
+    state as `_ev_value_html`, never a fabricated number."""
+    if ev is None or ev.ev_r is None:
+        return _NO_DATA_HTML
+    return f"{ev.ev_r:+.2f}R"
 
 
 def _render_blocked_banner(gate: Any) -> str:
@@ -669,25 +708,19 @@ def _render_health_section(gate: Any) -> str:
 
 
 def _render_market_section(view: dict[str, Any]) -> str:
-    kite = view["kite_status"]
-    kite_dot = "dot-ok" if kite and kite.status == "OK" else "dot-fail"
-    ltp = view["nifty_ltp"]
-    ltp_html = (
-        f'<div class="big-number">{ltp["ltp"]:.2f}</div>' if ltp.get("ltp") is not None else '<div class="not-yet">no real LTP available -- ' + _esc(ltp["detail"]) + "</div>"
-    )
+    """Item 7: the chart is a major visual element on its own -- real
+    NIFTY LTP and the real Kite connection detail already appear in the
+    command bar / Health section above, so this section is no longer a
+    small redundant "status card" duplicating them (item 17: avoid
+    every section looking like an identical bordered rectangle); it is
+    just the real chart, given real screen real estate."""
     source_note = (
         f"real archived candles from {_esc(view['candles_source'])}"
         if view["candles_source"]
         else "no real archived candle file found"
     )
     return f"""
-<section class="card" id="market">
-<h2>Kite / Market Status</h2>
-<div class="check"><span class="dot {kite_dot}"></span>{_esc(kite.detail) if kite else "not run"}</div>
-<p class="label">NIFTY 50 LTP</p>
-{ltp_html}
-</section>
-<section class="card card-wide" id="market-chart">
+<section class="card card-wide chart-card" id="market">
 <h2>NIFTY Price</h2>
 <p class="label">{source_note} &mdash; real, already-archived minute bars, not a live intraday tick feed. Refreshed from disk on every poll.</p>
 <div id="chart-container" style="height:480px;"></div>
@@ -696,36 +729,62 @@ def _render_market_section(view: dict[str, Any]) -> str:
 
 
 def _render_intelligence_section(view: dict[str, Any]) -> str:
+    """Item 9: a genuine connected-node pipeline visualization -- 5 real
+    stages as nodes joined by connector lines, each independently real
+    (done/not-run), never a fake "Analyzing..."/"Thinking..." animation
+    implying activity no real event actually reports. The detail list
+    beneath keeps every real timestamp/conclusion this section already
+    had -- the node row is a new, additional at-a-glance summary, not a
+    replacement for the real detail."""
     pipeline = view["pipeline"]
     ev = view["ev_estimate"]
     stages = [
-        ("Research", pipeline.get("MARKET_RESEARCH_COMPLETE")),
-        ("Signal", pipeline.get("SIGNAL_CREATED")),
-        ("Adversarial (validation)", pipeline.get("TRADE_VALIDATED")),
-        ("Supervisor (risk)", pipeline.get("RISK_APPROVED") or pipeline.get("RISK_REJECTED")),
+        ("Research", "Research", pipeline.get("MARKET_RESEARCH_COMPLETE")),
+        ("Signal", "Signal", pipeline.get("SIGNAL_CREATED")),
+        ("Adversarial", "Adversarial (validation)", pipeline.get("TRADE_VALIDATED")),
+        ("Supervisor", "Supervisor (risk)", pipeline.get("RISK_APPROVED") or pipeline.get("RISK_REJECTED")),
     ]
-    rows = []
-    for label, event in stages:
+    ev_done = ev is not None
+
+    def _node(label: str, done: bool) -> str:
+        state_class = "node-done" if done else "node-pending"
+        return f'<div class="node {state_class}"><span class="node-dot"></span><span class="node-label">{label}</span></div>'
+
+    def _connector(left_done: bool) -> str:
+        return f'<div class="node-connector{" node-connector-done" if left_done else ""}"></div>'
+
+    node_flow = (
+        _node(stages[0][0], stages[0][2] is not None)
+        + _connector(stages[0][2] is not None)
+        + _node(stages[1][0], stages[1][2] is not None)
+        + _connector(stages[1][2] is not None)
+        + _node("EV", ev_done)
+        + _connector(ev_done)
+        + _node(stages[2][0], stages[2][2] is not None)
+        + _connector(stages[2][2] is not None)
+        + _node(stages[3][0], stages[3][2] is not None)
+    )
+
+    def _detail_row(label: str, event: Any) -> str:
         if event is None:
-            rows.append(f'<div class="stage"><span class="stage-label">{label}</span><span class="not-yet">not yet this cycle</span></div>')
-        else:
-            rows.append(
-                f'<div class="stage stage-done"><span class="stage-label">{label}</span>'
-                f'<span class="stage-value">{_esc(event["event_type"])} @ {_esc(event["timestamp"])}</span></div>'
-            )
-    ev_done = " stage-done" if ev is not None else ""
-    ev_html = (
-        f'<div class="stage{ev_done}"><span class="stage-label">EV {_EV_TAG_HTML}</span>'
+            return f'<div class="stage"><span class="stage-label">{label}</span><span class="not-yet">NOT RUN</span></div>'
+        return (
+            f'<div class="stage stage-done"><span class="stage-label">{label}</span>'
+            f'<span class="stage-value">{_esc(event["event_type"])} @ {_esc(event["timestamp"])}</span></div>'
+        )
+
+    detail_rows = [_detail_row(stages[0][1], stages[0][2]), _detail_row(stages[1][1], stages[1][2])]
+    ev_detail = (
+        f'<div class="stage{" stage-done" if ev_done else ""}"><span class="stage-label">EV {_EV_TAG_HTML}</span>'
         f'<span class="stage-value">{_ev_value_html(ev)}</span></div>'
     )
+    detail_rows += [ev_detail, _detail_row(stages[2][1], stages[2][2]), _detail_row(stages[3][1], stages[3][2])]
+
     return f"""
-<section class="card" id="intelligence">
-<h2>Research &rarr; Signal &rarr; EV &rarr; Adversarial &rarr; Supervisor</h2>
-<div class="pipeline">
-{''.join(rows[:2])}
-{ev_html}
-{''.join(rows[2:])}
-</div>
+<section class="card card-wide" id="intelligence">
+<h2>AI Pipeline</h2>
+<div class="node-flow">{node_flow}</div>
+<div class="pipeline">{''.join(detail_rows)}</div>
 </section>
 """
 
@@ -741,6 +800,7 @@ def _render_candidate_section(view: dict[str, Any]) -> str:
 """
     confidence = signal.get("confidence")
     confidence_html = f"{confidence:.1f}" if isinstance(confidence, (int, float)) else _NO_DATA_HTML
+    ev_html = _ev_short_value_html(view["ev_estimate"])
     # Item 5: the real 7-component score_attribution as horizontal
     # contribution bars instead of a plain table -- same real numbers
     # (technical/opening/volume/option/global/news are real 0-100
@@ -763,7 +823,12 @@ def _render_candidate_section(view: dict[str, Any]) -> str:
     return f"""
 <section class="card" id="candidate">
 <h2>Current Candidate &mdash; {_esc(signal.get('setup_type', 'unknown'))} ({_esc(signal.get('direction', '?'))})</h2>
-<p class="label">confidence {confidence_html} &middot; regime {_esc(signal.get('regime', 'unknown'))} &middot; {_esc(signal.get('timestamp', ''))}</p>
+<p class="label">regime {_esc(signal.get('regime', 'unknown'))} &middot; {_esc(signal.get('timestamp', ''))}</p>
+<div class="stat-row">
+<div class="stat"><p class="kpi-label">Confidence</p><p class="kpi-value">{confidence_html}</p></div>
+<div class="stat"><p class="kpi-label">EV {_EV_TAG_HTML}</p><p class="kpi-value">{ev_html}</p></div>
+</div>
+<p class="label">Score attribution</p>
 {''.join(bars)}
 </section>
 """
@@ -841,45 +906,42 @@ def _render_position_section(view: dict[str, Any]) -> str:
 """
 
 
-def _render_kpi_row(view: dict[str, Any]) -> str:
-    """Item 3: the KPI row -- today's real P&L, real trade count vs.
-    the real configured daily limit, real confidence, real EV (labeled
-    per hard requirement #2), real regime, real risk utilization. Every
-    tile that has no real value yet (confidence/regime/EV before any
-    candidate exists today) renders the explicit NO REAL DATA YET
-    state (hard requirement #1) instead of a numeric 0.00 that could be
-    mistaken for a real measurement. P&L/trade-count/risk-utilization
-    ARE real, valid measurements even when zero (zero real trades today
-    is a true fact, not an absence) so those render as real numbers."""
+def _render_paper_trading_section(view: dict[str, Any]) -> str:
+    """Item 11: a dedicated Paper Trading card -- real realized P&L,
+    real unrealized P&L (or the honest "NO OPEN POSITION" state, never
+    conflated with a real position that happens to show 0.00), real
+    trades-used-today count, real daily risk utilization against the
+    real configured cap. A real zero is only ever shown when the real
+    underlying system genuinely reports zero (zero real trades today is
+    a true, valid measurement, not an absence) -- paired with an
+    explicit "0 REAL TRADES" note so a real zero P&L is never
+    mistakable for "no data was measured"."""
     realized = view["realized_pnl_today"]
     unrealized = view["unrealized_pnl_today"]
-    total = realized + unrealized
-    total_class = "profit" if total >= 0 else "loss"
+    realized_class = "profit" if realized >= 0 else "loss"
     trades_used = view["trades_today_count"]
     trades_cap = view["max_trades_per_day"]
     loss_cap = view["max_daily_loss"]
     loss_utilization = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
-
-    signal = view["latest_signal"]
-    confidence = signal.get("confidence") if signal else None
-    confidence_html = f"{confidence:.1f}" if isinstance(confidence, (int, float)) else _NO_DATA_HTML
-    regime = signal.get("regime") if signal else None
-    regime_html = _esc(regime) if regime else _NO_DATA_HTML
-    ev_html = _ev_value_html(view["ev_estimate"])
-
-    tiles = [
-        ("Today&rsquo;s P&amp;L", f'<span class="{total_class}">{total:+.2f}</span>'),
-        ("Trades Today", f"{trades_used} / {trades_cap}"),
-        ("Confidence", confidence_html),
-        (f"EV {_EV_TAG_HTML}", ev_html),
-        ("Regime", regime_html),
-        ("Risk Utilization", f"{loss_utilization:.1f}% of Rs{loss_cap:.0f}"),
-    ]
-    tiles_html = "".join(
-        f'<div class="kpi-tile"><p class="kpi-label">{label}</p><p class="kpi-value">{value}</p></div>'
-        for label, value in tiles
-    )
-    return f'<div class="kpi-row">{tiles_html}</div>'
+    position = view["position"]
+    if position.get("open"):
+        unrealized_class = "profit" if unrealized >= 0 else "loss"
+        unrealized_html = f'<span class="{unrealized_class}">{unrealized:+.2f}</span>'
+    else:
+        unrealized_html = '<span class="no-data">NO OPEN POSITION</span>'
+    realized_sub = f"{trades_used} real trade(s) today" if trades_used else "0 REAL TRADES today"
+    return f"""
+<section class="card" id="paper-trading">
+<h2>Paper Trading</h2>
+<div class="stat-row">
+<div class="stat"><p class="kpi-label">Realized P&amp;L</p><p class="kpi-value {realized_class}">{realized:+.2f}</p><p class="command-sub">{realized_sub}</p></div>
+<div class="stat"><p class="kpi-label">Unrealized P&amp;L</p><p class="kpi-value">{unrealized_html}</p></div>
+</div>
+<div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap}</span></div>
+<div class="attr-row"><span>Daily risk utilization</span><span class="mono">{loss_utilization:.1f}% of Rs{loss_cap:.0f}</span></div>
+<div class="risk-track"><div class="risk-fill" style="width:{loss_utilization:.1f}%"></div></div>
+</section>
+"""
 
 
 # The real, already-computed detail string check_option_tick_capture
@@ -922,13 +984,17 @@ def _render_capture_section(view: dict[str, Any]) -> str:
     own explicit purpose."""
     capture = view["capture_status"]
     archive = _gate_check(view["gate"], "instrument_archive")
+    _static_node = '<div class="node node-static"><span class="node-dot"></span><span class="node-label">{}</span></div>'
+    _static_connector = '<div class="node-connector node-connector-static"></div>'
+    raw_flow = _static_connector.join(_static_node.format(label) for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"))
     return f"""
 <section class="card card-wide" id="capture">
-<h2>Data Capture &amp; Foundation</h2>
+<h2>Data Foundation</h2>
 {_check_row(capture)}
 {_render_capture_metrics(capture)}
 {_check_row(archive)}
-<div class="foundation-fact"><span class="dot dot-ok"></span>Raw Kite ticks are never modified in place &mdash; RAW &rarr; NORMALIZED &rarr; VALIDATED &rarr; RESEARCH layering, permanent since Brief 20.</div>
+<p class="label" style="margin-top: var(--sp-4);">Raw data integrity &mdash; a permanent architectural guarantee, not a live check: real Kite ticks are never modified in place.</p>
+<div class="node-flow node-flow-compact">{raw_flow}</div>
 <div class="foundation-fact"><span class="dot dot-unknown"></span>Historical option P&amp;L reconstruction: <span class="not-yet">NOT AVAILABLE YET</span></div>
 <div class="foundation-fact"><span class="dot dot-unknown"></span>Real trade calibration sample: <span class="not-yet">0 REAL TRADES</span></div>
 </section>
@@ -982,8 +1048,9 @@ def _render_events_section(view: dict[str, Any]) -> str:
 
 
 _SIDEBAR_GROUPS = (
-    ("Primary", (("overview", "Overview"), ("market", "Market"), ("intelligence", "Intelligence"), ("candidate", "Candidate"), ("position", "Position"))),
-    ("Operations", (("health", "System Health"), ("capture", "Data Capture"), ("notifications", "Notifications"), ("events", "Events"))),
+    ("Command", (("overview", "Overview"), ("market", "Market"), ("intelligence", "Intelligence"))),
+    ("Trading", (("candidate", "Candidate"), ("position", "Position"), ("events", "Events"))),
+    ("Operations", (("health", "System Health"), ("capture", "Data Capture"), ("notifications", "Notifications"))),
 )
 
 # Simple, single-color (currentColor) 16x16 stroke icons -- inline SVG,
@@ -1054,42 +1121,48 @@ def _render_sidebar(view: dict[str, Any], settings: Settings | None) -> str:
 
 
 def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime) -> str:
-    """Item 2: the hero market header -- real NIFTY LTP, real market
-    open/closed state, real Kite/AI/Capture/Health status inline.
-    Intraday change is honestly NOT shown: no real reference/previous
-    price is plumbed anywhere in this project's real data layer, and
-    computing one here would be new data this brief's own ground rules
-    forbid -- stated plainly rather than fabricated."""
+    """Item 6: a real 3-column top command bar -- NIFTY price, real
+    market open/closed state, real overall system verdict -- the three
+    Level-1 facts a person needs in the first five seconds, side by
+    side rather than stacked. Real Kite/AI/Capture detail lives one
+    section down in the System Health command panel (right after this
+    one) rather than duplicated here as small pips -- this bar states
+    the headline, that section explains it.
+
+    Intraday change is honestly NOT shown as a number: no real
+    reference/previous price is plumbed anywhere in this project's real
+    data layer, and computing one here would be new data this brief's
+    own ground rules forbid -- stated plainly rather than fabricated."""
     ltp = view["nifty_ltp"]
-    ltp_html = f'{ltp["ltp"]:.2f}' if ltp.get("ltp") is not None else _NO_DATA_HTML
+    ltp_available = ltp.get("ltp") is not None
+    ltp_html = f'{ltp["ltp"]:.2f}' if ltp_available else _NO_DATA_HTML
+    change_line = "Change: not tracked yet" if ltp_available else f'no real LTP available &mdash; {_esc(ltp["detail"])}'
     session_label = _market_session_label(settings, now)
-    kite = view["kite_status"]
-    ai = _gate_check(view["gate"], "ai_provider")
-    capture = view["capture_status"]
+    session_dot = "dot-ok dot-live" if session_label == "MARKET OPEN" else "dot-unknown"
     gate = view["gate"]
-
-    def _pip(check: Any, label: str) -> str:
-        dot = "dot-ok" if check and check.status == "OK" else "dot-fail"
-        return f'<span class="hero-pip"><span class="dot {dot}"></span>{label}</span>'
-
-    health_dot = "dot-ok" if gate.verdict == "READY" else "dot-fail"
-    pips = (
-        _pip(kite, "Kite")
-        + _pip(ai, "AI")
-        + _pip(capture, "Capture")
-        + f'<span class="hero-pip"><span class="dot {health_dot}"></span>Health: {_esc(gate.verdict)}</span>'
+    verdict_class = "verdict-ready" if gate.verdict == "READY" else "verdict-blocked"
+    system_sub = (
+        f"{len(gate.blocking_reasons)} blocking condition(s)"
+        if gate.verdict != "READY"
+        else f"{len(gate.checks)} real checks passing"
     )
     return f"""
-<div class="hero">
-<div class="hero-top">
-<div>
-<div class="hero-label-row"><span class="hero-eyebrow">NIFTY 50</span></div>
+<div class="command-bar">
+<div class="command-cell command-cell-price">
+<p class="hero-eyebrow">NIFTY 50</p>
 <div class="hero-ltp">{ltp_html}</div>
-<p class="hero-change">change: not tracked yet</p>
+<p class="hero-change">{change_line}</p>
 </div>
-<div class="hero-session"><span class="session-pill">{_esc(session_label)}</span></div>
+<div class="command-cell">
+<p class="hero-eyebrow">Market Status</p>
+<div class="command-status"><span class="dot {session_dot}"></span>{_esc(session_label)}</div>
+<p class="command-sub">Last update {now.strftime('%H:%M:%S')} IST</p>
 </div>
-<div class="hero-pips">{pips}</div>
+<div class="command-cell">
+<p class="hero-eyebrow">System</p>
+<div class="command-status"><span class="verdict {verdict_class}">{gate.verdict}</span></div>
+<p class="command-sub">{system_sub}</p>
+</div>
 </div>
 """
 
@@ -1134,17 +1207,17 @@ def render_dashboard(
     overview_html = f"""
 <section class="hero-section" id="overview">
 {_render_hero(view, settings, now)}
-{_render_kpi_row(view)}
 </section>
 """
-    # Structural ordering, not just styling: System Health renders
-    # immediately after Overview -- before Market/Intelligence/
-    # Candidate/Position -- so "is the system even OK" is the first
-    # real thing a person sees below the hero, matching its own
-    # sidebar description as a command panel. The sidebar's own nav
-    # grouping (Primary vs. Operations) is a separate, intentional
-    # organizational grouping and is unaffected by this real page-order
-    # choice -- anchors work identically regardless of DOM order.
+    # Real structural ordering, matching the requested Level-1/2/3/4
+    # information hierarchy: Level 1 (System Health, Market chart) comes
+    # first, right after the command bar; Level 2 (Intelligence,
+    # Candidate) next; Level 3 (Paper Trading, Data Foundation) after
+    # that; Level 4 (Notifications) and the live Event Timeline last.
+    # The sidebar's own nav grouping (Command/Trading/Operations) is a
+    # separate, intentional organizational grouping and is unaffected
+    # by this real page-order choice -- anchors work identically
+    # regardless of DOM order.
     grid_html = "".join(
         [
             _render_health_section(gate),
@@ -1152,6 +1225,7 @@ def render_dashboard(
             _render_intelligence_section(view),
             _render_candidate_section(view),
             _render_position_section(view),
+            _render_paper_trading_section(view),
             _render_capture_section(view),
             _render_notifications_section(view),
             _render_events_section(view),
@@ -1163,11 +1237,21 @@ def render_dashboard(
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="{refresh_seconds}">
 <title>NIFTY AI Trader &mdash; Command Center</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
+/* UI redesign v2: real, self-hosted fonts (see monitoring/static/
+   fonts/README.md) -- served by this same real, read-only, GET-only
+   local server, never fetched from Google Fonts. If a real request to
+   this same-origin file genuinely fails, the stack below (system-ui/
+   Consolas) is a deliberate, real fallback -- never a silent blank. */
+@font-face {{ font-family: "Inter"; font-weight: 400; src: url("{STATIC_FONTS_PREFIX}inter-400.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "Inter"; font-weight: 500; src: url("{STATIC_FONTS_PREFIX}inter-500.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "Inter"; font-weight: 600; src: url("{STATIC_FONTS_PREFIX}inter-600.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "Inter"; font-weight: 700; src: url("{STATIC_FONTS_PREFIX}inter-700.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "JetBrains Mono"; font-weight: 400; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-400.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "JetBrains Mono"; font-weight: 500; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-500.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "JetBrains Mono"; font-weight: 600; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-600.woff2") format("woff2"); font-display: swap; }}
+@font-face {{ font-family: "JetBrains Mono"; font-weight: 700; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-700.woff2") format("woff2"); font-display: swap; }}
 :root {{
   --bg: #0a0c11; --card: #12151d; --card-alt: #171b25; --border: #232838; --border-soft: #1b2029;
   --text: #e9ebf1; --text-dim: #b6bccb; --muted: #7c8598;
@@ -1236,27 +1320,25 @@ h2 {{
 .blocking-reasons {{ margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
 .blocking-reasons ul {{ margin: var(--sp-2) 0 0 0; padding-left: 1.2em; color: var(--fail); font-size: var(--fs-sm); }}
 .hero-section {{ margin-bottom: var(--sp-6); scroll-margin-top: var(--sp-5); }}
-.hero {{
-  background: linear-gradient(135deg, rgba(91,140,255,0.12), rgba(156,123,255,0.05) 45%, var(--card) 80%);
+.command-bar {{
+  display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 0;
+  background: linear-gradient(135deg, rgba(91,140,255,0.1), rgba(156,123,255,0.04) 45%, var(--card) 85%);
   border: 1px solid var(--border); border-radius: var(--radius);
-  padding: var(--sp-6) var(--sp-6); margin-bottom: var(--sp-4); position: relative; overflow: hidden;
+  margin-bottom: var(--sp-4); overflow: hidden;
 }}
-.hero-top {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--sp-5); }}
-.hero-label-row {{ display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-2) 0; }}
-.hero-eyebrow {{ color: var(--muted); font-size: var(--fs-sm); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }}
+.command-cell {{ padding: var(--sp-6); border-left: 1px solid var(--border-soft); }}
+.command-cell:first-child {{ border-left: none; }}
+.hero-eyebrow {{ color: var(--muted); font-size: var(--fs-sm); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 var(--sp-3) 0; }}
 .hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-hero); font-weight: 700; letter-spacing: -0.02em; line-height: 1; }}
-.hero-change {{ color: var(--muted); font-size: var(--fs-base); margin: var(--sp-2) 0 0 0; }}
-.session-pill {{ background: var(--card-alt); border: 1px solid var(--border-soft); padding: var(--sp-2) var(--sp-4); border-radius: 20px; font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.04em; }}
-.hero-pips {{ display: flex; flex-wrap: wrap; gap: var(--sp-5); margin-top: var(--sp-5); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); position: relative; }}
-.hero-pip {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-dim); font-weight: 500; }}
-.kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-4); }}
-.kpi-tile {{
-  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-4);
-  transition: border-color 0.12s ease;
-}}
-.kpi-tile:hover {{ border-color: var(--accent); }}
+.hero-change {{ color: var(--muted); font-size: var(--fs-base); margin: var(--sp-3) 0 0 0; }}
+.command-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xl); font-weight: 650; font-family: var(--font-mono); }}
+.command-sub {{ color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-2) 0 0 0; }}
+.stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--sp-4); margin: var(--sp-4) 0; }}
+.stat {{ background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: var(--sp-4); min-width: 0; }}
+.risk-track {{ background: var(--card-alt); border-radius: 20px; height: 6px; overflow: hidden; margin-top: var(--sp-2); }}
+.risk-fill {{ background: linear-gradient(90deg, var(--ok), var(--amber)); height: 100%; border-radius: 20px; transition: width 0.3s ease; }}
 .kpi-label {{ color: var(--muted); font-size: var(--fs-xs); margin: 0 0 var(--sp-2) 0; letter-spacing: 0.03em; text-transform: uppercase; }}
-.kpi-value {{ font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 650; margin: 0; font-variant-numeric: tabular-nums; }}
+.kpi-value {{ font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 650; margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: break-word; word-break: break-word; }}
 .no-data {{ color: var(--amber); font-style: italic; font-weight: 600; font-size: var(--fs-sm); letter-spacing: 0.01em; }}
 .ev-tag {{
   background: rgba(79,140,255,0.15); color: var(--accent); font-size: var(--fs-xs); font-weight: 700;
@@ -1269,8 +1351,11 @@ h2 {{
 .card {{
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: var(--sp-5); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
-  scroll-margin-top: var(--sp-5);
+  scroll-margin-top: var(--sp-5); transition: border-color 0.15s ease, transform 0.15s ease;
 }}
+.card:hover {{ border-color: var(--border-soft); transform: translateY(-1px); }}
+@keyframes live-pulse {{ 0%, 100% {{ box-shadow: 0 0 0 0 rgba(30,203,140,0.4); }} 50% {{ box-shadow: 0 0 0 5px rgba(30,203,140,0); }} }}
+.dot-live {{ animation: live-pulse 2s ease-in-out infinite; }}
 .card-wide {{ grid-column: 1 / -1; }}
 .mono {{ font-family: var(--font-mono); font-variant-numeric: tabular-nums; }}
 .label {{ color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-3) 0; letter-spacing: 0.01em; }}
@@ -1294,12 +1379,23 @@ h2 {{
 .health-tile-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-md); font-weight: 650; margin: 0; }}
 .health-tile-detail {{ color: var(--text-dim); font-size: var(--fs-xs); margin: var(--sp-2) 0 0 0; line-height: 1.4; }}
 .checks-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 var(--sp-4); }}
-.check {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }}
+.check {{ display: flex; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }}
 .check:last-child {{ border-bottom: none; padding-bottom: 0; }}
+.check .dot {{ margin-top: 5px; }}
+.check-body {{ display: flex; flex-direction: column; gap: 3px; min-width: 0; }}
+.check-detail {{ color: var(--muted); font-size: var(--fs-xs); }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
 .dot-ok {{ background: var(--ok); box-shadow: 0 0 0 3px rgba(30,203,140,0.15); }}
 .dot-fail {{ background: var(--fail); box-shadow: 0 0 0 3px rgba(240,69,79,0.15); }}
 .dot-unknown {{ background: var(--muted); }}
+.node-flow {{ display: flex; align-items: center; margin-bottom: var(--sp-5); overflow-x: auto; padding: var(--sp-2) 0; }}
+.node {{ display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); flex-shrink: 0; min-width: 64px; }}
+.node-dot {{ width: 14px; height: 14px; border-radius: 50%; background: var(--card-alt); border: 2px solid var(--border-soft); }}
+.node-done .node-dot {{ background: var(--purple); border-color: var(--purple); box-shadow: 0 0 0 4px rgba(156,123,255,0.15); }}
+.node-label {{ font-size: var(--fs-xs); color: var(--text-dim); font-weight: 600; letter-spacing: 0.02em; text-align: center; }}
+.node-done .node-label {{ color: var(--text); }}
+.node-connector {{ flex: 1; height: 2px; background: var(--border-soft); min-width: var(--sp-5); margin: 0 -2px 22px -2px; }}
+.node-connector-done {{ background: var(--purple); opacity: 0.5; }}
 .pipeline {{ position: relative; padding-left: var(--sp-5); }}
 .pipeline::before {{ content: ""; position: absolute; left: 3px; top: 6px; bottom: 6px; width: 1px; background: var(--border-soft); }}
 .stage {{ position: relative; display: flex; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
@@ -1337,6 +1433,11 @@ h2 {{
 .capture-metric {{ background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); }}
 .foundation-fact {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); color: var(--text-dim); border-bottom: 1px solid var(--border-soft); }}
 .foundation-fact:last-child {{ border-bottom: none; padding-bottom: 0; }}
+.node-flow-compact {{ margin-bottom: var(--sp-4); }}
+.node-flow-compact .node {{ min-width: 88px; }}
+.node-static .node-dot {{ background: var(--ok); border-color: var(--ok); box-shadow: 0 0 0 4px rgba(30,203,140,0.15); }}
+.node-static .node-label {{ color: var(--text); }}
+.node-connector-static {{ background: var(--ok); opacity: 0.4; }}
 .timeline {{ max-height: 420px; overflow-y: auto; margin-top: var(--sp-1); }}
 .event-row {{
   display: grid; grid-template-columns: auto 1fr auto auto; gap: var(--sp-3); align-items: center;
@@ -1366,10 +1467,12 @@ h2 {{
 }}
 @media (max-width: 900px) {{
   :root {{ --fs-hero: 3rem; }}
+  .command-bar {{ grid-template-columns: 1fr; }}
+  .command-cell {{ border-left: none; border-top: 1px solid var(--border-soft); }}
+  .command-cell:first-child {{ border-top: none; }}
 }}
 @media (max-width: 560px) {{
   .main {{ padding: var(--sp-4); }}
-  .hero-top {{ flex-direction: column; }}
   :root {{ --fs-2xl: 1.9rem; --fs-hero: 2.4rem; }}
 }}
 </style>
@@ -1480,9 +1583,30 @@ def _make_handler(database: Database, settings: Settings | None = None) -> type[
                     self._respond_json([])
                     return
                 self._respond_json(_cached_dashboard_view()["candles"])
+            elif self.path.startswith(STATIC_FONTS_PREFIX):
+                self._respond_static_font(self.path[len(STATIC_FONTS_PREFIX) :])
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        def _respond_static_font(self, filename: str) -> None:
+            # A real, deliberate allowlist -- never a raw path join --
+            # so this GET-only route can never be tricked into reading
+            # any other file on disk. Real, self-hosted WOFF2 binaries
+            # (see monitoring/static/fonts/README.md); a real, long
+            # cache lifetime is safe since each real filename is
+            # version-pinned by its own weight, never overwritten.
+            if filename not in STATIC_FONT_FILES:
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = (STATIC_FONTS_DIR / filename).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "font/woff2")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=2592000, immutable")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _respond_html(self, html: str) -> None:
             body = html.encode("utf-8")
