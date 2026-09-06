@@ -38,6 +38,7 @@ import socket
 import threading
 from collections.abc import Callable
 from datetime import date, datetime
+from datetime import timezone as _dt_timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,15 @@ REFRESH_SECONDS = 7
 LIVE_PATH = "/live"
 DASHBOARD_PATHS = ("/", "/dashboard")
 CANDLES_API_PATH = "/api/candles"
+LIVE_STATE_API_PATH = "/api/live-state"
+# Command Center v3: the client polls LIVE_STATE_API_PATH this often to
+# patch specific real values (LTP, P&L, verdict, latest events) without
+# a full page reload -- see build_live_state_payload's own docstring
+# for why this real, tested AJAX-poll fallback was chosen over
+# real SSE/WebSocket streaming. Faster than DASHBOARD_REFRESH_SECONDS
+# (below) since it reuses the same cached view -- a real, cheap client
+# poll, not a new expensive backend recomputation.
+LIVE_POLL_SECONDS = 10
 STATIC_FONTS_PREFIX = "/static/fonts/"
 
 # UI redesign v2: real, self-hosted WOFF2 font binaries (see
@@ -73,6 +83,12 @@ STATIC_FONT_FILES = {
 # reuse the last real computed view (still labeled with its own real
 # "as of" timestamp, never silently stale-and-unmarked).
 DASHBOARD_REFRESH_SECONDS = 30
+
+# A real value is considered stale on the client once the server's own
+# real `computed_at` is older than this -- dims the live-marked values
+# and shows an honest STALE badge rather than silently leaving an old
+# number looking current.
+STALE_AFTER_SECONDS = DASHBOARD_REFRESH_SECONDS * 2
 
 # Final Brief: real, already-archived candle data (Brief 4-15's own
 # real minute-bar CSVs). No live tick-to-candle pipeline exists yet in
@@ -565,6 +581,71 @@ def build_dashboard_view(
     }
 
 
+# --- Command Center v3: live partial updates (no full page reload) -----
+#
+# Section 3's own explicit sequencing note: real SSE/WebSocket streaming
+# is the highest-risk, most novel item in this brief -- a genuinely new
+# backend mechanism, not presentation. Deliberately NOT built. Chosen
+# fallback instead, exactly as the brief itself pre-authorized: a real,
+# lightweight AJAX poll against a new read-only JSON endpoint
+# (LIVE_STATE_API_PATH) that patches specific real DOM values in place
+# -- no full-page `<meta refresh>` reload for the values that change
+# most often (NIFTY LTP, P&L, verdict, latest events). The endpoint
+# reuses the SAME cached `_cached_dashboard_view()` the HTML route
+# already uses (see _make_handler) -- zero new backend calls, zero new
+# computation, just a smaller real JSON projection of the same real
+# view dict for a cheaper, faster client-side poll. `<meta refresh>`
+# stays as a slower, whole-page fallback (structural changes -- a new
+# section appearing, e.g. a position opening for the first time) at
+# `refresh_seconds`; the JS poll below runs faster, at LIVE_POLL_SECONDS.
+
+
+def _classify_event_kind(event_type: str) -> str:
+    """The one, shared real/no-trade/system classification -- used by
+    both the HTML event timeline (`_render_event_row`) and the JSON
+    live-state payload below, so the two can never silently diverge."""
+    if event_type in _FILL_EVENT_TYPES:
+        return "fill"
+    if event_type in _NO_TRADE_EVENT_TYPES:
+        return "no-trade"
+    return "system"
+
+
+def build_live_state_payload(view: dict[str, Any]) -> dict[str, Any]:
+    """A small, real, JSON-serializable projection of the same real
+    `view` dict the HTML route already renders -- no new data, no new
+    computation, just fewer/lighter fields for a fast, frequent client
+    poll. `events` carries `event_id` specifically so the client can
+    tell a genuinely NEW real event apart from one it has already
+    rendered (for the real slide-in animation), without guessing from
+    timestamps alone."""
+    gate = view["gate"]
+    position = view["position"]
+    nifty_ltp = view["nifty_ltp"]
+    realized = view["realized_pnl_today"]
+    unrealized = view["unrealized_pnl_today"]
+    return {
+        "computed_at": view["computed_at"],
+        "gate_verdict": gate.verdict,
+        "nifty_ltp": nifty_ltp.get("ltp"),
+        "realized_pnl_today": realized,
+        "unrealized_pnl_today": unrealized,
+        "total_pnl_today": realized + unrealized,
+        "position_open": bool(position.get("open")),
+        "trades_today_count": view["trades_today_count"],
+        "events": [
+            {
+                "event_id": e.get("event_id"),
+                "event_type": e.get("event_type"),
+                "timestamp": e.get("timestamp"),
+                "agent": e.get("agent"),
+                "kind": _classify_event_kind(e.get("event_type", "")),
+            }
+            for e in view["events"][:8]
+        ],
+    }
+
+
 # --- Final brief: the one-page dashboard's real HTML -----------------
 
 # NO_TRADE-shaped event types -- rendered with an honest amber "not a
@@ -926,15 +1007,15 @@ def _render_paper_trading_section(view: dict[str, Any]) -> str:
     position = view["position"]
     if position.get("open"):
         unrealized_class = "profit" if unrealized >= 0 else "loss"
-        unrealized_html = f'<span class="{unrealized_class}">{unrealized:+.2f}</span>'
+        unrealized_html = f'<span class="{unrealized_class}" data-live="unrealized-pnl">{unrealized:+.2f}</span>'
     else:
-        unrealized_html = '<span class="no-data">NO OPEN POSITION</span>'
+        unrealized_html = '<span class="no-data" data-live="unrealized-pnl">NO OPEN POSITION</span>'
     realized_sub = f"{trades_used} real trade(s) today" if trades_used else "0 REAL TRADES today"
     return f"""
 <section class="card" id="paper-trading">
 <h2>Paper Trading</h2>
 <div class="stat-row">
-<div class="stat"><p class="kpi-label">Realized P&amp;L</p><p class="kpi-value {realized_class}">{realized:+.2f}</p><p class="command-sub">{realized_sub}</p></div>
+<div class="stat"><p class="kpi-label">Realized P&amp;L</p><p class="kpi-value {realized_class}" data-live="realized-pnl">{realized:+.2f}</p><p class="command-sub">{realized_sub}</p></div>
 <div class="stat"><p class="kpi-label">Unrealized P&amp;L</p><p class="kpi-value">{unrealized_html}</p></div>
 </div>
 <div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap}</span></div>
@@ -1011,22 +1092,26 @@ def _render_notifications_section(view: dict[str, Any]) -> str:
 """
 
 
+_KIND_BADGE_HTML = {
+    "fill": '<span class="badge badge-fill">REAL FILL/EXIT</span>',
+    "no-trade": '<span class="badge badge-no-trade">NO TRADE</span>',
+    "system": '<span class="badge badge-system">SYSTEM</span>',
+}
+
+
 def _render_event_row(event: dict[str, Any]) -> str:
     event_type = event.get("event_type", "")
-    if event_type in _FILL_EVENT_TYPES:
-        badge, kind = '<span class="badge badge-fill">REAL FILL/EXIT</span>', "fill"
-    elif event_type in _NO_TRADE_EVENT_TYPES:
-        badge, kind = '<span class="badge badge-no-trade">NO TRADE</span>', "no-trade"
-    else:
-        badge, kind = '<span class="badge badge-system">SYSTEM</span>', "system"
+    kind = _classify_event_kind(event_type)
+    badge = _KIND_BADGE_HTML[kind]
     # `data-kind` (not an extra class) is a real, additional visual cue
     # (a left-border accent, see .event-row[data-kind] in the
     # stylesheet) -- deliberately not added to `class="event-row"`
     # itself, since existing tests match that exact literal attribute
     # string to split real event rows apart; a second class there would
     # silently break that real structural check.
+    event_id = event.get("event_id", "")
     return (
-        f'<div class="event-row" data-kind="{kind}">{badge}<span class="event-type">{_esc(event_type)}</span>'
+        f'<div class="event-row" data-kind="{kind}" data-event-id="{_esc(str(event_id))}">{badge}<span class="event-type">{_esc(event_type)}</span>'
         f'<span class="event-time mono">{_esc(event.get("timestamp", ""))}</span>'
         f'<span class="event-agent">{_esc(event.get("agent", ""))}</span></div>'
     )
@@ -1042,7 +1127,7 @@ def _render_events_section(view: dict[str, Any]) -> str:
 <section class="card card-wide" id="events">
 <h2>Recent Decisions &amp; Live Event Timeline</h2>
 <p class="label">Every real recorded event -- NO_TRADE/RISK_REJECTED entries are always labeled distinctly from real fills, never shown as completed trades.</p>
-<div class="timeline">{rows}</div>
+<div class="timeline" id="live-event-list" data-live="event-list">{rows}</div>
 </section>
 """
 
@@ -1150,7 +1235,7 @@ def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime)
 <div class="command-bar">
 <div class="command-cell command-cell-price">
 <p class="hero-eyebrow">NIFTY 50</p>
-<div class="hero-ltp">{ltp_html}</div>
+<div class="hero-ltp" data-live="nifty-ltp">{ltp_html}</div>
 <p class="hero-change">{change_line}</p>
 </div>
 <div class="command-cell">
@@ -1160,9 +1245,44 @@ def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime)
 </div>
 <div class="command-cell">
 <p class="hero-eyebrow">System</p>
-<div class="command-status"><span class="verdict {verdict_class}">{gate.verdict}</span></div>
+<div class="command-status"><span class="verdict {verdict_class}" data-live="gate-verdict">{gate.verdict}</span></div>
 <p class="command-sub">{system_sub}</p>
 </div>
+</div>
+"""
+
+
+def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetime) -> str:
+    """Item 5: a real, STICKY top command bar -- genuinely position:
+    sticky at the very top of the viewport (unlike the command-bar
+    cards above, which scroll away with the rest of Overview), showing
+    the handful of real facts worth never losing sight of while
+    scrolling: system verdict, market session, Kite/AI connectivity,
+    and a real IST/UTC clock. Deliberately does NOT duplicate the
+    fuller P&L/Position/Risk detail already show once each, in their
+    own dedicated cards further down -- showing the same real number
+    twice in two different places was exactly the kind of redundant
+    "admin panel" clutter the prior redesign round removed (the old
+    small Market Status card)."""
+    gate = view["gate"]
+    kite = view["kite_status"]
+    ai = _gate_check(gate, "ai_provider")
+    verdict_dot = "dot-ok" if gate.verdict == "READY" else "dot-fail"
+    kite_dot = "dot-ok" if kite and kite.status == "OK" else "dot-fail"
+    ai_dot = "dot-ok" if ai and ai.status == "OK" else "dot-fail"
+    session_label = _market_session_label(settings, now)
+    session_dot = "dot-ok dot-live" if session_label == "MARKET OPEN" else "dot-unknown"
+    utc_now = now.astimezone(_dt_timezone.utc)
+    return f"""
+<div class="topbar">
+<div class="topbar-brand"><span class="topbar-mark">N</span>NIFTY AI TRADER</div>
+<div class="topbar-item"><span class="dot {verdict_dot}"></span>SYSTEM <span data-live="gate-verdict-compact">{_esc(gate.verdict)}</span></div>
+<div class="topbar-item"><span class="dot {session_dot}"></span>{_esc(session_label)}</div>
+<div class="topbar-item"><span class="dot {kite_dot}"></span>KITE</div>
+<div class="topbar-item"><span class="dot {ai_dot}"></span>AI</div>
+<span id="stale-badge" class="badge badge-stale" hidden>STALE</span>
+<div class="topbar-spacer"></div>
+<div class="topbar-clock">IST {now.strftime('%I:%M:%S %p')} &middot; UTC {utc_now.strftime('%H:%M:%S')}</div>
 </div>
 """
 
@@ -1203,6 +1323,7 @@ def render_dashboard(
     # going forward, the same way the DEMO DATA banner already makes
     # demo mode unmistakable.
     build_marker = f"build {_esc(real_git_commit_hash())} &middot; generated {timestamp}"
+    kind_badges_json = json.dumps(_KIND_BADGE_HTML)
 
     overview_html = f"""
 <section class="hero-section" id="overview">
@@ -1258,7 +1379,7 @@ def render_dashboard(
   --ok: #1ecb8c; --fail: #f0454f; --amber: #f2a838; --accent: #5b8cff; --purple: #9c7bff;
   --font-ui: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --radius: 12px; --radius-sm: 8px; --sidebar-w: 252px;
+  --radius: 12px; --radius-sm: 8px; --sidebar-w: 252px; --topbar-h: 40px;
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
   --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.5rem; --fs-hero: 4.2rem;
 }}
@@ -1277,9 +1398,27 @@ h2 {{
   display: flex; align-items: baseline; gap: var(--sp-2); padding-bottom: var(--sp-3);
   border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em; scroll-margin-top: var(--sp-5);
 }}
-.shell {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; align-items: start; max-width: 100vw; }}
+.topbar {{
+  position: sticky; top: 0; z-index: 20; height: var(--topbar-h);
+  display: flex; align-items: center; gap: var(--sp-5);
+  background: var(--card); border-bottom: 1px solid var(--border);
+  padding: 0 var(--sp-4); font-size: var(--fs-xs); color: var(--text-dim);
+  font-family: var(--font-mono); white-space: nowrap; overflow-x: auto;
+}}
+.topbar-brand {{ display: flex; align-items: center; gap: var(--sp-2); font-family: var(--font-ui); font-weight: 700; color: var(--text); flex-shrink: 0; }}
+.topbar-mark {{
+  width: 18px; height: 18px; border-radius: 5px; background: var(--accent); color: #fff;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700;
+}}
+.topbar-item {{ display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }}
+.topbar-spacer {{ flex: 1; }}
+.topbar-clock {{ color: var(--muted); flex-shrink: 0; }}
+@media (max-width: 560px) {{
+  .topbar-brand span:last-child {{ display: none; }}
+}}
+.shell {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: calc(100vh - var(--topbar-h)); align-items: start; max-width: 100vw; }}
 .sidebar {{
-  position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  position: sticky; top: var(--topbar-h); height: calc(100vh - var(--topbar-h)); overflow-y: auto;
   background: var(--card); border-right: 1px solid var(--border);
   padding: var(--sp-5) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-5);
 }}
@@ -1453,6 +1592,14 @@ h2 {{
 .badge-fill {{ background: rgba(30,203,140,0.18); color: var(--ok); }}
 .badge-no-trade {{ background: rgba(242,168,56,0.18); color: var(--amber); }}
 .badge-system {{ background: rgba(124,133,152,0.18); color: var(--muted); }}
+.badge-stale {{ background: rgba(242,168,56,0.18); color: var(--amber); }}
+[data-live] {{ transition: opacity 0.2s ease; }}
+[data-live].is-stale {{ opacity: 0.6; }}
+[data-live].flash {{ animation: live-flash 0.4s ease; }}
+@keyframes live-flash {{ 0% {{ background: rgba(91,140,255,0.25); }} 100% {{ background: transparent; }} }}
+.event-row-live {{ animation: event-slide-in 0.18s ease-out; }}
+@keyframes event-slide-in {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+.reduced-motion * {{ animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }}
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
 .footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
@@ -1478,6 +1625,7 @@ h2 {{
 </style>
 </head>
 <body{body_class}>
+{_render_topbar(view, settings, now)}
 <div class="shell">
 {_render_sidebar(view, settings)}
 <main class="main">
@@ -1532,6 +1680,96 @@ h2 {{
   setInterval(poll, {refresh_seconds * 1000});
   window.addEventListener('resize', function() {{ chart.applyOptions({{ width: container.clientWidth }}); }});
 }})();
+
+(function() {{
+  // Command Center v3, Section 3 fallback: a real AJAX poll against
+  // {LIVE_STATE_API_PATH} (see build_live_state_payload's own docstring
+  // for why this was chosen over SSE/WebSocket) that patches only the
+  // specific [data-live] DOM values that actually changed, in place --
+  // never a full page reload for these fast-moving numbers. Never
+  // fabricates: a missing/None value is left exactly as the server
+  // rendered it (already an honest NO REAL DATA YET string).
+  var KIND_BADGES = {kind_badges_json};
+  var knownEventIds = {{}};
+  document.querySelectorAll('[data-event-id]').forEach(function(el) {{ knownEventIds[el.getAttribute('data-event-id')] = true; }});
+
+  function escapeHtml(s) {{
+    return String(s).replace(/[&<>"']/g, function(c) {{
+      return {{'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}}[c];
+    }});
+  }}
+
+  function flash(el) {{
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+  }}
+
+  function patchText(el, text, colorClass) {{
+    if (el.textContent === text) return;
+    el.textContent = text;
+    if (colorClass) {{
+      el.classList.remove('profit', 'loss', 'no-data');
+      el.classList.add(colorClass);
+    }}
+    flash(el);
+  }}
+
+  function applyStale(stale) {{
+    document.querySelectorAll('[data-live]').forEach(function(el) {{ el.classList.toggle('is-stale', stale); }});
+    var badge = document.getElementById('stale-badge');
+    if (badge) badge.hidden = !stale;
+  }}
+
+  function prependEvents(events) {{
+    var list = document.getElementById('live-event-list');
+    if (!list || !events.length) return;
+    var fresh = events.filter(function(e) {{ return e.event_id !== null && e.event_id !== undefined && !knownEventIds[e.event_id]; }});
+    if (!fresh.length) return;
+    var placeholder = list.querySelector('p.not-yet');
+    if (placeholder) placeholder.remove();
+    fresh.slice().reverse().forEach(function(e) {{
+      knownEventIds[e.event_id] = true;
+      var row = document.createElement('div');
+      row.className = 'event-row event-row-live';
+      row.setAttribute('data-kind', e.kind);
+      row.setAttribute('data-event-id', String(e.event_id));
+      row.innerHTML = (KIND_BADGES[e.kind] || KIND_BADGES.system)
+        + '<span class="event-type">' + escapeHtml(e.event_type || '') + '</span>'
+        + '<span class="event-time mono">' + escapeHtml(e.timestamp || '') + '</span>'
+        + '<span class="event-agent">' + escapeHtml(e.agent || '') + '</span>';
+      list.insertBefore(row, list.firstChild);
+    }});
+  }}
+
+  function poll() {{
+    fetch('{LIVE_STATE_API_PATH}').then(function(r) {{ return r.json(); }}).then(function(state) {{
+      if (!state || !state.computed_at) return;
+      var ageSeconds = (Date.now() - new Date(state.computed_at).getTime()) / 1000;
+      applyStale(ageSeconds > {STALE_AFTER_SECONDS});
+
+      if (state.nifty_ltp !== null && state.nifty_ltp !== undefined) {{
+        document.querySelectorAll('[data-live="nifty-ltp"]').forEach(function(el) {{ patchText(el, state.nifty_ltp.toFixed(2), null); }});
+      }}
+      document.querySelectorAll('[data-live="gate-verdict"], [data-live="gate-verdict-compact"]').forEach(function(el) {{
+        patchText(el, state.gate_verdict, null);
+      }});
+      document.querySelectorAll('[data-live="realized-pnl"]').forEach(function(el) {{
+        patchText(el, (state.realized_pnl_today >= 0 ? '+' : '') + state.realized_pnl_today.toFixed(2), state.realized_pnl_today >= 0 ? 'profit' : 'loss');
+      }});
+      document.querySelectorAll('[data-live="unrealized-pnl"]').forEach(function(el) {{
+        if (!state.position_open) {{ patchText(el, 'NO OPEN POSITION', 'no-data'); return; }}
+        patchText(el, (state.unrealized_pnl_today >= 0 ? '+' : '') + state.unrealized_pnl_today.toFixed(2), state.unrealized_pnl_today >= 0 ? 'profit' : 'loss');
+      }});
+      prependEvents(state.events || []);
+    }}).catch(function() {{}});
+  }}
+
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {{
+    document.documentElement.classList.add('reduced-motion');
+  }}
+  setInterval(poll, {LIVE_POLL_SECONDS * 1000});
+}})();
 </script>
 </body>
 </html>"""
@@ -1583,6 +1821,11 @@ def _make_handler(database: Database, settings: Settings | None = None) -> type[
                     self._respond_json([])
                     return
                 self._respond_json(_cached_dashboard_view()["candles"])
+            elif self.path == LIVE_STATE_API_PATH:
+                if settings is None:
+                    self._respond_json({})
+                    return
+                self._respond_json(build_live_state_payload(_cached_dashboard_view()))
             elif self.path.startswith(STATIC_FONTS_PREFIX):
                 self._respond_static_font(self.path[len(STATIC_FONTS_PREFIX) :])
             else:

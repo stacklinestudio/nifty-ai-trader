@@ -25,7 +25,9 @@ from config import IST, Settings
 from events.contracts import Event, EventType
 from learning.memory import MemoryStore
 from monitoring.live_status_server import (
+    LIVE_STATE_API_PATH,
     build_dashboard_view,
+    build_live_state_payload,
     build_live_status_server,
     kite_chart_url,
     render_dashboard,
@@ -303,13 +305,22 @@ def test_timeline_labels_no_trade_and_fill_events_distinctly(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
     html = render_dashboard(view)
 
-    assert html.count("NO TRADE") == 1
-    assert html.count("REAL FILL/EXIT") == 1
+    # Each badge text appears twice: once in the real static event row
+    # (asserted precisely below) and once more inside the embedded
+    # KIND_BADGES JS template -- the same real badge markup, reused
+    # verbatim so a live-prepended future event (see the /api/live-state
+    # poll) can never render a different badge than the server did.
+    assert html.count("NO TRADE") == 2
+    assert html.count("REAL FILL/EXIT") == 2
     # Each real event's own row must carry its own correct badge -- never
     # the other event's badge, and never both badges on one row (events
     # are DESC by timestamp, so PAPER_FILL's row renders before
     # RISK_REJECTED's).
-    rows = html.split('class="event-row"')[1:]
+    # Extract each real row as its own bounded fragment (non-greedy, up
+    # to that row's own closing </div>) -- a plain split on the last row
+    # would otherwise run to the end of the whole document, swallowing
+    # the unrelated KIND_BADGES JS template further down the page.
+    rows = re.findall(r'<div class="event-row".*?</div>', html)
     assert len(rows) == 2
     fill_row, rejected_row = rows
     assert "PAPER_FILL" in fill_row and "REAL FILL/EXIT" in fill_row and "NO TRADE" not in fill_row
@@ -871,3 +882,116 @@ def test_dashboard_post_is_rejected(dashboard_server):
     with pytest.raises(urllib.error.HTTPError) as exc_info:
         urllib.request.urlopen(request, timeout=5)
     assert exc_info.value.code == 501
+
+
+# --- Command Center v3, Section 3: /api/live-state real polling endpoint -
+
+
+def test_live_state_api_returns_real_json_with_expected_keys(dashboard_server):
+    status, body = _fetch(dashboard_server, LIVE_STATE_API_PATH)
+
+    assert status == 200
+    data = json.loads(body)
+    for key in (
+        "computed_at",
+        "gate_verdict",
+        "nifty_ltp",
+        "realized_pnl_today",
+        "unrealized_pnl_today",
+        "total_pnl_today",
+        "position_open",
+        "trades_today_count",
+        "events",
+    ):
+        assert key in data, key
+    assert isinstance(data["events"], list)
+
+
+def test_live_state_api_is_read_only(dashboard_server):
+    port = dashboard_server.server_address[1]
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{LIVE_STATE_API_PATH}", data=b"{}", method="POST")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(request, timeout=5)
+    assert exc_info.value.code == 501
+
+
+def test_live_state_payload_reflects_a_real_injected_event_with_correct_kind(tmp_path):
+    """A real RISK_REJECTED event must appear in the live-state payload
+    (not just the HTML timeline) carrying `kind: "no-trade"`, using the
+    exact same shared classifier the HTML row uses (`_classify_event_kind`)
+    -- so the AJAX-polled live view can never silently drift from what
+    the full-page render already shows."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime.now(IST)
+    event = Event(EventType.RISK_REJECTED, "risk_manager", now, output_summary={"reason": "daily loss cap"})
+    database.save_event(event)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    payload = build_live_state_payload(view)
+
+    assert payload["events"], "real injected event missing from the live-state payload"
+    latest = payload["events"][0]
+    assert latest["event_type"] == "RISK_REJECTED"
+    assert latest["kind"] == "no-trade"
+    assert latest["event_id"] is not None
+
+
+def test_live_state_payload_never_recomputes_numbers_that_diverge_from_the_html_view(tmp_path):
+    """The JSON payload is documented as a pure projection of the same
+    `view` dict the HTML route renders -- this pins that down as a real
+    behavioral guarantee, not just a docstring claim: identical real
+    P&L/verdict numbers in both."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    payload = build_live_state_payload(view)
+
+    assert payload["gate_verdict"] == view["gate"].verdict
+    assert payload["realized_pnl_today"] == view["realized_pnl_today"]
+    assert payload["unrealized_pnl_today"] == view["unrealized_pnl_today"]
+    assert payload["total_pnl_today"] == view["realized_pnl_today"] + view["unrealized_pnl_today"]
+    assert payload["position_open"] == bool(view["position"].get("open"))
+
+
+def test_rendered_dashboard_carries_real_data_live_hooks_for_the_poll_to_target(tmp_path):
+    """The client-side poll (see the inline <script> in render_dashboard)
+    patches `[data-live="..."]` elements by name -- this pins down that
+    the specific names it looks for are actually present in the real
+    rendered markup, so a future rename on either side fails loudly."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    for marker in ("nifty-ltp", "gate-verdict", "gate-verdict-compact", "realized-pnl", "unrealized-pnl"):
+        assert f'data-live="{marker}"' in html, marker
+    assert 'id="live-event-list"' in html
+    assert 'id="stale-badge"' in html
+
+
+def test_topbar_is_genuinely_sticky_and_shows_real_kite_and_ai_status(tmp_path):
+    """Item 5: a real sticky top command bar -- `position: sticky` (not
+    just visually pinned by page layout), showing the same real, already-
+    computed Kite/AI gate checks the sidebar footer shows (never a second,
+    separately-recomputed status)."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_blocked_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    topbar_start = html.index('<div class="topbar">')
+    topbar_end = html.index("</div>", html.index("topbar-clock", topbar_start))
+    topbar_html = html[topbar_start:topbar_end]
+
+    assert ".topbar {" in html and "position: sticky" in html[html.index(".topbar {"):html.index(".topbar {") + 200]
+    assert "KITE" in topbar_html
+    assert "AI" in topbar_html
+    assert "BLOCKED" in topbar_html  # real injected blocked verdict, not hardcoded READY
