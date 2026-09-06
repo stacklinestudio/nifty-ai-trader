@@ -341,6 +341,33 @@ def test_hard_requirement_3_no_trade_and_fill_badges_have_genuinely_different_vi
     assert "var(--amber)" in no_trade_rule  # NO_TRADE: the same amber used for warnings, never green
 
 
+def test_event_rows_carry_a_distinct_data_kind_attribute_per_real_event_type(tmp_path):
+    """UI/UX redesign: each real event row also gets a `data-kind`
+    attribute (a real left-border accent hook, not just the badge) --
+    added without touching the existing `class="event-row"` attribute
+    itself, since the pre-existing regression tests split on that exact
+    literal string to isolate real rows."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime.now(IST)
+    database.save_event(Event(EventType.SIGNAL_CREATED, "signal_engine", now, output_summary={}))
+    database.save_event(Event(EventType.RISK_REJECTED, "risk_manager", now + timedelta(seconds=1), output_summary={}))
+    database.save_event(
+        Event(EventType.PAPER_FILL, "paper_broker", now + timedelta(seconds=2), output_summary={"order_id": "o1"})
+    )
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    html = render_dashboard(view)
+
+    rows = html.split('class="event-row"')[1:]
+    assert len(rows) == 3
+    fill_row, rejected_row, signal_row = rows  # DESC by timestamp
+    assert 'data-kind="fill"' in fill_row
+    assert 'data-kind="no-trade"' in rejected_row
+    assert 'data-kind="no-trade"' in signal_row
+
+
 # --- hard requirement #1: no real-looking zero for unmeasured values ----
 
 
@@ -545,6 +572,87 @@ def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server
     assert len(anchors) == 9  # Overview, Market, Intelligence, Candidate, Position, Health, Data Capture, Notifications, Events
     for anchor in anchors:
         assert f'id="{anchor}"' in html, f"sidebar links to #{anchor} but no element has id=\"{anchor}\""
+
+
+def test_sidebar_has_two_real_nav_groups(dashboard_server):
+    """The sidebar visually groups Overview/Market/Intelligence/
+    Candidate/Position under "Primary" and System Health/Data Capture/
+    Notifications/Events under "Operations" -- both group labels are
+    plain non-link `<li>` items inside the SAME one `side-nav` list
+    (not a second list), so the real anchor-count/structural
+    guarantees above still hold unchanged."""
+    status, body = _fetch(dashboard_server, "/dashboard")
+    html = body.decode("utf-8")
+    assert status == 200
+    assert html.count('class="nav-group-label"') == 2
+    assert ">Primary<" in html
+    assert ">Operations<" in html
+
+
+def test_health_highlights_show_kite_ai_and_tick_capture_with_real_detail(tmp_path):
+    """UI/UX redesign: the 3 checks a person needs to see first (Kite,
+    AI provider, option tick capture) get a headline highlight grid --
+    same real GateCheck objects, never recomputed, real detail text
+    included."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_blocked_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert 'class="health-highlights"' in html
+    highlights_start = html.index('class="health-highlights"')
+    highlights_html = html[highlights_start : highlights_start + 1500]
+    assert "Kite" in highlights_html
+    assert "AI Provider" in highlights_html
+    assert "Tick Capture" in highlights_html
+    assert "TokenException" in highlights_html  # the real kite_connection detail, not a generic label
+
+
+def test_capture_metrics_parses_real_segments_ticks_gaps_when_available(tmp_path):
+    """The real, already-computed option_tick_capture detail string is
+    parsed purely for display into 3 labeled tiles -- same real
+    numbers, never recomputed."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    gate = _ready_gate()
+    checks = list(gate.checks)
+    checks[2] = GateCheck(
+        "option_tick_capture", OK, "2 real segment(s), 1543 real ticks, 1 real gap(s) for 2026-09-06"
+    )
+    gate = GateReport("READY", tuple(checks))
+
+    view = build_dashboard_view(settings, database, gate=gate, today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert 'class="capture-metrics"' in html
+    metrics_start = html.index('class="capture-metrics"')
+    metrics_html = html[metrics_start : metrics_start + 700]
+    assert "Segments" in metrics_html and ">2<" in metrics_html
+    assert "Ticks" in metrics_html and ">1543<" in metrics_html
+    assert "Gaps" in metrics_html and ">1<" in metrics_html
+
+
+def test_capture_metrics_honestly_absent_when_the_real_detail_cannot_be_parsed(tmp_path):
+    """No real capture segment today -- the structured metric tiles
+    must not appear at all (never a fabricated 0/0/0 that could look
+    like a real, parsed measurement); the real honest FAIL detail text
+    is still shown via the normal check row."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    gate = _ready_gate()
+    checks = list(gate.checks)
+    checks[2] = GateCheck("option_tick_capture", "FAIL", "no real capture segment found for 2026-09-06")
+    gate = GateReport("BLOCKED", tuple(checks))
+
+    view = build_dashboard_view(settings, database, gate=gate, today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert 'class="capture-metrics"' not in html
+    assert "no real capture segment found" in html
 
 
 def test_live_path_is_unchanged_by_the_dashboard_addition(dashboard_server):

@@ -33,6 +33,7 @@ authentication would be required before ever doing that on purpose.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 from collections.abc import Callable
@@ -584,14 +585,40 @@ def _render_blocked_banner(gate: Any) -> str:
 """
 
 
+def _render_highlight_tile(check: Any, label: str) -> str:
+    """One of the 3 headline health tiles (Kite / AI Provider / Tick
+    Capture) -- same real `GateCheck` `_check_row` already renders
+    elsewhere, just given more visual weight since these three are the
+    ones a person needs to see first."""
+    if check is None:
+        return f'<div class="health-tile"><p class="health-tile-label">{_esc(label)}</p><p class="health-tile-status"><span class="dot dot-unknown"></span>NOT RUN</p></div>'
+    dot = "dot-ok" if check.status == "OK" else "dot-fail"
+    return (
+        f'<div class="health-tile"><p class="health-tile-label">{_esc(label)}</p>'
+        f'<p class="health-tile-status"><span class="dot {dot}"></span>{_esc(check.status)}</p>'
+        f'<p class="health-tile-detail">{_esc(check.detail)}</p></div>'
+    )
+
+
 def _render_health_section(gate: Any) -> str:
-    """Item 7: system health as a real status panel -- the real overall
-    verdict prominent (reinforced page-wide by `_render_blocked_banner`
-    above, not only here), each of the 7 real checks with equal visual
-    weight, and the real specific blocking reasons listed plainly
-    underneath when blocked (hard requirement #4's second half)."""
+    """Item 7: system health as a real status panel -- the same real 7
+    checks `run_system_health_gate` already computes, never
+    recomputed. The 3 a person most needs to see first (Kite, AI
+    provider, option tick capture) get a headline highlight grid; the
+    remaining 4 real checks (instrument archive, data completeness,
+    notifications, risk/broker construction) list below with equal
+    visual weight to each other. The real overall verdict is prominent
+    here (reinforced page-wide by `_render_blocked_banner` above), and
+    the real specific blocking reasons are listed plainly underneath
+    when blocked (hard requirement #4's second half)."""
     verdict_class = "verdict-ready" if gate.verdict == "READY" else "verdict-blocked"
-    checks_html = "".join(_check_row(c) for c in gate.checks)
+    highlight_names = ("kite_connection", "ai_provider", "option_tick_capture")
+    highlight_labels = {"kite_connection": "Kite", "ai_provider": "AI Provider", "option_tick_capture": "Tick Capture"}
+    highlights_html = "".join(
+        _render_highlight_tile(_gate_check(gate, name), highlight_labels[name]) for name in highlight_names
+    )
+    remaining_checks = [c for c in gate.checks if c.name not in highlight_names]
+    checks_html = "".join(_check_row(c) for c in remaining_checks)
     blocking_html = ""
     if gate.verdict != "READY":
         reasons = "".join(f"<li>{_esc(reason)}</li>" for reason in gate.blocking_reasons)
@@ -599,6 +626,7 @@ def _render_health_section(gate: Any) -> str:
     return f"""
 <section class="card card-wide" id="health">
 <h2>System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
+<div class="health-highlights">{highlights_html}</div>
 <div class="checks-grid">{checks_html}</div>
 {blocking_html}
 </section>
@@ -647,19 +675,22 @@ def _render_intelligence_section(view: dict[str, Any]) -> str:
             rows.append(f'<div class="stage"><span class="stage-label">{label}</span><span class="not-yet">not yet this cycle</span></div>')
         else:
             rows.append(
-                f'<div class="stage"><span class="stage-label">{label}</span>'
+                f'<div class="stage stage-done"><span class="stage-label">{label}</span>'
                 f'<span class="stage-value">{_esc(event["event_type"])} @ {_esc(event["timestamp"])}</span></div>'
             )
+    ev_done = " stage-done" if ev is not None else ""
     ev_html = (
-        f'<div class="stage"><span class="stage-label">EV {_EV_TAG_HTML}</span>'
+        f'<div class="stage{ev_done}"><span class="stage-label">EV {_EV_TAG_HTML}</span>'
         f'<span class="stage-value">{_ev_value_html(ev)}</span></div>'
     )
     return f"""
 <section class="card" id="intelligence">
 <h2>Research &rarr; Signal &rarr; EV &rarr; Adversarial &rarr; Supervisor</h2>
+<div class="pipeline">
 {''.join(rows[:2])}
 {ev_html}
 {''.join(rows[2:])}
+</div>
 </section>
 """
 
@@ -816,21 +847,51 @@ def _render_kpi_row(view: dict[str, Any]) -> str:
     return f'<div class="kpi-row">{tiles_html}</div>'
 
 
+# The real, already-computed detail string check_option_tick_capture
+# formats (see monitoring/system_health_gate.py): "{N} real segment(s),
+# {N} real ticks, {N} real gap(s) for {date}". Parsed here purely for
+# DISPLAY -- pulling the same three real numbers already inside that
+# one real string out into their own labeled tiles, never computing
+# anything new. Deliberately labeled "Segments" (this check's own real
+# vocabulary -- one real capture-session file, not a per-contract
+# count) rather than "Contracts": renaming it to something the real
+# check doesn't actually measure would be exactly the kind of
+# real-looking-but-wrong number this project's own honesty rules exist
+# to prevent.
+_CAPTURE_DETAIL_PATTERN = re.compile(r"(\d+) real segment\(s\), (\d+) real ticks, (\d+) real gap\(s\)")
+
+
+def _render_capture_metrics(capture: Any) -> str:
+    match = _CAPTURE_DETAIL_PATTERN.search(capture.detail) if capture and capture.status == "OK" else None
+    if not match:
+        return ""
+    segments, ticks, gaps = match.groups()
+    tiles = (("Segments", segments), ("Ticks", ticks), ("Gaps", gaps))
+    return '<div class="capture-metrics">' + "".join(
+        f'<div class="capture-metric"><p class="kpi-label">{label}</p><p class="kpi-value mono">{value}</p></div>'
+        for label, value in tiles
+    ) + "</div>"
+
+
 def _render_capture_section(view: dict[str, Any]) -> str:
-    """Item 9: Data Foundation -- real option tick capture status, real
-    instrument archive validity (both real gate checks, never
-    recomputed), plus two static, honest, permanent facts about this
-    project's own real current limitations: raw-tick immutability (a
-    real architectural guarantee, permanent since Brief 20) and the
-    real absence of historical option P&L reconstruction / trade
-    calibration data -- stated plainly, not hidden behind a polished
-    UI, per this card's own explicit purpose."""
+    """Item 9: Data Foundation -- real option tick capture status
+    (broken into its own real segment/tick/gap counts, parsed from the
+    real, already-computed check detail string -- see
+    `_CAPTURE_DETAIL_PATTERN`'s own docstring), real instrument archive
+    validity (both real gate checks, never recomputed), plus two
+    static, honest, permanent facts about this project's own real
+    current limitations: raw-tick immutability (a real architectural
+    guarantee, permanent since Brief 20) and the real absence of
+    historical option P&L reconstruction / trade calibration data --
+    stated plainly, not hidden behind a polished UI, per this card's
+    own explicit purpose."""
     capture = view["capture_status"]
     archive = _gate_check(view["gate"], "instrument_archive")
     return f"""
 <section class="card card-wide" id="capture">
 <h2>Data Capture &amp; Foundation</h2>
 {_check_row(capture)}
+{_render_capture_metrics(capture)}
 {_check_row(archive)}
 <div class="foundation-fact"><span class="dot dot-ok"></span>Raw Kite ticks are never modified in place &mdash; RAW &rarr; NORMALIZED &rarr; VALIDATED &rarr; RESEARCH layering, permanent since Brief 20.</div>
 <div class="foundation-fact"><span class="dot dot-unknown"></span>Historical option P&amp;L reconstruction: <span class="not-yet">NOT AVAILABLE YET</span></div>
@@ -852,13 +913,19 @@ def _render_notifications_section(view: dict[str, Any]) -> str:
 def _render_event_row(event: dict[str, Any]) -> str:
     event_type = event.get("event_type", "")
     if event_type in _FILL_EVENT_TYPES:
-        badge = '<span class="badge badge-fill">REAL FILL/EXIT</span>'
+        badge, kind = '<span class="badge badge-fill">REAL FILL/EXIT</span>', "fill"
     elif event_type in _NO_TRADE_EVENT_TYPES:
-        badge = '<span class="badge badge-no-trade">NO TRADE</span>'
+        badge, kind = '<span class="badge badge-no-trade">NO TRADE</span>', "no-trade"
     else:
-        badge = '<span class="badge badge-system">SYSTEM</span>'
+        badge, kind = '<span class="badge badge-system">SYSTEM</span>', "system"
+    # `data-kind` (not an extra class) is a real, additional visual cue
+    # (a left-border accent, see .event-row[data-kind] in the
+    # stylesheet) -- deliberately not added to `class="event-row"`
+    # itself, since existing tests match that exact literal attribute
+    # string to split real event rows apart; a second class there would
+    # silently break that real structural check.
     return (
-        f'<div class="event-row">{badge}<span class="event-type">{_esc(event_type)}</span>'
+        f'<div class="event-row" data-kind="{kind}">{badge}<span class="event-type">{_esc(event_type)}</span>'
         f'<span class="event-time mono">{_esc(event.get("timestamp", ""))}</span>'
         f'<span class="event-agent">{_esc(event.get("agent", ""))}</span></div>'
     )
@@ -879,16 +946,9 @@ def _render_events_section(view: dict[str, Any]) -> str:
 """
 
 
-_SIDEBAR_ITEMS = (
-    ("overview", "Overview"),
-    ("market", "Market"),
-    ("intelligence", "Intelligence"),
-    ("candidate", "Candidate"),
-    ("position", "Position"),
-    ("health", "Health"),
-    ("capture", "Data Capture"),
-    ("notifications", "Notifications"),
-    ("events", "Events"),
+_SIDEBAR_GROUPS = (
+    ("Primary", (("overview", "Overview"), ("market", "Market"), ("intelligence", "Intelligence"), ("candidate", "Candidate"), ("position", "Position"))),
+    ("Operations", (("health", "System Health"), ("capture", "Data Capture"), ("notifications", "Notifications"), ("events", "Events"))),
 )
 
 
@@ -916,7 +976,16 @@ def _render_sidebar(view: dict[str, Any], settings: Settings | None) -> str:
     kite_dot = "dot-ok" if kite and kite.status == "OK" else "dot-fail"
     ai_dot = "dot-ok" if ai and ai.status == "OK" else "dot-fail"
     mode_label = f"{settings.trading_mode.upper()} TRADING" if settings is not None else "MODE: NOT AVAILABLE"
-    nav_html = "".join(f'<li><a href="#{anchor}">{label}</a></li>' for anchor, label in _SIDEBAR_ITEMS)
+    # One flat <ul class="side-nav"> (not one per group) -- group headers
+    # are plain, non-link <li> items inside the same list. Keeps the
+    # real structural guarantee every sidebar test relies on (exactly
+    # one `class="side-nav"...</ul>` block containing all 9 real
+    # anchors) while still giving the two-group visual hierarchy.
+    nav_html = "".join(
+        f'<li class="nav-group-label">{_esc(group_label)}</li>'
+        + "".join(f'<li><a href="#{anchor}">{label}</a></li>' for anchor, label in items)
+        for group_label, items in _SIDEBAR_GROUPS
+    )
     return f"""
 <nav class="sidebar">
 <div class="brand"><span class="brand-mark">N</span><div><div class="brand-name">NIFTY AI Trader</div><div class="brand-sub">Command Center</div></div></div>
@@ -1023,23 +1092,28 @@ def render_dashboard(
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="{refresh_seconds}">
 <title>NIFTY AI Trader &mdash; Command Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root {{
-  --bg: #0b0e14; --card: #131722; --card-alt: #171c28; --border: #232838; --border-soft: #1b2130;
-  --text: #e6e9ef; --text-dim: #b7bfd1; --muted: #7c869b;
-  --ok: #16c784; --fail: #ea3943; --amber: #f0a020; --accent: #4f8cff;
-  --radius: 12px; --radius-sm: 6px; --sidebar-w: 240px;
+  --bg: #0a0c11; --card: #12151d; --card-alt: #171b25; --border: #232838; --border-soft: #1b2029;
+  --text: #e9ebf1; --text-dim: #b6bccb; --muted: #7c8598;
+  --ok: #1ecb8c; --fail: #f0454f; --amber: #f2a838; --accent: #5b8cff; --purple: #9c7bff;
+  --font-ui: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --radius: 12px; --radius-sm: 8px; --sidebar-w: 252px;
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
-  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.4rem;
+  --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.5rem;
 }}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
 body {{
   margin: 0; background: var(--bg); color: var(--text);
-  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-ui);
   font-size: var(--fs-base); line-height: 1.5; -webkit-font-smoothing: antialiased;
-  border-top: 4px solid transparent;
+  border-top: 4px solid transparent; overflow-x: hidden;
 }}
 body.blocked {{ border-top-color: var(--fail); }}
 h1 {{ font-size: var(--fs-xl); font-weight: 650; margin: 0; letter-spacing: -0.01em; }}
@@ -1048,7 +1122,7 @@ h2 {{
   display: flex; align-items: baseline; gap: var(--sp-2); padding-bottom: var(--sp-3);
   border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em; scroll-margin-top: var(--sp-5);
 }}
-.shell {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; align-items: start; }}
+.shell {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; align-items: start; max-width: 100vw; }}
 .sidebar {{
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   background: var(--card); border-right: 1px solid var(--border);
@@ -1066,11 +1140,17 @@ h2 {{
   letter-spacing: 0.05em; text-align: center; padding: var(--sp-2); border-radius: var(--radius-sm);
 }}
 .side-nav {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; flex: 1; }}
+.nav-group-label {{
+  color: var(--muted); font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: var(--sp-4) var(--sp-3) var(--sp-1) var(--sp-3);
+}}
+.nav-group-label:first-child {{ padding-top: 0; }}
 .side-nav a {{
   display: block; color: var(--text-dim); text-decoration: none; font-size: var(--fs-sm);
-  padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm); border-left: 2px solid transparent;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }}
-.side-nav a:hover {{ background: var(--card-alt); color: var(--text); }}
+.side-nav a:hover {{ background: var(--card-alt); color: var(--text); border-left-color: var(--accent); }}
 .side-footer {{ display: flex; flex-direction: column; gap: var(--sp-2); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
 .side-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--muted); }}
 .main {{ padding: var(--sp-6) var(--sp-5); min-width: 0; }}
@@ -1089,15 +1169,19 @@ h2 {{
   padding: var(--sp-5); margin-bottom: var(--sp-4);
 }}
 .hero-top {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--sp-4); }}
-.hero-ltp {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
+.hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
 .hero-change {{ color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-1) 0 0 0; }}
 .session-pill {{ background: var(--card-alt); border: 1px solid var(--border-soft); padding: var(--sp-2) var(--sp-4); border-radius: 20px; font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.04em; }}
 .hero-pips {{ display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px solid var(--border-soft); }}
 .hero-pip {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-dim); }}
 .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-4); }}
-.kpi-tile {{ background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-4); }}
+.kpi-tile {{
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-4);
+  transition: border-color 0.12s ease;
+}}
+.kpi-tile:hover {{ border-color: var(--accent); }}
 .kpi-label {{ color: var(--muted); font-size: var(--fs-xs); margin: 0 0 var(--sp-2) 0; letter-spacing: 0.03em; text-transform: uppercase; }}
-.kpi-value {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-lg); font-weight: 650; margin: 0; }}
+.kpi-value {{ font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 650; margin: 0; font-variant-numeric: tabular-nums; }}
 .no-data {{ color: var(--amber); font-style: italic; font-weight: 600; font-size: var(--fs-sm); letter-spacing: 0.01em; }}
 .ev-tag {{
   background: rgba(79,140,255,0.15); color: var(--accent); font-size: var(--fs-xs); font-weight: 700;
@@ -1113,19 +1197,36 @@ h2 {{
   scroll-margin-top: var(--sp-5);
 }}
 .card-wide {{ grid-column: 1 / -1; }}
-.mono {{ font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; }}
+.mono {{ font-family: var(--font-mono); font-variant-numeric: tabular-nums; }}
 .label {{ color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-3) 0; letter-spacing: 0.01em; }}
-.big-number {{ font-family: "SFMono-Regular", Consolas, monospace; font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
+.big-number {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
 .not-yet {{ color: var(--muted); font-style: italic; font-size: var(--fs-sm); }}
 .verdict {{ font-size: var(--fs-xs); padding: 3px 11px; border-radius: 20px; font-weight: 700; letter-spacing: 0.05em; }}
-.verdict-ready {{ background: rgba(22,199,132,0.15); color: var(--ok); }}
-.verdict-blocked {{ background: rgba(234,57,67,0.15); color: var(--fail); }}
+.verdict-ready {{ background: rgba(30,203,140,0.15); color: var(--ok); }}
+.verdict-blocked {{ background: rgba(240,69,79,0.15); color: var(--fail); }}
+.health-highlights {{
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-4);
+  margin-bottom: var(--sp-5);
+}}
+.health-tile {{
+  background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: var(--sp-4);
+}}
+.health-tile-label {{ color: var(--muted); font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; margin: 0 0 var(--sp-2) 0; }}
+.health-tile-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-md); font-weight: 650; margin: 0; }}
+.health-tile-detail {{ color: var(--text-dim); font-size: var(--fs-xs); margin: var(--sp-2) 0 0 0; line-height: 1.4; }}
 .checks-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 var(--sp-4); }}
 .check {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }}
 .check:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
-.dot-ok {{ background: var(--ok); }} .dot-fail {{ background: var(--fail); }} .dot-unknown {{ background: var(--muted); }}
-.stage {{ display: flex; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
+.dot-ok {{ background: var(--ok); box-shadow: 0 0 0 3px rgba(30,203,140,0.15); }}
+.dot-fail {{ background: var(--fail); box-shadow: 0 0 0 3px rgba(240,69,79,0.15); }}
+.dot-unknown {{ background: var(--muted); }}
+.pipeline {{ position: relative; padding-left: var(--sp-5); }}
+.pipeline::before {{ content: ""; position: absolute; left: 3px; top: 6px; bottom: 6px; width: 1px; background: var(--border-soft); }}
+.stage {{ position: relative; display: flex; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
+.stage::before {{ content: ""; position: absolute; left: calc(-1 * var(--sp-5) + 0px); top: 50%; transform: translateY(-50%); width: 7px; height: 7px; border-radius: 50%; background: var(--border-soft); }}
+.stage.stage-done::before {{ background: var(--purple); }}
 .stage:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .stage-label {{ color: var(--muted); }}
 .stage-value {{ text-align: right; }}
@@ -1133,39 +1234,46 @@ h2 {{
 .attr-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .attr-row > span:first-child {{ color: var(--text-dim); }}
 .profit {{ color: var(--ok); }} .loss {{ color: var(--fail); }}
-.bar-row {{ display: grid; grid-template-columns: 110px 1fr 48px; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }}
+.bar-row {{ display: grid; grid-template-columns: 110px 1fr 52px; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }}
 .bar-label {{ color: var(--text-dim); font-size: var(--fs-sm); }}
 .bar-track {{ background: var(--card-alt); border-radius: 20px; height: 8px; overflow: hidden; }}
-.bar-fill {{ background: linear-gradient(90deg, var(--accent), var(--ok)); height: 100%; border-radius: 20px; }}
-.bar-value {{ text-align: right; font-size: var(--fs-sm); }}
+.bar-fill {{ background: linear-gradient(90deg, var(--accent), var(--purple)); height: 100%; border-radius: 20px; }}
+.bar-value {{ text-align: right; font-size: var(--fs-sm); font-family: var(--font-mono); }}
 .position-card {{
   background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
   padding: var(--sp-4); margin-bottom: var(--sp-4);
 }}
 .position-card .attr-row, .position-card .label {{ margin-bottom: 0; }}
 .demo-tag {{
-  background: rgba(240,160,32,0.18); color: var(--amber); font-size: var(--fs-xs); font-weight: 700;
+  background: rgba(242,168,56,0.18); color: var(--amber); font-size: var(--fs-xs); font-weight: 700;
   padding: 1px 6px; border-radius: 4px; letter-spacing: 0.04em; vertical-align: middle;
 }}
 .kite-link {{ color: var(--accent); text-decoration: none; font-size: var(--fs-sm); font-weight: 600; }}
 .kite-link:hover {{ text-decoration: underline; }}
 .multi-position-warning {{
-  background: rgba(240,160,32,0.12); border: 1px solid rgba(240,160,32,0.35); color: var(--amber);
+  background: rgba(242,168,56,0.1); border: 1px solid rgba(242,168,56,0.35); color: var(--amber);
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); font-size: var(--fs-sm);
   margin-bottom: var(--sp-4); line-height: 1.5;
 }}
+.capture-metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--sp-4); margin: var(--sp-3) 0 var(--sp-4) 0; }}
+.capture-metric {{ background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); }}
 .foundation-fact {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); color: var(--text-dim); border-bottom: 1px solid var(--border-soft); }}
 .foundation-fact:last-child {{ border-bottom: none; padding-bottom: 0; }}
 .timeline {{ max-height: 420px; overflow-y: auto; margin-top: var(--sp-1); }}
 .event-row {{
   display: grid; grid-template-columns: auto 1fr auto auto; gap: var(--sp-3); align-items: center;
-  padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm);
+  padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm);
+  border-left: 3px solid transparent; margin-left: calc(-1 * var(--sp-3));
 }}
+.event-row[data-kind="fill"] {{ border-left-color: var(--ok); }}
+.event-row[data-kind="no-trade"] {{ border-left-color: var(--amber); }}
+.event-row[data-kind="system"] {{ border-left-color: var(--border); }}
 .event-row:last-child {{ border-bottom: none; }}
+.event-type {{ font-weight: 500; }}
 .badge {{ font-size: var(--fs-xs); font-weight: 700; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.03em; white-space: nowrap; }}
-.badge-fill {{ background: rgba(22,199,132,0.18); color: var(--ok); }}
-.badge-no-trade {{ background: rgba(240,160,32,0.18); color: var(--amber); }}
-.badge-system {{ background: rgba(139,147,167,0.18); color: var(--muted); }}
+.badge-fill {{ background: rgba(30,203,140,0.18); color: var(--ok); }}
+.badge-no-trade {{ background: rgba(242,168,56,0.18); color: var(--amber); }}
+.badge-system {{ background: rgba(124,133,152,0.18); color: var(--muted); }}
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
 .footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
@@ -1173,7 +1281,13 @@ h2 {{
   .shell {{ grid-template-columns: 1fr; }}
   .sidebar {{ position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }}
   .side-nav {{ flex-direction: row; flex-wrap: wrap; }}
+  .nav-group-label {{ display: none; }}
   .side-footer {{ flex-direction: row; border-top: none; padding-top: 0; }}
+}}
+@media (max-width: 560px) {{
+  .main {{ padding: var(--sp-4); }}
+  .hero-top {{ flex-direction: column; }}
+  :root {{ --fs-2xl: 1.9rem; }}
 }}
 </style>
 </head>
@@ -1194,13 +1308,23 @@ h2 {{
   var container = document.getElementById('chart-container');
   if (!container || typeof LightweightCharts === 'undefined') return;
   var chart = LightweightCharts.createChart(container, {{
-    layout: {{ background: {{ color: '#131722' }}, textColor: '#8b93a7' }},
-    grid: {{ vertLines: {{ color: '#232838' }}, horzLines: {{ color: '#232838' }} }},
-    timeScale: {{ timeVisible: true }},
+    layout: {{ background: {{ color: '#12151d' }}, textColor: '#7c8598', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }},
+    grid: {{ vertLines: {{ color: '#1b2029' }}, horzLines: {{ color: '#1b2029' }} }},
+    crosshair: {{
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: {{ color: '#5b8cff', width: 1, style: 2, labelBackgroundColor: '#5b8cff' }},
+      horzLine: {{ color: '#5b8cff', width: 1, style: 2, labelBackgroundColor: '#5b8cff' }}
+    }},
+    rightPriceScale: {{ borderColor: '#232838' }},
+    timeScale: {{ borderColor: '#232838', timeVisible: true }},
     width: container.clientWidth,
     height: 340,
   }});
-  var series = chart.addCandlestickSeries();
+  var series = chart.addCandlestickSeries({{
+    upColor: '#1ecb8c', downColor: '#f0454f', borderVisible: false,
+    wickUpColor: '#1ecb8c', wickDownColor: '#f0454f',
+    priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
+  }});
   var initial = {candles_json};
   series.setData(initial);
   var lastTime = initial.length ? initial[initial.length - 1].time : null;
