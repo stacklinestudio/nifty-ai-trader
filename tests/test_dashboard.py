@@ -26,6 +26,7 @@ from events.contracts import Event, EventType
 from learning.memory import MemoryStore
 from monitoring.live_status_server import (
     LIVE_STATE_API_PATH,
+    _build_pnl_position_events_view,
     build_dashboard_view,
     build_live_state_payload,
     build_live_status_server,
@@ -893,7 +894,8 @@ def test_live_state_api_returns_real_json_with_expected_keys(dashboard_server):
     assert status == 200
     data = json.loads(body)
     for key in (
-        "computed_at",
+        "health_computed_at",
+        "fast_computed_at",
         "gate_verdict",
         "nifty_ltp",
         "realized_pnl_today",
@@ -929,7 +931,8 @@ def test_live_state_payload_reflects_a_real_injected_event_with_correct_kind(tmp
     database.save_event(event)
 
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
-    payload = build_live_state_payload(view)
+    fast_view = _build_pnl_position_events_view(settings, database, now.date())
+    payload = build_live_state_payload(view, fast_view)
 
     assert payload["events"], "real injected event missing from the live-state payload"
     latest = payload["events"][0]
@@ -948,13 +951,87 @@ def test_live_state_payload_never_recomputes_numbers_that_diverge_from_the_html_
     database.initialize()
 
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
-    payload = build_live_state_payload(view)
+    fast_view = _build_pnl_position_events_view(settings, database, date(2026, 9, 6))
+    payload = build_live_state_payload(view, fast_view)
 
     assert payload["gate_verdict"] == view["gate"].verdict
     assert payload["realized_pnl_today"] == view["realized_pnl_today"]
     assert payload["unrealized_pnl_today"] == view["unrealized_pnl_today"]
     assert payload["total_pnl_today"] == view["realized_pnl_today"] + view["unrealized_pnl_today"]
     assert payload["position_open"] == bool(view["position"].get("open"))
+
+
+def test_live_state_fast_tier_picks_up_a_real_new_event_within_one_poll_not_waiting_on_the_health_cache(tmp_path):
+    """The fast tier (P&L/position/events) must never share the health
+    gate's real DASHBOARD_REFRESH_SECONDS cache -- a real event written
+    to the database right before a poll must show up in THAT SAME poll,
+    not only after the (much slower) health cache happens to expire."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    server = build_live_status_server(database, settings, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Prime the real health-gate cache with an empty-events view.
+        status, body = _fetch(server, LIVE_STATE_API_PATH)
+        assert status == 200
+        before = json.loads(body)
+        assert before["events"] == []
+
+        # A second real connection to the same real sqlite file -- the
+        # same way a genuinely separate real writer process would touch
+        # this database while the dashboard server keeps running.
+        writer = Database(settings.database_path)
+        writer.save_event(
+            Event(EventType.RISK_REJECTED, "risk_manager", datetime.now(IST), output_summary={"reason": "daily loss cap"})
+        )
+
+        # Immediately re-poll -- well inside the real 30s health-cache
+        # window, so a shared cache would still show zero events here.
+        status, body = _fetch(server, LIVE_STATE_API_PATH)
+        assert status == 200
+        after = json.loads(body)
+
+        assert len(after["events"]) == 1, "real new event did not appear within one fast-tier poll"
+        assert after["events"][0]["event_type"] == "RISK_REJECTED"
+        # The health tier's own cached timestamp is untouched by this --
+        # confirms the fast-tier read genuinely bypassed it rather than
+        # accidentally forcing a full recompute.
+        assert after["health_computed_at"] == before["health_computed_at"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_live_state_health_tier_still_respects_its_real_cache_unaffected_by_the_split(tmp_path):
+    """The health tier (gate verdict, NIFTY LTP) must keep its existing
+    real DASHBOARD_REFRESH_SECONDS throttling, unchanged by splitting
+    the fast tier out -- two rapid real polls must return the exact
+    same real `health_computed_at`, proving `run_system_health_gate`
+    was not silently invoked a second time."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    server = build_live_status_server(database, settings, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _fetch(server, LIVE_STATE_API_PATH)
+        assert status == 200
+        first = json.loads(body)
+
+        status, body = _fetch(server, LIVE_STATE_API_PATH)
+        assert status == 200
+        second = json.loads(body)
+
+        assert first["health_computed_at"] == second["health_computed_at"]
+        assert first["gate_verdict"] == second["gate_verdict"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_rendered_dashboard_carries_real_data_live_hooks_for_the_poll_to_target(tmp_path):

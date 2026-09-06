@@ -491,6 +491,51 @@ def _gate_check(gate: Any, name: str) -> Any:
     return None
 
 
+def _build_pnl_position_events_view(settings: Settings, database: Database, today: date) -> dict[str, Any]:
+    """The cheap, real, DB-only slice of the dashboard's data -- real
+    open position(s), real today's realized/unrealized P&L, real
+    today's trade count, real recent events. Deliberately makes no live
+    Kite call and never touches `run_system_health_gate` -- nothing
+    here costs more than a real local SQLite read, so unlike
+    `build_dashboard_view`'s other fields (the gate's checks, live NIFTY
+    LTP) it does not need DASHBOARD_REFRESH_SECONDS throttling and is
+    safe to recompute on every single `/api/live-state` poll (see
+    build_live_state_payload). Extracted out of `build_dashboard_view`
+    so both real callers share one real implementation -- never two
+    that could silently drift."""
+    from learning.memory import MemoryStore
+
+    events = database.events(limit=200)
+
+    # Defensive-only (see all_open_position_views' own docstring): the
+    # real architecture never allows more than one real open position at
+    # a time, so `real_positions` normally has 0 or 1 entries. Demo data
+    # is used only when there are genuinely zero real ones, matching
+    # current_position_view's own real-always-wins rule.
+    real_positions = all_open_position_views(database)
+    if real_positions:
+        open_positions = real_positions
+    else:
+        demo = database.demo_position()
+        open_positions = [demo] if demo is not None else []
+    position = open_positions[0] if open_positions else {"open": False}
+    unrealized_pnl_today = sum(p["unrealized_pnl"] for p in open_positions)
+
+    memory = MemoryStore(settings.database_path)
+    all_trades = memory.recent(memory_type="trade", limit=1000)
+    todays_trades = [t for t in all_trades if _is_same_real_day(t.get("timestamp"), today)]
+    realized_pnl_today = sum(float(t["payload"].get("pnl") or 0.0) for t in todays_trades)
+
+    return {
+        "events": events,
+        "position": position,
+        "open_positions": open_positions,
+        "unrealized_pnl_today": unrealized_pnl_today,
+        "trades_today_count": len(todays_trades),
+        "realized_pnl_today": realized_pnl_today,
+    }
+
+
 def build_dashboard_view(
     settings: Settings,
     database: Database,
@@ -533,29 +578,12 @@ def build_dashboard_view(
             latest_signal.get("setup_type", ""), latest_signal.get("regime", ""), settings, memory, []
         )
 
-    events = database.events(limit=200)
+    pnl_view = _build_pnl_position_events_view(settings, database, today)
+    events = pnl_view["events"]
     pipeline = _latest_event_by_type(
         events,
         ("MARKET_RESEARCH_COMPLETE", "SIGNAL_CREATED", "TRADE_VALIDATED", "RISK_APPROVED", "RISK_REJECTED"),
     )
-
-    # Defensive-only (see all_open_position_views' own docstring): the
-    # real architecture never allows more than one real open position at
-    # a time, so `real_positions` normally has 0 or 1 entries. Demo data
-    # is used only when there are genuinely zero real ones, matching
-    # current_position_view's own real-always-wins rule.
-    real_positions = all_open_position_views(database)
-    if real_positions:
-        open_positions = real_positions
-    else:
-        demo = database.demo_position()
-        open_positions = [demo] if demo is not None else []
-    position = open_positions[0] if open_positions else {"open": False}
-    unrealized_pnl_today = sum(p["unrealized_pnl"] for p in open_positions)
-
-    all_trades = memory.recent(memory_type="trade", limit=1000)
-    todays_trades = [t for t in all_trades if _is_same_real_day(t.get("timestamp"), today)]
-    realized_pnl_today = sum(float(t["payload"].get("pnl") or 0.0) for t in todays_trades)
 
     return {
         "today": today.isoformat(),
@@ -567,11 +595,11 @@ def build_dashboard_view(
         "latest_signal": latest_signal,
         "ev_estimate": ev_estimate,
         "pipeline": pipeline,
-        "position": position,
-        "open_positions": open_positions,
-        "unrealized_pnl_today": unrealized_pnl_today,
-        "trades_today_count": len(todays_trades),
-        "realized_pnl_today": realized_pnl_today,
+        "position": pnl_view["position"],
+        "open_positions": pnl_view["open_positions"],
+        "unrealized_pnl_today": pnl_view["unrealized_pnl_today"],
+        "trades_today_count": pnl_view["trades_today_count"],
+        "realized_pnl_today": pnl_view["realized_pnl_today"],
         "max_trades_per_day": settings.max_trades_per_day,
         "max_daily_loss": settings.max_daily_loss,
         "capture_status": _gate_check(gate, "option_tick_capture"),
@@ -590,14 +618,21 @@ def build_dashboard_view(
 # lightweight AJAX poll against a new read-only JSON endpoint
 # (LIVE_STATE_API_PATH) that patches specific real DOM values in place
 # -- no full-page `<meta refresh>` reload for the values that change
-# most often (NIFTY LTP, P&L, verdict, latest events). The endpoint
-# reuses the SAME cached `_cached_dashboard_view()` the HTML route
-# already uses (see _make_handler) -- zero new backend calls, zero new
-# computation, just a smaller real JSON projection of the same real
-# view dict for a cheaper, faster client-side poll. `<meta refresh>`
+# most often (NIFTY LTP, P&L, verdict, latest events). `<meta refresh>`
 # stays as a slower, whole-page fallback (structural changes -- a new
 # section appearing, e.g. a position opening for the first time) at
 # `refresh_seconds`; the JS poll below runs faster, at LIVE_POLL_SECONDS.
+#
+# Two genuinely different freshnesses feed this one payload, not one
+# shared cache:
+#   - "health" tier (gate verdict, NIFTY LTP): sourced from the SAME
+#     DASHBOARD_REFRESH_SECONDS-cached `_cached_dashboard_view()` the
+#     HTML route uses -- these real fields cost a real live Kite call
+#     and real Discord/Telegram probe sends, so they stay throttled.
+#   - "fast" tier (P&L, position, events): built fresh on every single
+#     call via `_build_pnl_position_events_view` -- a real local SQLite
+#     read costs nothing that justifies sharing the health gate's
+#     expensive cache, so these are never stale beyond one real poll.
 
 
 def _classify_event_kind(event_type: str) -> str:
@@ -611,28 +646,32 @@ def _classify_event_kind(event_type: str) -> str:
     return "system"
 
 
-def build_live_state_payload(view: dict[str, Any]) -> dict[str, Any]:
-    """A small, real, JSON-serializable projection of the same real
-    `view` dict the HTML route already renders -- no new data, no new
-    computation, just fewer/lighter fields for a fast, frequent client
-    poll. `events` carries `event_id` specifically so the client can
-    tell a genuinely NEW real event apart from one it has already
-    rendered (for the real slide-in animation), without guessing from
-    timestamps alone."""
-    gate = view["gate"]
-    position = view["position"]
-    nifty_ltp = view["nifty_ltp"]
-    realized = view["realized_pnl_today"]
-    unrealized = view["unrealized_pnl_today"]
+def build_live_state_payload(health_view: dict[str, Any], fast_view: dict[str, Any]) -> dict[str, Any]:
+    """Combines the two real, independently-fresh tiers into one JSON
+    payload. `health_view` is the real `DASHBOARD_REFRESH_SECONDS`-
+    cached dashboard view (its own real `computed_at` is up to that many
+    real seconds old -- reported as `health_computed_at` so the client
+    can dim only the fields that actually came from it). `fast_view` is
+    a fresh, uncached `_build_pnl_position_events_view` result, real as
+    of right now -- reported as `fast_computed_at`. `events` carries
+    `event_id` specifically so the client can tell a genuinely NEW real
+    event apart from one it has already rendered (for the real
+    slide-in animation), without guessing from timestamps alone."""
+    gate = health_view["gate"]
+    nifty_ltp = health_view["nifty_ltp"]
+    position = fast_view["position"]
+    realized = fast_view["realized_pnl_today"]
+    unrealized = fast_view["unrealized_pnl_today"]
     return {
-        "computed_at": view["computed_at"],
+        "health_computed_at": health_view["computed_at"],
+        "fast_computed_at": datetime.now(IST).isoformat(timespec="seconds"),
         "gate_verdict": gate.verdict,
         "nifty_ltp": nifty_ltp.get("ltp"),
         "realized_pnl_today": realized,
         "unrealized_pnl_today": unrealized,
         "total_pnl_today": realized + unrealized,
         "position_open": bool(position.get("open")),
-        "trades_today_count": view["trades_today_count"],
+        "trades_today_count": fast_view["trades_today_count"],
         "events": [
             {
                 "event_id": e.get("event_id"),
@@ -641,7 +680,7 @@ def build_live_state_payload(view: dict[str, Any]) -> dict[str, Any]:
                 "agent": e.get("agent"),
                 "kind": _classify_event_kind(e.get("event_type", "")),
             }
-            for e in view["events"][:8]
+            for e in fast_view["events"][:8]
         ],
     }
 
@@ -1715,8 +1754,15 @@ h2 {{
     flash(el);
   }}
 
-  function applyStale(stale) {{
-    document.querySelectorAll('[data-live]').forEach(function(el) {{ el.classList.toggle('is-stale', stale); }});
+  // Only the "health" tier (gate verdict, NIFTY LTP) rides the real
+  // DASHBOARD_REFRESH_SECONDS-cached view and can genuinely go stale --
+  // see build_live_state_payload's own docstring. The "fast" tier
+  // (P&L, position, events) is rebuilt fresh on every real poll, so it
+  // is never dimmed by the health tier's real cache age.
+  var HEALTH_TIER_SELECTOR = '[data-live="nifty-ltp"], [data-live="gate-verdict"], [data-live="gate-verdict-compact"]';
+
+  function applyHealthStale(stale) {{
+    document.querySelectorAll(HEALTH_TIER_SELECTOR).forEach(function(el) {{ el.classList.toggle('is-stale', stale); }});
     var badge = document.getElementById('stale-badge');
     if (badge) badge.hidden = !stale;
   }}
@@ -1744,9 +1790,12 @@ h2 {{
 
   function poll() {{
     fetch('{LIVE_STATE_API_PATH}').then(function(r) {{ return r.json(); }}).then(function(state) {{
-      if (!state || !state.computed_at) return;
-      var ageSeconds = (Date.now() - new Date(state.computed_at).getTime()) / 1000;
-      applyStale(ageSeconds > {STALE_AFTER_SECONDS});
+      if (!state || !state.health_computed_at) return;
+      var healthAgeSeconds = (Date.now() - new Date(state.health_computed_at).getTime()) / 1000;
+      applyHealthStale(healthAgeSeconds > {STALE_AFTER_SECONDS});
+      // state.fast_computed_at is always ~now (no cache on this tier) --
+      // real, but not currently surfaced as a separate visible badge,
+      // since a fast-tier value is never stale enough to warn about.
 
       if (state.nifty_ltp !== null && state.nifty_ltp !== undefined) {{
         document.querySelectorAll('[data-live="nifty-ltp"]').forEach(function(el) {{ patchText(el, state.nifty_ltp.toFixed(2), null); }});
@@ -1825,7 +1874,22 @@ def _make_handler(database: Database, settings: Settings | None = None) -> type[
                 if settings is None:
                     self._respond_json({})
                     return
-                self._respond_json(build_live_state_payload(_cached_dashboard_view()))
+                # Slow (health) tier first, fast tier second -- NOT an
+                # arbitrary ordering choice: build_dashboard_view (inside
+                # _cached_dashboard_view) always resolves the real
+                # execution.position_persistence/agents circular import
+                # by importing the gate's own agents-package dependency
+                # first. Building the fast tier before this on a cold
+                # process can hit that same import mid-initialization
+                # from the other direction and raise ImportError -- see
+                # this project's own real incident, not a hypothetical.
+                health_view = _cached_dashboard_view()
+                # Fast tier: a real, uncached DB read on every single
+                # poll (see _build_pnl_position_events_view's own
+                # docstring for why this one does NOT share the health
+                # gate's DASHBOARD_REFRESH_SECONDS cache).
+                fast_view = _build_pnl_position_events_view(settings, database, datetime.now(IST).date())
+                self._respond_json(build_live_state_payload(health_view, fast_view))
             elif self.path.startswith(STATIC_FONTS_PREFIX):
                 self._respond_static_font(self.path[len(STATIC_FONTS_PREFIX) :])
             else:
