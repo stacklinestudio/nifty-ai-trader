@@ -103,6 +103,49 @@ def test_paper_execution_requires_and_receives_risk_approval(tmp_path: Path):
     assert cycle.risk_approved and cycle.order and cycle.order["status"] == "FILLED"
 
 
+def test_paper_fill_event_includes_the_real_kite_chart_link_when_instrument_token_known(
+    tmp_path: Path,
+):
+    """Final Brief Part B: the real Kite chart URL pattern
+    https://kite.zerodha.com/chart/ext/tvc/{exchange}/{tradingsymbol}/{instrument_token}
+    built from the exact real instrument data already known at fill time
+    (state.context["selected_option"], populated by OptionsAgent)."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    fills: list[Event] = []
+    orchestrator = Orchestrator(settings, database)
+    orchestrator.bus.subscribe(EventType.PAPER_FILL, fills.append)
+
+    context = candidate_context()
+    instrument = OptionInstrument(
+        "NIFTY24CE", 22000, datetime.now(IST).date() + timedelta(days=3), "CE", 25, instrument_token=17512194
+    )
+    context["option_quotes"] = [OptionQuote(instrument, 10, datetime.now(IST), 9.75, 10.25, 1000)]
+    cycle = orchestrator.run_cycle(context)
+
+    assert cycle.order and cycle.order["status"] == "FILLED"
+    assert fills, "expected a real PAPER_FILL event to have been published"
+    summary = fills[0].output_summary
+    assert summary["kite_chart_url"] == "https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194"
+    assert "live_status_url" in summary
+
+
+def test_paper_fill_event_omits_kite_chart_link_without_a_real_instrument_token(tmp_path: Path):
+    """The real option_quote() fixture above never sets instrument_token --
+    the URL must never be fabricated when that real value isn't known."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    fills: list[Event] = []
+    orchestrator = Orchestrator(settings, database)
+    orchestrator.bus.subscribe(EventType.PAPER_FILL, fills.append)
+
+    cycle = orchestrator.run_cycle(candidate_context())
+
+    assert cycle.order and cycle.order["status"] == "FILLED"
+    assert fills
+    assert "kite_chart_url" not in fills[0].output_summary
+
+
 def test_learning_memory_is_append_only(tmp_path: Path):
     store = MemoryStore(tmp_path / "learning.db")
     memory_id = store.append("trade", {"outcome": "NO_TRADE"}, datetime.now(IST))

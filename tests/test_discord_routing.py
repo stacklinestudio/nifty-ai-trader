@@ -108,6 +108,39 @@ def test_failure_on_one_channel_does_not_block_notifications_to_others():
     assert calls and calls[0][0] == "https://discord.test/trades"
 
 
+def test_paper_fill_notification_clearly_labels_both_real_links():
+    """Final Brief Part B: the dashboard/Kite chart links must be
+    readable at a glance, not just buried in the raw JSON blob."""
+    calls: list[tuple[str, dict]] = []
+    notifier = DiscordNotifier("https://discord.test/legacy", recording_transport(calls))
+
+    notifier.send_event(
+        event(
+            EventType.PAPER_FILL,
+            {
+                "order_id": "o1",
+                "live_status_url": "http://192.168.1.10:8765/live",
+                "kite_chart_url": "https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194",
+            },
+        )
+    )
+
+    description = calls[0][1]["json"]["embeds"][0]["description"]
+    assert "Our dashboard: http://192.168.1.10:8765/live" in description
+    assert "Kite chart: https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194" in description
+
+
+def test_non_paper_fill_events_never_get_a_links_line():
+    calls: list[tuple[str, dict]] = []
+    notifier = DiscordNotifier("https://discord.test/legacy", recording_transport(calls))
+
+    notifier.send_event(event(EventType.RISK_APPROVED, {"reasons": []}))
+
+    description = calls[0][1]["json"]["embeds"][0]["description"]
+    assert "Our dashboard" not in description
+    assert "Kite chart" not in description
+
+
 def test_webhooks_by_category_from_settings_reads_all_six_fields():
     # Settings' os.getenv(...) defaults are evaluated once at class
     # definition (module import) time, not per-instance -- so this

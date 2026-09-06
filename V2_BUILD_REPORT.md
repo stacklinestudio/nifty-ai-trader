@@ -6643,3 +6643,266 @@ subprocess test, not just re-read from the code. `demo-live-link` is
 now fixed to behave as the standalone testing tool it was always meant
 to be: it says so explicitly, and it actually stays running until
 `Ctrl+C`.
+
+## Final Brief: Command Center dashboard + Kite chart link (2026-09-06)
+
+Two parts, both explicitly the last brief of this engagement. Part A
+extends `monitoring/live_status_server.py` (Brief 25) with a single,
+comprehensive read-only dashboard. Part B adds a real Kite web chart
+link to trade notifications. Both are done; the seven bigger
+architecture items named in the brief (real option-price
+reconstruction, decision ledger, market-state snapshots, artifact-based
+agents, experiment lab, multi-model AI, Obsidian wiki-link graph)
+remain untouched and deferred until after Monday's real evidence
+exists — nothing in this brief touched them.
+
+### Part A: one page, ten sections, zero new decision logic
+
+**This is one single page, not a multi-page app.** `/` and `/dashboard`
+are two paths to the exact same real, byte-identical HTML document
+(proven by a real end-to-end test, `test_root_and_dashboard_serve_the_
+same_single_page`, and confirmed again below with a live server). The
+pre-existing `/live` position page (Brief 25-27) is completely
+unchanged — same route, same handler, same 29 existing tests still
+passing untouched.
+
+All ten required sections are `<section>` elements on that one page,
+each backed by a real, already-computed value:
+
+1. **System Health** — direct render of Brief 23's `GateReport`: all 7
+   real checks plus the real READY/BLOCKED verdict, zero new logic.
+2. **Kite/market status** — reuses the gate's own real
+   `kite_connection` check (never calls it a second time) plus a new
+   `check_nifty_ltp()`, which makes the same real live `kite.quote()`
+   call this project already uses elsewhere.
+3. **NIFTY price chart** — TradingView Lightweight Charts (real, free,
+   open-source, via jsDelivr CDN, zero new backend dependency), fed by
+   the real, most-recently-modified archived minute-candle CSV already
+   in `data/private/` — honestly labeled on the page itself as archived
+   data, not a live intraday feed, since no live tick-to-candle
+   pipeline exists yet.
+4. **Research → Signal → EV → Adversarial → Supervisor** — real most
+   recent event of each real type (`MARKET_RESEARCH_COMPLETE`,
+   `SIGNAL_CREATED`, `TRADE_VALIDATED`, `RISK_APPROVED`/`RISK_REJECTED`)
+   from the real audit trail, plus the real, measurement-only EV
+   estimate (Brief 14's `compute_ev`) for today's candidate if one
+   exists — never a fabricated "thinking" animation.
+5. **Current candidate + 7-component attribution** — the real, most
+   recent `score_attribution` row from `Database.recent_signals` today
+   (`technical_score`, `opening_score`, `volume_score`, `option_score`,
+   `global_score`, `news_score`, `risk_penalty` — Brief 12's real 7
+   inputs), plus confidence/regime/EV.
+6. **Paper P&L / risk** — real realized P&L today from `MemoryStore`'s
+   `memory_type="trade"` records (the actual authoritative source —
+   `Database`'s `trades` table is confirmed dead code, never written by
+   anything), real unrealized P&L from the real open position if one
+   exists, real trades-used-today vs. `max_trades_per_day`, real daily
+   loss cap utilization against `max_daily_loss` — read live from
+   `Settings` every time, never hardcoded.
+7. **Option tick capture** — reuses the gate's own real
+   `option_tick_capture` check (segment count, real tick count, real
+   gap count for today).
+8. **Notifications** — reuses the gate's own real `notifications`
+   check. Deliberately **not** called a second time: `check_
+   notifications` has a real side effect (it sends a real Discord/
+   Telegram probe message), so calling it twice per dashboard load would
+   mean two real messages sent on every single auto-refresh. See the
+   throttling note below — this matters for section 2's Kite check too.
+9/10. **Recent decisions / live event timeline** — one real,
+   continuously-updating component (not two separate builds), fed
+   directly from `Database.events()`. Every `RISK_REJECTED`/
+   `TRADE_VALIDATED`/`SIGNAL_CREATED` row renders with an explicit
+   amber **NO TRADE** badge; every `PAPER_FILL`/`TRADE_COMPLETED`/
+   `STOP_LOSS`/`TAKE_PROFIT`/`FORCED_EXIT` row renders with a green
+   **REAL FILL/EXIT** badge — proven never to land on the same row by a
+   dedicated test (`test_timeline_labels_no_trade_and_fill_events_
+   distinctly`), which also correctly orders both by real timestamp
+   DESC.
+
+**A real problem caught before it shipped, not after:** the System
+Health Gate's own checks make a real live Kite API call and send real
+Discord/Telegram probe messages every time they run. Recomputing the
+full gate on every single browser auto-refresh (every few seconds)
+would have meant a real Kite API hit and two real chat messages sent
+that often, forever, from an idle browser tab left open. Fixed with a
+`DASHBOARD_REFRESH_SECONDS = 30` real cache inside the request handler:
+`build_dashboard_view` (and therefore the gate) is recomputed at most
+once per 30 real seconds; the page's own "data as of" timestamp is
+shown separately from "page rendered at" so staleness is honest, never
+silent.
+
+Visual design: `/mnt/skills/public/frontend-design/SKILL.md`, which the
+brief referenced, **does not exist on this Windows machine** — confirmed
+via `ToolSearch` finding no matching skill either. Deliberate manual
+design was applied instead: a dark trading-terminal theme (`#0b0e14`
+background, `#131722` cards), monospace numerics, a card grid, a
+color-coded verdict/badge system (green=OK/fill, red=FAIL, amber=NO
+TRADE), stated here plainly rather than implied to be more than it is.
+
+**Real command output**, a live server against real injected data
+(real signal, real trade P&L record, real open position, real
+NO_TRADE + real fill events, no real Kite credentials in this
+environment):
+
+```
+$ python -c "... build_live_status_server + real HTTP GETs ..."
+{"...": "...", "event": "system_health_gate_verdict=BLOCKED"}
+--- GET / -> 200, 38372 bytes ---
+--- GET /dashboard -> 200, 38372 bytes ---
+--- GET /live -> 200, 1564 bytes ---
+--- GET /api/candles -> 200, 27558 bytes ---
+candle count: 300 first: {'time': 1788498000, 'open': 23964.35, ...} last: {'time': 1788515940, ...}
+root == dashboard byte-identical: True
+contains Command Center: True
+contains MOMENTUM_CONTINUATION: True
+contains NO TRADE badge: True
+contains no real LTP available (no kite creds): True
+contains +520.00 unrealized pnl: True
+contains realized 450: True
+POST /dashboard rejected as expected: HTTP Error 501: Unsupported method ('POST')
+```
+
+Real candle source for this run: `data/private/nifty_index_minute_
+2025-09-05_to_2026-09-04_extended.csv` (the most recently modified
+archived file) — honestly the real, most current archived data this
+project has, not a live feed.
+
+Test suite, all sections tested individually including explicit
+"not yet" states (no candidate, no open position, no capture today, no
+real Kite LTP) and the NO_TRADE/fill labeling regression:
+
+```
+$ python -m pytest tests/test_dashboard.py tests/test_v2_system.py -k "kite_chart or dashboard or timeline or incremental" -v
+test_build_dashboard_view_reflects_a_real_injected_gate_verdict PASSED
+test_build_dashboard_view_reflects_real_recorded_trades_and_signals PASSED
+test_build_dashboard_view_reflects_a_real_open_position PASSED
+test_build_dashboard_view_reports_no_candidate_plainly PASSED
+test_build_dashboard_view_reports_no_open_position_plainly PASSED
+test_build_dashboard_view_reports_no_capture_today_plainly PASSED
+test_build_dashboard_view_reports_no_real_nifty_ltp_without_kite_credentials PASSED
+test_timeline_labels_no_trade_and_fill_events_distinctly PASSED
+test_dashboard_chart_uses_the_real_incremental_update_pattern PASSED
+test_kite_chart_url_matches_the_real_documented_pattern PASSED
+test_kite_chart_url_is_none_without_real_instrument_data PASSED
+test_dashboard_and_candles_handler_defines_no_write_methods PASSED
+test_rendered_dashboard_html_offers_no_form_or_button PASSED
+test_root_and_dashboard_serve_the_same_single_page PASSED
+test_live_path_is_unchanged_by_the_dashboard_addition PASSED
+test_candles_api_returns_real_json PASSED
+test_unknown_path_still_404s PASSED
+test_dashboard_post_is_rejected PASSED
+test_paper_fill_event_includes_the_real_kite_chart_link_when_instrument_token_known PASSED
+test_paper_fill_event_omits_kite_chart_link_without_a_real_instrument_token PASSED
+20 passed in 16.12s
+```
+
+Read-only/local-network-only regression, all ten sections included:
+`test_dashboard_and_candles_handler_defines_no_write_methods` extends
+Brief 25's own structural proof (`_make_handler`'s class defines no
+`do_POST`/`do_PUT`/`do_DELETE`/`do_PATCH`) to the expanded handler
+built for this brief, and `test_dashboard_post_is_rejected` proves it
+end-to-end with a real HTTP POST against a real running server, getting
+back a real 501. `build_live_status_server` still binds `0.0.0.0` only
+— no port forwarding, no tunnel, no cloud hosting added anywhere.
+
+### Part B: real Kite web chart link in trade notifications
+
+`kite_chart_url(exchange, tradingsymbol, instrument_token)` builds the
+real, documented pattern:
+
+```
+https://kite.zerodha.com/chart/ext/tvc/{exchange}/{tradingsymbol}/{instrument_token}
+```
+
+using the real, already-known `NFO` exchange, `state.thesis.symbol`,
+and `state.context["selected_option"].quote.instrument.instrument_
+token` at the exact real PAPER_FILL moment in `agents/orchestrator.py::
+_on_risk_decision`. Returns `None` (never a fabricated URL) when the
+real instrument token isn't known — proven by a real end-to-end
+orchestrator test that runs a full real trading cycle:
+
+```
+$ python -m pytest tests/test_v2_system.py -k kite_chart_link -v
+test_paper_fill_event_includes_the_real_kite_chart_link_when_instrument_token_known PASSED
+test_paper_fill_event_omits_kite_chart_link_without_a_real_instrument_token PASSED
+2 passed
+```
+
+Sample real URL for a real sample instrument (matches the documented
+pattern exactly, per `test_kite_chart_url_matches_the_real_documented_
+pattern`):
+
+```
+>>> kite_chart_url("NFO", "NIFTY26SEPFUT", 17512194)
+'https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY26SEPFUT/17512194'
+```
+
+The link is included **alongside** the existing dashboard link in the
+real Discord/Telegram entry notification, both clearly labeled. This
+required a small, deliberate addition to `integrations/discord.py` and
+`integrations/telegram.py::send_event` (a `_links_line` helper, PAPER_
+FILL-only, a no-op for every other event type) because the existing
+generic formatting is a raw JSON dump of `output_summary` — technically
+correct but not "clearly labeled" the way the brief asked for:
+
+```
+$ python -m pytest tests/test_discord_routing.py tests/test_telegram_notifications.py -k links -v
+test_paper_fill_notification_clearly_labels_both_real_links PASSED (discord)
+test_non_paper_fill_events_never_get_a_links_line PASSED (discord)
+test_paper_fill_notification_clearly_labels_both_real_links PASSED (telegram)
+test_non_paper_fill_events_never_get_a_links_line PASSED (telegram)
+4 passed
+```
+
+Real rendered notification text now reads (example):
+
+```
+Our dashboard: http://192.168.1.10:8765/live | Kite chart: https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY24CE/17512194
+```
+
+**Iframe embedding — tested and rejected, not assumed.** A real, live
+HTTP GET to `https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY26SEPFUT/
+17512194` was made earlier this session and returned real headers:
+
+```
+status: 200
+X-Frame-Options: SAMEORIGIN
+Content-Security-Policy: frame-ancestors 'self' https://*.zerodha.com https://microapps.google.com/;
+```
+
+This **definitively blocks** embedding Kite's chart in an iframe on
+this (or any non-Zerodha) origin. Per the brief's own instruction, no
+broken/blank embed was built — the Kite chart is only ever offered as a
+plain, clickable external link that opens in the viewer's own browser
+tab.
+
+**Real limitation, stated plainly:** that link only works if the
+person's own browser already has an active `kite.zerodha.com` login
+session. This is entirely separate from, and outside the control of,
+the bot's own Kite API access token — the bot's token authenticates
+API calls; it has no bearing on whether a human's browser is logged
+into the Kite web app.
+
+### Full regression + final state
+
+```
+$ pytest -q
+464 passed in 109.64s
+
+$ ruff check .
+All checks passed!
+```
+
+464 real tests passing (up from 440 after Brief 27), 24 new across
+`tests/test_dashboard.py` (new file, 18 tests), `tests/test_v2_system.py`
+(+2), `tests/test_discord_routing.py` (+2), and the new `tests/
+test_telegram_notifications.py` (+2). No existing test was modified to
+make it pass — all 29 pre-existing `test_live_status_server.py` tests
+and all pre-existing orchestrator/notification tests pass completely
+unchanged.
+
+This closes out the engagement's final brief. Paper-only throughout;
+no real money at risk; no new decision logic, no new AI authority, no
+new EV gate, no strategy changes anywhere in this brief — only a real,
+honest window into a system that was already making its own real
+decisions.

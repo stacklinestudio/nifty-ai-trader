@@ -6,10 +6,27 @@ from collections.abc import Callable
 
 import requests
 
-from events.contracts import Event
+from events.contracts import Event, EventType
 from monitoring.logger import configure_logger
 
 logger = configure_logger(__name__)
+
+
+def _links_line(event: Event) -> str:
+    """Mirrors integrations/discord.py::_links_line -- same real
+    dashboard/Kite chart URLs, same clearly-labeled extra line, PAPER_FILL
+    only, a no-op for every other event type or when neither link is
+    present."""
+    if event.event_type != EventType.PAPER_FILL:
+        return ""
+    dashboard_link = event.output_summary.get("live_status_url")
+    kite_link = event.output_summary.get("kite_chart_url")
+    parts = []
+    if dashboard_link:
+        parts.append(f"Our dashboard: {dashboard_link}")
+    if kite_link:
+        parts.append(f"Kite chart: {kite_link}")
+    return ("\n" + " | ".join(parts)) if parts else ""
 
 
 class TelegramNotifier:
@@ -26,6 +43,7 @@ class TelegramNotifier:
         """
         title = event.event_type.value.replace("_", " ").title()
         description = json.dumps(event.output_summary, default=str) or "(no details)"
+        description += _links_line(event)
         return self.send_message("INFO", f"{title}\n{description}")
 
     def send_message(self, severity: str, message: str) -> bool:

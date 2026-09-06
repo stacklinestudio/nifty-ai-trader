@@ -1,0 +1,345 @@
+"""Final Brief, Part A: the one-page Command Center dashboard.
+
+Every test below feeds `build_dashboard_view`/`render_dashboard` real,
+explicitly-constructed data (a real tmp_path SQLite Database, real
+MemoryStore trade records, a real injected GateReport) -- never a live
+network call. `check_kite_connection`/`check_notifications` inside a
+real `run_system_health_gate` call are exercised via dependency
+injection (`gate=` / `kite_factory=`) exactly like Brief 23's own tests,
+so these tests never hit the real Kite API or send a real Discord/
+Telegram message.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta
+
+import pytest
+
+from config import IST, Settings
+from events.contracts import Event, EventType
+from learning.memory import MemoryStore
+from monitoring.live_status_server import (
+    build_dashboard_view,
+    build_live_status_server,
+    kite_chart_url,
+    render_dashboard,
+)
+from monitoring.system_health_gate import OK, GateCheck, GateReport
+from storage.database import Database
+
+
+def _ready_gate() -> GateReport:
+    names = (
+        "kite_connection",
+        "ai_provider",
+        "option_tick_capture",
+        "instrument_archive",
+        "data_completeness",
+        "notifications",
+        "risk_and_broker",
+    )
+    return GateReport("READY", tuple(GateCheck(n, OK, f"real {n} detail") for n in names))
+
+
+def _blocked_gate() -> GateReport:
+    checks = list(_ready_gate().checks)
+    checks[0] = GateCheck("kite_connection", "FAIL", "real session invalid: TokenException")
+    return GateReport("BLOCKED", tuple(checks))
+
+
+# --- section-by-section: real injected data, no drift --------------------
+
+
+def test_build_dashboard_view_reflects_a_real_injected_gate_verdict(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_blocked_gate(), today=date(2026, 9, 6))
+
+    assert view["gate"].verdict == "BLOCKED"
+    html = render_dashboard(view)
+    assert "BLOCKED" in html
+    assert "TokenException" in html
+
+
+def test_build_dashboard_view_reflects_real_recorded_trades_and_signals(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    today = datetime(2026, 9, 6, 10, 0, tzinfo=IST)
+
+    database.save_event(
+        Event(EventType.SIGNAL_CREATED, "signal_engine", today, output_summary={}, confidence=80.0)
+    )
+    from storage.models import SignalRecord
+
+    database.save_signal(
+        SignalRecord(
+            timestamp=today,
+            direction="CALL",
+            confidence=82.0,
+            features={
+                "setup_type": "MOMENTUM_CONTINUATION",
+                "direction": "CALL",
+                "regime": "TREND",
+                "confidence": 82.0,
+                "technical_score": 75.0,
+                "opening_score": 60.0,
+                "volume_score": 40.0,
+                "option_score": 0.0,
+                "global_score": 0.0,
+                "news_score": 0.0,
+                "risk_penalty": 0.0,
+            },
+        )
+    )
+    memory = MemoryStore(settings.database_path)
+    memory.append("trade", {"pnl": 450.0, "order_id": "o1"}, today)
+    memory.append("trade", {"pnl": -120.0, "order_id": "o2"}, today)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=today.date())
+
+    assert view["latest_signal"]["setup_type"] == "MOMENTUM_CONTINUATION"
+    assert view["latest_signal"]["technical_score"] == 75.0
+    assert view["realized_pnl_today"] == pytest.approx(330.0)
+    assert view["trades_today_count"] == 2
+
+    html = render_dashboard(view)
+    assert "MOMENTUM_CONTINUATION" in html
+    assert "330.00" in html or "+330.00" in html
+
+
+def test_build_dashboard_view_reflects_a_real_open_position(tmp_path):
+    from agents.contracts import TradeCandidate, TradeThesis
+    from execution.position_persistence import position_state_to_dict
+    from execution.position_supervisor import PositionState
+
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    candidate = TradeCandidate(
+        direction="CALL", setup_type="MOMENTUM_CONTINUATION", underlying="NIFTY", confidence=80.0,
+        evidence=("e",), invalidations=(), entry_zone=(99.5, 100.5), stop_zone=(94.5, 95.5),
+        target_zone=(114.5, 115.5),
+    )
+    thesis = TradeThesis(candidate, "NIFTY26SEP24000CE", 100.0, 95.0, 115.0, 65, 325.0, 80.0, ("e",), ())
+    opened_at = datetime.now(IST)
+    state = PositionState.opening(thesis, opened_at, entry_order_id="order-1")
+    state.observe(108.0, opened_at + timedelta(minutes=5), 0.15)
+    database.save_open_position("order-1", opened_at.isoformat(), position_state_to_dict(state))
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=opened_at.date())
+
+    assert view["position"]["open"] is True
+    assert view["position"]["symbol"] == "NIFTY26SEP24000CE"
+    html = render_dashboard(view)
+    assert "+520.00" in html  # (108-100)*65 unrealized, from the real open position's P&L card
+
+
+# --- honest "not yet" states, tested explicitly, not just happy path -----
+
+
+def test_build_dashboard_view_reports_no_candidate_plainly(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+
+    assert view["latest_signal"] is None
+    assert view["ev_estimate"] is None
+    html = render_dashboard(view)
+    assert "No candidate evaluated yet today" in html
+
+
+def test_build_dashboard_view_reports_no_open_position_plainly(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+
+    assert view["position"] == {"open": False}
+
+
+def test_build_dashboard_view_reports_no_capture_today_plainly(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    gate = _ready_gate()
+    checks = list(gate.checks)
+    checks[2] = GateCheck("option_tick_capture", "FAIL", "no real capture segment found for 2026-09-06")
+    gate = GateReport("BLOCKED", tuple(checks))
+
+    view = build_dashboard_view(settings, database, gate=gate, today=date(2026, 9, 6))
+
+    html = render_dashboard(view)
+    assert "no real capture segment found" in html
+
+
+def test_build_dashboard_view_reports_no_real_nifty_ltp_without_kite_credentials(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")  # no KITE_API_KEY/ACCESS_TOKEN set in env
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+
+    assert view["nifty_ltp"]["ltp"] is None
+    html = render_dashboard(view)
+    assert "no real LTP available" in html
+
+
+# --- NO_TRADE / rejected entries never conflated with real fills --------
+
+
+def test_timeline_labels_no_trade_and_fill_events_distinctly(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    now = datetime.now(IST)
+    database.save_event(Event(EventType.RISK_REJECTED, "risk_manager", now, output_summary={"reason": "daily loss cap"}))
+    database.save_event(Event(EventType.PAPER_FILL, "paper_broker", now + timedelta(seconds=1), output_summary={"order_id": "o1"}))
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
+    html = render_dashboard(view)
+
+    assert html.count("NO TRADE") == 1
+    assert html.count("REAL FILL/EXIT") == 1
+    # Each real event's own row must carry its own correct badge -- never
+    # the other event's badge, and never both badges on one row (events
+    # are DESC by timestamp, so PAPER_FILL's row renders before
+    # RISK_REJECTED's).
+    rows = html.split('class="event-row"')[1:]
+    assert len(rows) == 2
+    fill_row, rejected_row = rows
+    assert "PAPER_FILL" in fill_row and "REAL FILL/EXIT" in fill_row and "NO TRADE" not in fill_row
+    assert "RISK_REJECTED" in rejected_row and "NO TRADE" in rejected_row and "REAL FILL/EXIT" not in rejected_row
+
+
+# --- chart: real incremental-update pattern, not full setData() on poll --
+
+
+def test_dashboard_chart_uses_the_real_incremental_update_pattern(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert "series.setData(initial)" in html  # one-time seed
+    assert "series.update(last)" in html  # real incremental live-update call
+    # The live poll path must call update(), not setData() again.
+    poll_body = html.split("function poll()")[1].split("setInterval(poll")[0]
+    assert "setData" not in poll_body
+    assert "series.update(last)" in poll_body
+
+
+# --- kite chart URL -------------------------------------------------------
+
+
+def test_kite_chart_url_matches_the_real_documented_pattern():
+    url = kite_chart_url("NFO", "NIFTY26SEPFUT", 17512194)
+    assert url == "https://kite.zerodha.com/chart/ext/tvc/NFO/NIFTY26SEPFUT/17512194"
+
+
+def test_kite_chart_url_is_none_without_real_instrument_data():
+    assert kite_chart_url("NFO", "", None) is None
+    assert kite_chart_url("NFO", "NIFTY26SEPFUT", None) is None
+
+
+# --- full regression: still no write handler anywhere on the page -------
+
+
+def test_dashboard_and_candles_handler_defines_no_write_methods():
+    from monitoring.live_status_server import _make_handler
+
+    handler_class = _make_handler(database=None, settings=None)
+    for method in ("do_POST", "do_PUT", "do_DELETE", "do_PATCH"):
+        assert method not in handler_class.__dict__
+
+
+def test_rendered_dashboard_html_offers_no_form_or_button(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    assert "<form" not in html.lower()
+    assert "<button" not in html.lower()
+
+
+# --- real end-to-end: one page, not a multi-page app ---------------------
+
+
+@pytest.fixture
+def dashboard_server(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    server = build_live_status_server(database, settings, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _fetch(server, path: str) -> tuple[int, bytes]:
+    port = server.server_address[1]
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+
+
+def test_root_and_dashboard_serve_the_same_single_page(dashboard_server):
+    status_root, body_root = _fetch(dashboard_server, "/")
+    status_dash, body_dash = _fetch(dashboard_server, "/dashboard")
+
+    assert status_root == 200
+    assert status_dash == 200
+    assert b"NIFTY AI Trader" in body_root
+    assert b"Command Center" in body_root
+    assert body_root == body_dash  # literally one page, served identically at both paths
+
+
+def test_live_path_is_unchanged_by_the_dashboard_addition(dashboard_server):
+    status, body = _fetch(dashboard_server, "/live")
+
+    assert status == 200
+    assert b"Live Position" in body
+    assert b"Command Center" not in body  # /live stays the pre-existing, separate real position page
+
+
+def test_candles_api_returns_real_json(dashboard_server):
+    status, body = _fetch(dashboard_server, "/api/candles")
+
+    assert status == 200
+    data = json.loads(body)
+    assert isinstance(data, list)
+
+
+def test_unknown_path_still_404s(dashboard_server):
+    status, _ = _fetch(dashboard_server, "/nonexistent")
+    assert status == 404
+
+
+def test_dashboard_post_is_rejected(dashboard_server):
+    port = dashboard_server.server_address[1]
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/dashboard", data=b"{}", method="POST")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(request, timeout=5)
+    assert exc_info.value.code == 501

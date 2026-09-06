@@ -41,7 +41,7 @@ from integrations.discord import DiscordNotifier, webhooks_by_category_from_sett
 from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
-from monitoring.live_status_server import live_status_url
+from monitoring.live_status_server import kite_chart_url, live_status_url
 from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
@@ -423,19 +423,36 @@ class Orchestrator:
             self._event(
                 EventType.PAPER_ORDER_SENT, {"order_id": order["order_id"]}, 100, execution.agent
             )
+            selected_option = state.context.get("selected_option")
+            instrument_token = (
+                selected_option.quote.instrument.instrument_token if selected_option else None
+            )
+            paper_fill_summary = {
+                "order_id": order["order_id"],
+                "fill_price": order["fill_price"],
+                # Brief 25: a real link to the local, read-only live
+                # position status page -- the real machine's local
+                # network address (never a public URL), so it only
+                # resolves for a device already on the same real
+                # local network. real_local_ip() itself never raises
+                # (falls back to 127.0.0.1 on any real socket error).
+                "live_status_url": live_status_url(self.settings),
+            }
+            # Final Brief Part B: the real Kite web chart for this exact
+            # traded contract -- NFO is the real, only exchange option
+            # contracts trade on in this project. None (never a
+            # fabricated URL) when `selected_option`/its real
+            # instrument_token isn't available -- e.g. the demo/backtest
+            # paths, which never populate context["selected_option"].
+            # Requires the person's OWN browser to already have an
+            # active kite.zerodha.com login session, entirely separate
+            # from and outside the bot's own API access token.
+            chart_url = kite_chart_url("NFO", state.thesis.symbol, instrument_token)
+            if chart_url:
+                paper_fill_summary["kite_chart_url"] = chart_url
             self._event(
                 EventType.PAPER_FILL,
-                {
-                    "order_id": order["order_id"],
-                    "fill_price": order["fill_price"],
-                    # Brief 25: a real link to the local, read-only live
-                    # position status page -- the real machine's local
-                    # network address (never a public URL), so it only
-                    # resolves for a device already on the same real
-                    # local network. real_local_ip() itself never raises
-                    # (falls back to 127.0.0.1 on any real socket error).
-                    "live_status_url": live_status_url(self.settings),
-                },
+                paper_fill_summary,
                 100,
                 execution.agent,
             )

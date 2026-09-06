@@ -45,6 +45,7 @@ from monitoring.health import check_health, system_health
 from monitoring.live_status_server import (
     build_live_status_server,
     build_mock_demo_position,
+    dashboard_url,
     live_status_url,
     run_live_status_server_in_background,
 )
@@ -244,7 +245,7 @@ def run_scheduled_day(settings: Settings) -> dict:
     # A real bind failure (e.g. the configured port already in use) must
     # never prevent the real trading day from starting.
     try:
-        run_live_status_server_in_background(Database(settings.database_path), settings.live_status_port)
+        run_live_status_server_in_background(Database(settings.database_path), settings, settings.live_status_port)
     except OSError as exc:
         logger.warning("live_status_server_start_failed error=%s", exc)
     orchestrator = Orchestrator(settings, database)
@@ -723,8 +724,9 @@ def main() -> int:
         database.initialize()
         url = live_status_url(settings)
         print(f"Live position status page: {url}")
+        print(f"Command Center dashboard: {dashboard_url(settings)}")
         print("Local network only -- never exposed beyond it. Ctrl+C to stop.")
-        server = build_live_status_server(database, settings.live_status_port)
+        server = build_live_status_server(database, settings, settings.live_status_port)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -755,7 +757,7 @@ def main() -> int:
             "the server below is what keeps the link above alive. Press Ctrl+C to stop "
             "(the demo state stays in the database until then, or until a real trade opens)."
         )
-        server = build_live_status_server(database, settings.live_status_port)
+        server = build_live_status_server(database, settings, settings.live_status_port)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

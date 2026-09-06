@@ -49,6 +49,25 @@ CATEGORIES = (
 )
 
 
+def _links_line(event: Event) -> str:
+    """Final Brief Part B: PAPER_FILL's output_summary already carries the
+    real dashboard/Kite chart URLs as plain dict values (readable, but
+    buried inside the JSON blob above); this appends one clearly labeled
+    extra line so a real person opening the notification doesn't have to
+    parse JSON to find them. A no-op string for every other event type,
+    or when neither real link is present on this one."""
+    if event.event_type != EventType.PAPER_FILL:
+        return ""
+    dashboard_link = event.output_summary.get("live_status_url")
+    kite_link = event.output_summary.get("kite_chart_url")
+    parts = []
+    if dashboard_link:
+        parts.append(f"Our dashboard: {dashboard_link}")
+    if kite_link:
+        parts.append(f"Kite chart: {kite_link}")
+    return ("\n" + " | ".join(parts)) if parts else ""
+
+
 class DiscordNotifier:
     """Routes to one of 6 category webhooks when configured
     (webhooks_by_category), falling back to a single webhook_url per
@@ -115,6 +134,7 @@ class DiscordNotifier:
         category = CATEGORY_BY_EVENT_TYPE.get(event.event_type, "system")
         title = event.event_type.value.replace("_", " ").title()
         description = json.dumps(event.output_summary, default=str) or "(no details)"
+        description += _links_line(event)
         return self.send_embed(title, description, "INFO", category)
 
 
