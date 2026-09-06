@@ -171,18 +171,49 @@ def check_data_completeness(
 
 
 def check_notifications(settings: Settings) -> GateCheck:
-    """Real reachability -- the same real send_message() calls `python
-    main.py notifications` already makes, reused verbatim, not
-    reimplemented."""
+    """Real reachability -- the same real DiscordNotifier/TelegramNotifier
+    this project already sends every real notification through.
+
+    Real bug, found by direct inspection after a real report that this
+    check said "discord=unreachable/not configured" all session despite
+    real Discord delivery via the 6 category-specific webhooks
+    (DISCORD_WEBHOOK_TRADES etc.) working the whole time: the old code
+    called `discord.send_message(..., category=None)`, and
+    `DiscordNotifier._resolve_url` only ever consults `webhooks_by_
+    category` when a real category is actually passed in -- with
+    category=None it falls straight to the single fallback
+    `DISCORD_WEBHOOK_URL`, skipping every category-specific webhook
+    entirely. When no fallback is configured (this project's own
+    deliberate choice, since only category webhooks are set), that
+    fallback URL is empty, so the send silently no-ops and reports
+    unreachable -- even though real Discord delivery has been working
+    the entire time through the category webhooks this check never
+    actually tested.
+
+    Real fix: probe the fallback if one is configured (unchanged
+    behavior when it is); otherwise probe exactly ONE real configured
+    category webhook -- never all 6, since this check already sends a
+    real message as a side effect and must not multiply that further.
+    This matches how notifications are actually sent in practice: a
+    real message always resolves to either the fallback or a real
+    category webhook, never to nothing when either exists.
+    """
     telegram = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
-    discord = DiscordNotifier(
-        settings.discord_webhook_url, webhooks_by_category=webhooks_by_category_from_settings(settings)
-    )
+    webhooks_by_category = webhooks_by_category_from_settings(settings)
+    discord = DiscordNotifier(settings.discord_webhook_url, webhooks_by_category=webhooks_by_category)
     telegram_ok = telegram.send_message("INFO", "System Health Gate check; no trade.")
-    discord_ok = discord.send_message("INFO", "System Health Gate check; no trade.")
+    probed_category = None if settings.discord_webhook_url else next(
+        (category for category, url in webhooks_by_category.items() if url), None
+    )
+    discord_ok = discord.send_message("INFO", "System Health Gate check; no trade.", probed_category)
+    discord_detail = (
+        f"reachable via '{probed_category}' channel"
+        if discord_ok and probed_category
+        else ("reachable" if discord_ok else "unreachable/not configured")
+    )
     detail = (
         f"telegram={'reachable' if telegram_ok else 'unreachable/not configured'}, "
-        f"discord={'reachable' if discord_ok else 'unreachable/not configured'}"
+        f"discord={discord_detail}"
     )
     return GateCheck("notifications", OK if (telegram_ok or discord_ok) else FAIL, detail)
 

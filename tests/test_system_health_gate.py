@@ -274,6 +274,91 @@ def test_check_notifications_fails_when_neither_channel_is_reachable(monkeypatch
     assert "unreachable" in result.detail
 
 
+def test_check_notifications_reports_discord_reachable_via_a_real_category_webhook_with_no_fallback(
+    monkeypatch,
+):
+    """Real bug report: this check called `discord.send_message(...,
+    category=None)`, and `DiscordNotifier._resolve_url` only ever
+    consults `webhooks_by_category` when a real category is actually
+    passed -- with category=None it falls straight to the single
+    fallback DISCORD_WEBHOOK_URL. With no fallback configured (this
+    project's own deliberate setup -- only the 6 category-specific
+    webhooks are set) that fallback is empty, so the old code silently
+    no-opped and reported "unreachable/not configured" even though real
+    Discord delivery via the category webhooks has been confirmed
+    working the whole session. This proves the real fix: the check now
+    probes a real configured category webhook when no fallback exists,
+    using the real (unmocked) DiscordNotifier so the actual URL
+    resolution logic runs, not a stand-in."""
+    calls: list[str] = []
+
+    class FakeResponse:
+        ok = True
+
+    def fake_post(url: str, **kwargs) -> FakeResponse:
+        calls.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("monitoring.system_health_gate.TelegramNotifier", _RecordingNotifier)
+    _RecordingNotifier.next_result = False  # isolates the assertion to the real discord path
+    settings = Settings(discord_webhook_url="", discord_webhook_trades="https://discord.test/trades")
+
+    result = check_notifications(settings)
+
+    assert result.status == OK
+    assert calls == ["https://discord.test/trades"]  # the real category webhook was actually probed
+    assert "discord=reachable via 'trades' channel" in result.detail
+
+
+def test_check_notifications_still_fails_with_no_fallback_and_no_category_webhook_configured(
+    monkeypatch,
+):
+    """No real webhook of any kind configured -- must still fail, never
+    fabricate a channel to probe."""
+
+    def fake_post(url: str, **kwargs):
+        raise AssertionError("must never send a real request with no real webhook configured")
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("monitoring.system_health_gate.TelegramNotifier", _RecordingNotifier)
+    _RecordingNotifier.next_result = False
+    settings = Settings(discord_webhook_url="")
+
+    result = check_notifications(settings)
+
+    assert result.status == FAIL
+    assert "discord=unreachable/not configured" in result.detail
+
+
+def test_check_notifications_still_uses_the_fallback_when_one_is_configured(monkeypatch):
+    """Unchanged behavior when a real fallback DISCORD_WEBHOOK_URL IS
+    configured -- the fix must not stop testing the fallback."""
+    calls: list[str] = []
+
+    class FakeResponse:
+        ok = True
+
+    def fake_post(url: str, **kwargs) -> FakeResponse:
+        calls.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("monitoring.system_health_gate.TelegramNotifier", _RecordingNotifier)
+    _RecordingNotifier.next_result = False
+    settings = Settings(
+        discord_webhook_url="https://discord.test/fallback",
+        discord_webhook_trades="https://discord.test/trades",
+    )
+
+    result = check_notifications(settings)
+
+    assert result.status == OK
+    assert calls == ["https://discord.test/fallback"]
+    assert "discord=reachable" in result.detail
+    assert "via 'trades'" not in result.detail
+
+
 # --- Risk engine / paper broker construction --------------------------------
 
 

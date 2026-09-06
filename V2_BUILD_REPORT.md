@@ -6985,3 +6985,113 @@ server.py` (now 31, all pre-existing ones unchanged); the two existing
 kite-chart-link tests in `tests/test_v2_system.py` were extended
 in-place to also assert the new `dashboard_url` field, since they
 already covered the exact real event this field was added to.
+
+## Bug report: System Health Gate's "notifications" check falsely reported Discord unreachable (2026-09-06)
+
+Real report: the gate's `notifications` check said `discord=unreachable/
+not configured` all session, despite real Discord delivery confirmed
+working the whole time through the 6 category-specific webhooks
+(`DISCORD_WEBHOOK_TRADES` etc.) — this project's own deliberate setup,
+with no single fallback `DISCORD_WEBHOOK_URL` configured.
+
+### Root cause, confirmed by direct inspection
+
+`check_notifications` called `discord.send_message("INFO", "...")` with
+no `category` argument. `DiscordNotifier._resolve_url`:
+
+```python
+def _resolve_url(self, category):
+    if category:
+        configured = self.webhooks_by_category.get(category)
+        if configured:
+            return configured
+    return self.webhook_url
+```
+
+only ever consults `webhooks_by_category` when a real category is
+actually passed. With `category=None`, it falls straight through to
+the single fallback `self.webhook_url` — which is the empty string in
+this project's real, deliberate configuration (category webhooks only,
+no fallback). `send_embed` sees `if not url: return False` and returns
+immediately, without a real network attempt of any kind, against any
+of the 6 real, working category webhooks. **Confirmed: yes, the check
+was only ever testing the single fallback variable**, exactly as
+suspected, and reporting an empty fallback as "not configured" even
+though real, working category webhooks existed the entire time.
+
+### The real fix
+
+`check_notifications` now probes the fallback if one is configured
+(unchanged behavior in that case); otherwise it probes exactly **one**
+real, configured category webhook — never all 6, since this check
+already sends a real message as a side effect (throttled to once per
+30s by the Final Brief's dashboard cache) and must not multiply that
+further. This matches how a real notification actually resolves in
+practice: to the fallback if set, else to whichever real category
+webhook is configured for that message — never to nothing when either
+exists.
+
+```python
+probed_category = None if settings.discord_webhook_url else next(
+    (category for category, url in webhooks_by_category.items() if url), None
+)
+discord_ok = discord.send_message("INFO", "...", probed_category)
+```
+
+The detail string now names which real channel was probed (e.g.
+`discord=reachable via 'trades' channel`) instead of a bare
+reachable/unreachable, so a future reader can see exactly which real
+webhook the gate actually tested.
+
+### Real proof
+
+A direct, unmocked reproduction of the exact reported scenario (no
+fallback, category webhooks configured) shows the fix now makes a real
+network attempt against the category webhook instead of an instant,
+silent no-op:
+
+```
+$ python -c "... check_notifications(Settings(discord_webhook_url='', discord_webhook_trades='https://discord.com/api/webhooks/FAKE/TRADES')) ..."
+GateCheck(name='notifications', status='FAIL', detail='telegram=unreachable/not configured, discord=unreachable/not configured')
+elapsed seconds (nonzero => a real network attempt against the category webhook was actually made, with real retry backoff): 2.17
+```
+
+(FAIL here is correct and expected — the URL above is a fake
+placeholder, not a real webhook; the ~2.2s elapsed time with real retry
+backoff is the proof that a genuine attempt was made against the
+category webhook this time, rather than returning instantly because
+the fallback was empty.)
+
+Three new tests, using the real, unmocked `DiscordNotifier` with only
+its underlying `requests.post` transport faked (so the actual URL
+resolution logic runs for real):
+
+```
+$ python -m pytest tests/test_system_health_gate.py -k "check_notifications" -v
+test_check_notifications_ok_when_at_least_one_channel_is_reachable PASSED
+test_check_notifications_fails_when_neither_channel_is_reachable PASSED
+test_check_notifications_reports_discord_reachable_via_a_real_category_webhook_with_no_fallback PASSED
+test_check_notifications_still_fails_with_no_fallback_and_no_category_webhook_configured PASSED
+test_check_notifications_still_uses_the_fallback_when_one_is_configured PASSED
+5 passed
+```
+
+`test_check_notifications_reports_discord_reachable_via_a_real_
+category_webhook_with_no_fallback` is the one directly proving the
+fix: with `discord_webhook_url=""` and only `discord_webhook_trades`
+set, the check now reports `OK` and the real `requests.post` call was
+made to `https://discord.test/trades` — the real category webhook, not
+a silently-skipped empty fallback. A companion test confirms the
+fallback is still used unchanged when one IS configured, and another
+confirms the check still correctly fails when no real webhook of any
+kind exists.
+
+Full regression:
+
+```
+$ pytest -q
+469 passed in 108.96s
+
+$ ruff check .
+All checks passed!
+```
