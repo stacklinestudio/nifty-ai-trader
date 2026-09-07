@@ -739,8 +739,8 @@ def test_sidebar_nav_items_carry_real_icons(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
     html = render_dashboard(view)
 
-    assert html.count('class="nav-icon"') == 10  # one per real sidebar anchor (Data Foundation split out this round)
-    assert html.count("<svg") >= 10
+    assert html.count('class="nav-icon"') == 9  # one per real sidebar anchor (Notifications relocated to the topbar this round)
+    assert html.count("<svg") >= 9
 
 
 # --- kite chart URL -------------------------------------------------------
@@ -846,14 +846,14 @@ def test_static_fonts_route_rejects_unknown_filenames(dashboard_server):
 
 
 def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server):
-    """Item 1: the sidebar's 10 links (Overview/Market/Intelligence/
-    Candidate/Position/Health/Data Foundation/Option Capture/
-    Notifications/Events -- Data Foundation split out from the combined
-    Data Capture card this round, see _render_data_foundation_section)
-    are real scroll-anchors into THIS one page (plain `#id` hrefs),
-    never separate routes. Confirms every real `href="#..."` in the
-    sidebar has a real matching `id="..."` element somewhere on the
-    same real page -- not a decorative link that goes nowhere."""
+    """Item 1: the sidebar's 9 links (Overview/Market/Intelligence/
+    Candidate/Position/Health/Data Foundation/Option Capture/Events --
+    Notifications relocated to a real, on-demand topbar popover this
+    round, no longer a sidebar-linked section, see _render_topbar) are
+    real scroll-anchors into THIS one page (plain `#id` hrefs), never
+    separate routes. Confirms every real `href="#..."` in the sidebar
+    has a real matching `id="..."` element somewhere on the same real
+    page -- not a decorative link that goes nowhere."""
     status, body = _fetch(dashboard_server, "/dashboard")
     html = body.decode("utf-8")
     assert status == 200
@@ -863,7 +863,7 @@ def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server
     nav_html = html[nav_start:nav_end]
     anchors = re.findall(r'href="#([a-z-]+)"', nav_html)
 
-    assert len(anchors) == 10
+    assert len(anchors) == 9
     for anchor in anchors:
         assert f'id="{anchor}"' in html, f"sidebar links to #{anchor} but no element has id=\"{anchor}\""
 
@@ -871,7 +871,7 @@ def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server
 def test_sidebar_has_three_real_nav_groups(dashboard_server):
     """UI redesign v2: the sidebar visually groups Overview/Market/
     Intelligence under "Command", Candidate/Position/Events under
-    "Trading", and System Health/Data Capture/Notifications under
+    "Trading", and System Health/Data Foundation/Option Capture under
     "Operations" -- all three group labels are plain non-link `<li>`
     items inside the SAME one `side-nav` list (not separate lists), so
     the real anchor-count/structural guarantees the other sidebar
@@ -883,6 +883,57 @@ def test_sidebar_has_three_real_nav_groups(dashboard_server):
     assert ">Command<" in html
     assert ">Trading<" in html
     assert ">Operations<" in html
+
+
+def test_notifications_popover_preserves_the_real_check_data_no_standalone_card_left(tmp_path):
+    """Consolidation pass: the old always-visible "Notifications" card
+    is gone entirely -- this real check's data (status + detail) now
+    lives only in the topbar's on-demand popover (a real <details>
+    element, id="notifications"). Confirms nothing was lost: the exact
+    same real detail string appears once, in the popover, and the old
+    standalone card structure no longer exists anywhere on the page."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    checks = list(_ready_gate().checks)
+    checks[5] = GateCheck(
+        "notifications", "OK", "telegram=reachable, discord=reachable/system"
+    )
+    gate = GateReport("READY", tuple(checks))
+
+    view = build_dashboard_view(settings, database, gate=gate, today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    # The old standalone card is gone -- not just visually hidden.
+    assert '<section class="card" id="notifications">' not in html
+    assert "<h2>" not in html.split('id="notifications"')[1].split("</details>")[0]
+
+    # A real, on-demand <details> popover exists instead, in the topbar.
+    assert '<details class="topbar-item topbar-popover" id="notifications">' in html
+    popover_start = html.index('id="notifications"')
+    popover_html = html[popover_start : popover_start + 600]
+    assert "</details>" in popover_html
+    assert "dot-ok" in popover_html  # real OK status -> real OK dot color
+    assert "telegram=reachable, discord=reachable/system" in popover_html
+
+
+def test_notifications_popover_shows_a_real_fail_dot_when_the_real_check_fails(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    checks = list(_ready_gate().checks)
+    checks[5] = GateCheck(
+        "notifications", "FAIL", "telegram=unreachable/not configured, discord=unreachable/not configured"
+    )
+    gate = GateReport("READY", tuple(checks))
+
+    view = build_dashboard_view(settings, database, gate=gate, today=date(2026, 9, 6))
+    html = render_dashboard(view)
+
+    popover_start = html.index('id="notifications"')
+    popover_html = html[popover_start : popover_start + 600]
+    assert "dot-fail" in popover_html
+    assert "telegram=unreachable/not configured, discord=unreachable/not configured" in popover_html
 
 
 def test_health_highlights_show_kite_ai_and_tick_capture_with_real_detail(tmp_path):

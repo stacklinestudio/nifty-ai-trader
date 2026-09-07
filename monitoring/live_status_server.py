@@ -1230,28 +1230,57 @@ def _render_capture_metrics(capture: Any) -> str:
 
 
 def _render_data_foundation_section(view: dict[str, Any]) -> str:
-    """This round's brief, Section 12: Data Foundation split out into
-    its own visually distinct card -- real instrument archive validity
-    (a real gate check, never recomputed), the real RAW->NORMALIZED->
-    VALIDATED->RESEARCH layering (a permanent architectural guarantee,
-    Brief 20), plus two static, honest facts about this project's own
-    current real limitations. Was combined with Option Capture in one
-    card in a prior round; split here so each has its own real
-    hierarchy per the brief's own "distinct but related cards"
-    instruction -- same two real gate checks, same real facts, no new
-    data, no new computation."""
+    """Restyled to visually match AI Pipeline's own connected-node +
+    detail-list presentation (`_render_intelligence_section`) instead of
+    the plain check-row/foundation-fact look -- same real node/connector
+    CSS classes, same `.pipeline`/`.stage` detail-row typography. Purely
+    a visual change: the real instrument archive validity (a real gate
+    check, never recomputed), the real RAW->NORMALIZED->VALIDATED->
+    RESEARCH layering (a permanent architectural guarantee, Brief 20),
+    and the same two honest facts about this project's own current real
+    limitations are all still here, same real data, no new computation
+    -- only how they're drawn changed."""
     archive = _gate_check(view["gate"], "instrument_archive")
-    _static_node = '<div class="node node-static"><span class="node-dot"></span><span class="node-label">{}</span></div>'
+
+    def _static_node(label: str) -> str:
+        return (
+            f'<div class="node node-static"><span class="node-dot"></span>'
+            f'<span class="node-label">{label}</span><span class="node-state">ACTIVE</span></div>'
+        )
+
     _static_connector = '<div class="node-connector node-connector-static"></div>'
-    raw_flow = _static_connector.join(_static_node.format(label) for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"))
+    raw_flow = _static_connector.join(_static_node(label) for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"))
+
+    if archive is None:
+        archive_stage = '<div class="stage"><span class="stage-label">Instrument archive</span><span class="not-yet">NOT RUN</span></div>'
+    elif archive.status == "OK":
+        archive_stage = (
+            '<div class="stage stage-done"><span class="stage-label">Instrument archive</span>'
+            f'<span class="stage-value">{_esc(archive.detail)}</span></div>'
+        )
+    else:
+        archive_stage = (
+            '<div class="stage"><span class="stage-label">Instrument archive</span>'
+            f'<span class="stage-value loss">{_esc(archive.detail)}</span></div>'
+        )
+    integrity_stage = (
+        '<div class="stage stage-done"><span class="stage-label">Raw data integrity</span>'
+        '<span class="stage-value">Permanent guarantee &mdash; real Kite ticks never modified in place</span></div>'
+    )
+    pnl_stage = (
+        '<div class="stage"><span class="stage-label">Historical option P&amp;L reconstruction</span>'
+        '<span class="not-yet">NOT AVAILABLE YET</span></div>'
+    )
+    calib_stage = (
+        '<div class="stage"><span class="stage-label">Real trade calibration sample</span>'
+        '<span class="not-yet">0 REAL TRADES</span></div>'
+    )
+
     return f"""
 <section class="card" id="data-foundation">
 <h2>{_NAV_ICONS['data-foundation']}Data Foundation</h2>
-{_check_row(archive)}
-<p class="label" style="margin-top: var(--sp-4);">Raw data integrity &mdash; a permanent architectural guarantee, not a live check: real Kite ticks are never modified in place.</p>
 <div class="node-flow node-flow-compact">{raw_flow}</div>
-<div class="foundation-fact"><span class="dot dot-unknown"></span>Historical option P&amp;L reconstruction: <span class="not-yet">NOT AVAILABLE YET</span></div>
-<div class="foundation-fact"><span class="dot dot-unknown"></span>Real trade calibration sample: <span class="not-yet">0 REAL TRADES</span></div>
+<div class="pipeline">{archive_stage}{integrity_stage}{pnl_stage}{calib_stage}</div>
 </section>
 """
 
@@ -1273,14 +1302,10 @@ def _render_capture_section(view: dict[str, Any]) -> str:
 """
 
 
-def _render_notifications_section(view: dict[str, Any]) -> str:
-    check = view["notifications_status"]
-    return f"""
-<section class="card" id="notifications">
-<h2>{_NAV_ICONS['notifications']}Notifications</h2>
-{_check_row(check)}
-</section>
-"""
+# _render_notifications_section (the old, always-visible standalone
+# "Notifications" card) has been removed -- real relocation, not a
+# deletion of real content. The same real view["notifications_status"]
+# check now renders inside _render_topbar's own on-demand popover.
 
 
 _KIND_BADGE_HTML = {
@@ -1332,10 +1357,12 @@ _SIDEBAR_GROUPS = (
             ("health", "System Health"),
             ("data-foundation", "Data Foundation"),
             ("capture", "Option Capture"),
-            ("notifications", "Notifications"),
         ),
     ),
 )
+# Notifications is no longer a standalone sidebar-linked section -- see
+# _render_topbar's own real, on-demand popover (id="notifications" on
+# a <details> element in the topbar, not a scroll target).
 
 # Simple, single-color (currentColor) 16x16 stroke icons -- inline SVG,
 # zero external requests, zero new dependencies. Purely decorative
@@ -1489,6 +1516,17 @@ def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetim
     risk_pct = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
     risk_html = f"{risk_pct:.0f}%" if loss_cap else "NO REAL DATA YET"
 
+    # Consolidation pass: Notifications is no longer its own standalone
+    # panel -- the exact same real check (view["notifications_status"])
+    # now surfaces here instead, on demand (hover or click, via a real
+    # native <details> disclosure -- no new JS), right next to the
+    # clock. Same real data, same OK/FAIL semantic dot color, just
+    # relocated from an always-visible card to an on-demand popover.
+    notif = view["notifications_status"]
+    notif_dot = "dot-ok" if notif and notif.status == "OK" else "dot-fail"
+    notif_status_text = _esc(notif.status) if notif else "NOT RUN"
+    notif_detail_text = _esc(notif.detail) if notif else "not run"
+
     icon = _NAV_ICONS
     return f"""
 <div class="topbar">
@@ -1502,6 +1540,13 @@ def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetim
 <div class="topbar-item">{icon['intelligence']}<span class="dot {ai_dot}"></span>AI</div>
 <span id="stale-badge" class="badge badge-stale" hidden>STALE</span>
 <div class="topbar-spacer"></div>
+<details class="topbar-item topbar-popover" id="notifications">
+<summary>{icon['notifications']}<span class="dot {notif_dot}"></span></summary>
+<div class="popover-content">
+<p class="popover-title">Notifications <span class="mono">{notif_status_text}</span></p>
+<p class="popover-detail">{notif_detail_text}</p>
+</div>
+</details>
 <div class="topbar-clock">IST {now.strftime('%I:%M:%S %p')} &middot; UTC {utc_now.strftime('%H:%M:%S')}</div>
 </div>
 """
@@ -1568,17 +1613,22 @@ def render_dashboard(
     # deleted -- the brief's hierarchy is a Level-1 summary order, not
     # an instruction to remove real detail sections or their existing,
     # tested anchors.
+    # This round's brief: Current Candidate and Option Capture moved up
+    # to sit alongside P&L/Risk/Position -- one cohesive "current state"
+    # section right after System Health, rather than further down the
+    # page. Data Foundation stays in place (restyled only, not moved).
+    # Notifications is no longer a section here at all -- see
+    # _render_topbar's own real, on-demand popover.
     grid_html = "".join(
         [
             _render_health_section(gate),
             _render_kpi_row(view),
             _render_position_section(view),
+            _render_candidate_section(view),
+            _render_capture_section(view),
             _render_market_section(view),
             _render_intelligence_section(view),
-            _render_candidate_section(view),
             _render_data_foundation_section(view),
-            _render_capture_section(view),
-            _render_notifications_section(view),
             _render_events_section(view),
         ]
     )
@@ -1649,6 +1699,25 @@ h2 {{
 .topbar-item svg {{ opacity: 0.65; flex-shrink: 0; }}
 .topbar-spacer {{ flex: 1; }}
 .topbar-clock {{ color: var(--muted); flex-shrink: 0; }}
+/* Real, on-demand Notifications popover -- a native <details> element
+   (no new JS): click-to-toggle via the browser's own real disclosure
+   behavior, plus a real CSS-only :hover reveal for mouse users. Same
+   real check data _render_notifications_section used to always show;
+   just relocated and made on-demand. */
+.topbar-popover {{ position: relative; cursor: pointer; }}
+.topbar-popover summary {{ display: flex; align-items: center; gap: var(--sp-2); list-style: none; }}
+.topbar-popover summary::-webkit-details-marker {{ display: none; }}
+.topbar-popover summary::marker {{ content: ""; }}
+.topbar-popover .popover-content {{
+  display: none; position: absolute; top: calc(100% + var(--sp-2)); right: 0; z-index: 30;
+  min-width: 240px; max-width: 320px; background: var(--card-alt); border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
+  font-family: var(--font-ui); white-space: normal; text-align: left;
+}}
+.topbar-popover:hover .popover-content, .topbar-popover[open] .popover-content {{ display: block; }}
+.popover-title {{ margin: 0 0 var(--sp-2) 0; font-weight: 700; color: var(--text); display: flex; justify-content: space-between; gap: var(--sp-3); }}
+.popover-detail {{ margin: 0; color: var(--text-dim); font-size: var(--fs-sm); line-height: 1.5; }}
 @media (max-width: 560px) {{
   .topbar-brand span:last-child {{ display: none; }}
 }}
