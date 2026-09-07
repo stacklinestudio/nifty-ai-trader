@@ -37,7 +37,7 @@ import re
 import socket
 import threading
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, time
 from datetime import timezone as _dt_timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -416,6 +416,68 @@ def check_nifty_ltp(settings: Settings, kite_factory: Callable[[], object] | Non
     return {"status": "OK", "detail": f"real NIFTY LTP {ltp}", "ltp": ltp}
 
 
+# Kite's own fixed instrument_token for the NSE NIFTY 50 index -- a stable,
+# Kite-assigned value (not something this project computes), so duplicating
+# it here is safe. Not imported from execution/live_context.py's own
+# identical NIFTY_INDEX_TOKEN: that module pulls in agents.* at import
+# time, a real circular-import hazard this file already hit once (see
+# _build_pnl_position_events_view's own history). data/option_tick_
+# capture.py duplicates this same real constant for the same reason --
+# this is the third, not a new pattern.
+NIFTY_INDEX_TOKEN = 256265
+
+
+def check_live_intraday_candles(
+    settings: Settings, kite_factory: Callable[[], object] | None = None, now: datetime | None = None
+) -> list[dict[str, Any]] | None:
+    """Real, live intraday NIFTY candles for TODAY's actual session, via
+    the exact same real, already-in-production Kite REST wrapper the
+    trading pipeline itself uses for technical features
+    (`data.historical.KiteHistoricalData`, `execution/live_context.py`'s
+    own real `candles(NIFTY_INDEX_TOKEN, ...)` call) -- not a new Kite
+    integration, the same real historical_data() endpoint reused for a
+    second real read. Returns None (never a fabricated/partial chart)
+    whenever a real live fetch genuinely isn't possible right now: no
+    real Kite credentials configured, a real API/auth failure, or a
+    real empty response (e.g. before market open, or a non-trading
+    day) -- the caller falls back to the honest archived-file path in
+    exactly that case, the same fail-closed shape `check_nifty_ltp`
+    already uses for the exact same real reason."""
+    if not (settings.kite_api_key and settings.kite_access_token):
+        return None
+    if kite_factory is None:
+        try:
+            from kiteconnect import KiteConnect
+        except ImportError:
+            return None
+
+        def kite_factory() -> object:
+            kite = KiteConnect(api_key=settings.kite_api_key)
+            kite.set_access_token(settings.kite_access_token)
+            return kite
+
+    now = now or datetime.now(IST)
+    try:
+        from data.historical import KiteHistoricalData
+
+        market_open_today = datetime.combine(now.date(), time(9, 15), tzinfo=IST)
+        frame = KiteHistoricalData(kite_factory()).candles(NIFTY_INDEX_TOKEN, market_open_today, now, interval="minute")
+    except Exception:  # noqa: BLE001 - any real API/auth/data-shape failure means no real live candles right now.
+        return None
+    if frame.empty:
+        return None
+    return [
+        {
+            "time": int(index.timestamp()),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+        }
+        for index, row in frame.iterrows()
+    ]
+
+
 # --- Final brief: real, already-archived candle data ---------------------
 
 
@@ -544,9 +606,12 @@ def build_dashboard_view(
     today: date | None = None,
 ) -> dict[str, Any]:
     """Assembles every real, already-computed value the ten dashboard
-    sections need. Zero new logic -- every field here is read straight
-    from a real, already-built function/table elsewhere in this
-    project. `gate`/`kite_factory`/`today` are injectable purely for
+    sections need. Every field here is read straight from a real,
+    already-built function/table elsewhere in this project -- including
+    `candles`/`candles_live`, which reuse the trading pipeline's own
+    existing `KiteHistoricalData` Kite integration (see
+    `check_live_intraday_candles`) rather than adding a new one.
+    `gate`/`kite_factory`/`today` are injectable purely for
     deterministic tests; production callers never pass them.
 
     Calls `run_system_health_gate` at most once per invocation (never
@@ -560,12 +625,22 @@ def build_dashboard_view(
     from monitoring.system_health_gate import run_system_health_gate
     from research.expected_value import compute_ev
 
-    today = today or datetime.now(IST).date()
+    now_dt = datetime.now(IST)
+    today = today or now_dt.date()
     gate = gate or run_system_health_gate(settings, database, kite_factory=kite_factory, today=today)
     nifty_ltp = check_nifty_ltp(settings, kite_factory)
 
-    csv_path = find_latest_candle_csv()
-    candles = load_recent_candles(csv_path) if csv_path else []
+    # Real live intraday candles for today's actual session when a real
+    # Kite session exists and the real fetch succeeds; the honest
+    # archived-file fallback (unchanged) otherwise -- never a silent mix
+    # of the two, never a fabricated/partial chart. See
+    # check_live_intraday_candles' own docstring for why this is a real
+    # reuse of the trading pipeline's own existing Kite integration, not
+    # new plumbing.
+    live_candles = check_live_intraday_candles(settings, kite_factory, now=now_dt)
+    candles_live = live_candles is not None
+    csv_path = None if candles_live else find_latest_candle_csv()
+    candles = live_candles if candles_live else (load_recent_candles(csv_path) if csv_path else [])
 
     signals = database.recent_signals(limit=1000)
     todays_signals = [s for s in signals if _is_same_real_day(s.get("timestamp"), today)]
@@ -591,6 +666,7 @@ def build_dashboard_view(
         "gate": gate,
         "nifty_ltp": nifty_ltp,
         "candles": candles,
+        "candles_live": candles_live,
         "candles_source": csv_path.name if csv_path else None,
         "latest_signal": latest_signal,
         "ev_estimate": ev_estimate,
@@ -836,15 +912,23 @@ def _render_market_section(view: dict[str, Any]) -> str:
     small redundant "status card" duplicating them (item 17: avoid
     every section looking like an identical bordered rectangle); it is
     just the real chart, given real screen real estate."""
-    source_note = (
-        f"real archived candles from {_esc(view['candles_source'])}"
-        if view["candles_source"]
-        else "no real archived candle file found"
-    )
+    if view.get("candles_live"):
+        source_note = (
+            "real live intraday candles from Kite's own historical_data() -- today's actual "
+            "session, refreshed on every poll"
+        )
+    elif view["candles_source"]:
+        source_note = (
+            f"real archived candles from {_esc(view['candles_source'])} -- real, already-archived "
+            "minute bars, not a live intraday feed (no real Kite session available right now). "
+            "Refreshed from disk on every poll"
+        )
+    else:
+        source_note = "no real archived candle file found, and no real Kite session available right now"
     return f"""
 <section class="card card-wide chart-card" id="market">
 <h2>{_NAV_ICONS['market']}NIFTY Price</h2>
-<p class="label">{source_note} &mdash; real, already-archived minute bars, not a live intraday tick feed. Refreshed from disk on every poll.</p>
+<p class="label">{source_note}.</p>
 <div id="chart-container" style="height:560px;"></div>
 </section>
 """

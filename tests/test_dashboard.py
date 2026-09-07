@@ -26,10 +26,12 @@ from events.contracts import Event, EventType
 from learning.memory import MemoryStore
 from monitoring.live_status_server import (
     LIVE_STATE_API_PATH,
+    NIFTY_INDEX_TOKEN,
     _build_pnl_position_events_view,
     build_dashboard_view,
     build_live_state_payload,
     build_live_status_server,
+    check_live_intraday_candles,
     kite_chart_url,
     render_dashboard,
 )
@@ -502,6 +504,137 @@ def test_dashboard_chart_uses_the_real_incremental_update_pattern(tmp_path):
     poll_body = html.split("function poll()")[1].split("setInterval(poll")[0]
     assert "setData" not in poll_body
     assert "series.update(last)" in poll_body
+
+
+# --- live intraday candles: real reuse of the trading pipeline's own -----
+# --- Kite historical_data() integration, honest fallback otherwise -------
+
+
+class _FakeKiteHistorical:
+    """A real-shaped fake -- returns rows in exactly the format Kite's own
+    documented `historical_data()` response uses (list of dicts with
+    date/open/high/low/close/volume), never a shortcut shape the real
+    KiteHistoricalData wrapper wouldn't actually encounter."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def historical_data(self, instrument_token, start, end, interval):
+        self.last_call = (instrument_token, start, end, interval)
+        return self._rows
+
+
+def test_check_live_intraday_candles_returns_none_without_real_kite_credentials(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")  # no KITE_API_KEY/ACCESS_TOKEN
+
+    result = check_live_intraday_candles(settings, kite_factory=lambda: _FakeKiteHistorical([]))
+
+    assert result is None
+
+
+def test_check_live_intraday_candles_returns_real_candles_from_the_injected_kite(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "paper.db", kite_api_key="test-key", kite_access_token="test-token"
+    )
+    fake_kite = _FakeKiteHistorical(
+        [
+            {"date": "2026-09-07T09:15:00+0530", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 0},
+            {"date": "2026-09-07T09:16:00+0530", "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.5, "volume": 0},
+        ]
+    )
+    now = datetime(2026, 9, 7, 9, 17, tzinfo=IST)
+
+    result = check_live_intraday_candles(settings, kite_factory=lambda: fake_kite, now=now)
+
+    assert result == [
+        {"time": int(datetime(2026, 9, 7, 9, 15, tzinfo=IST).timestamp()), "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5},
+        {"time": int(datetime(2026, 9, 7, 9, 16, tzinfo=IST).timestamp()), "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.5},
+    ]
+    # The real trading pipeline's own fixed NIFTY 50 instrument_token --
+    # never a different/guessed instrument.
+    assert fake_kite.last_call[0] == NIFTY_INDEX_TOKEN
+    assert fake_kite.last_call[3] == "minute"
+
+
+def test_check_live_intraday_candles_returns_none_on_a_real_fetch_failure(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "paper.db", kite_api_key="test-key", kite_access_token="test-token"
+    )
+
+    class _RaisingKite:
+        def historical_data(self, *args, **kwargs):
+            raise RuntimeError("real API/auth failure")
+
+    result = check_live_intraday_candles(settings, kite_factory=lambda: _RaisingKite())
+
+    assert result is None
+
+
+def test_check_live_intraday_candles_returns_none_on_a_real_empty_response(tmp_path):
+    """An empty real response (e.g. before market open, or a real
+    non-trading day) must fall back honestly, never render an empty
+    chart labeled as live."""
+    settings = Settings(
+        database_path=tmp_path / "paper.db", kite_api_key="test-key", kite_access_token="test-token"
+    )
+
+    result = check_live_intraday_candles(settings, kite_factory=lambda: _FakeKiteHistorical([]))
+
+    assert result is None
+
+
+def test_build_dashboard_view_uses_real_live_candles_when_a_real_kite_session_is_available(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "paper.db", kite_api_key="test-key", kite_access_token="test-token"
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    fake_kite = _FakeKiteHistorical(
+        [{"date": "2026-09-07T09:15:00+0530", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 0}]
+    )
+
+    view = build_dashboard_view(
+        settings, database, gate=_ready_gate(), kite_factory=lambda: fake_kite, today=date(2026, 9, 7)
+    )
+
+    assert view["candles_live"] is True
+    assert view["candles_source"] is None  # no archived file consulted when live data is real and available
+    assert len(view["candles"]) == 1
+
+
+def test_build_dashboard_view_falls_back_to_the_archived_file_without_a_real_kite_session(tmp_path):
+    settings = Settings(database_path=tmp_path / "paper.db")  # no real Kite credentials
+    database = Database(settings.database_path)
+    database.initialize()
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
+
+    assert view["candles_live"] is False
+
+
+def test_market_section_labels_live_and_archived_candles_distinctly(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "paper.db", kite_api_key="test-key", kite_access_token="test-token"
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    fake_kite = _FakeKiteHistorical(
+        [{"date": "2026-09-07T09:15:00+0530", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 0}]
+    )
+
+    live_view = build_dashboard_view(
+        settings, database, gate=_ready_gate(), kite_factory=lambda: fake_kite, today=date(2026, 9, 7)
+    )
+    live_html = render_dashboard(live_view)
+    assert "real live intraday candles from Kite" in live_html
+    assert "real archived candles from" not in live_html
+
+    archived_settings = Settings(database_path=tmp_path / "paper2.db")
+    archived_database = Database(archived_settings.database_path)
+    archived_database.initialize()
+    archived_view = build_dashboard_view(archived_settings, archived_database, gate=_ready_gate(), today=date(2026, 9, 6))
+    archived_html = render_dashboard(archived_view)
+    assert "real live intraday candles from Kite" not in archived_html
 
 
 def test_chart_container_uses_the_real_larger_height(tmp_path):
