@@ -410,7 +410,7 @@ def test_hard_requirement_1_no_real_looking_zero_for_unmeasured_values(tmp_path)
     # appear -- the Intelligence pipeline stage, which always renders
     # regardless of whether a real candidate exists today.
     pipeline_start = html.index('id="intelligence"')
-    pipeline_html = html[pipeline_start : pipeline_start + 1200]
+    pipeline_html = html[pipeline_start : pipeline_start + 2000]
     assert "NO REAL DATA YET" in pipeline_html
     assert "0.00" not in pipeline_html and ">0<" not in pipeline_html
 
@@ -512,8 +512,8 @@ def test_chart_container_uses_the_real_larger_height(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
     html = render_dashboard(view)
 
-    assert 'id="chart-container" style="height:480px;"' in html
-    assert "height: 480," in html  # the real chart JS config, not just the container's own CSS
+    assert 'id="chart-container" style="height:560px;"' in html
+    assert "height: 560," in html  # the real chart JS config, not just the container's own CSS
 
 
 # --- real bug report: staleness vs. genuine redesign shortfall -----------
@@ -572,8 +572,8 @@ def test_sidebar_nav_items_carry_real_icons(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
     html = render_dashboard(view)
 
-    assert html.count('class="nav-icon"') == 9  # one per real sidebar anchor
-    assert html.count("<svg") >= 9
+    assert html.count('class="nav-icon"') == 10  # one per real sidebar anchor (Data Foundation split out this round)
+    assert html.count("<svg") >= 10
 
 
 # --- kite chart URL -------------------------------------------------------
@@ -679,12 +679,14 @@ def test_static_fonts_route_rejects_unknown_filenames(dashboard_server):
 
 
 def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server):
-    """Item 1: the sidebar's 9 links (Overview/Market/Intelligence/
-    Candidate/Position/Health/Data Capture/Notifications/Events) are
-    real scroll-anchors into THIS one page (plain `#id` hrefs), never
-    separate routes. Confirms every real `href="#..."` in the sidebar
-    has a real matching `id="..."` element somewhere on the same real
-    page -- not a decorative link that goes nowhere."""
+    """Item 1: the sidebar's 10 links (Overview/Market/Intelligence/
+    Candidate/Position/Health/Data Foundation/Option Capture/
+    Notifications/Events -- Data Foundation split out from the combined
+    Data Capture card this round, see _render_data_foundation_section)
+    are real scroll-anchors into THIS one page (plain `#id` hrefs),
+    never separate routes. Confirms every real `href="#..."` in the
+    sidebar has a real matching `id="..."` element somewhere on the
+    same real page -- not a decorative link that goes nowhere."""
     status, body = _fetch(dashboard_server, "/dashboard")
     html = body.decode("utf-8")
     assert status == 200
@@ -694,7 +696,7 @@ def test_sidebar_anchors_are_real_scroll_targets_not_dead_links(dashboard_server
     nav_html = html[nav_start:nav_end]
     anchors = re.findall(r'href="#([a-z-]+)"', nav_html)
 
-    assert len(anchors) == 9  # Overview, Market, Intelligence, Candidate, Position, Health, Data Capture, Notifications, Events
+    assert len(anchors) == 10
     for anchor in anchors:
         assert f'id="{anchor}"' in html, f"sidebar links to #{anchor} but no element has id=\"{anchor}\""
 
@@ -841,7 +843,10 @@ def test_intelligence_pipeline_renders_as_connected_nodes(tmp_path):
 
 def test_data_foundation_shows_a_real_raw_data_flow_diagram(tmp_path):
     """Item 12: RAW -> NORMALIZED -> VALIDATED -> RESEARCH as a real
-    visual connected flow, not a plain text sentence."""
+    visual connected flow, not a plain text sentence. Lives in its own
+    real Data Foundation card this round (split out from the combined
+    Data Capture card), separate from Option Capture's own real
+    segment/tick/gap metrics -- see _render_data_foundation_section."""
     settings = Settings(database_path=tmp_path / "paper.db")
     database = Database(settings.database_path)
     database.initialize()
@@ -849,11 +854,11 @@ def test_data_foundation_shows_a_real_raw_data_flow_diagram(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=date(2026, 9, 6))
     html = render_dashboard(view)
 
-    capture_start = html.index('id="capture"')
-    capture_html = html[capture_start : capture_start + 2500]
-    assert "node-static" in capture_html
+    foundation_start = html.index('id="data-foundation"')
+    foundation_html = html[foundation_start : foundation_start + 2500]
+    assert "node-static" in foundation_html
     for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"):
-        assert f">{label}<" in capture_html
+        assert f">{label}<" in foundation_html
 
 
 def test_live_path_is_unchanged_by_the_dashboard_addition(dashboard_server):

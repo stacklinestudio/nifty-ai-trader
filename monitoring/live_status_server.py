@@ -801,9 +801,10 @@ def _render_health_section(gate: Any) -> str:
     remaining 4 real checks (instrument archive, data completeness,
     notifications, risk/broker construction) list below with equal
     visual weight to each other. The real overall verdict is prominent
-    here (reinforced page-wide by `_render_blocked_banner` above), and
-    the real specific blocking reasons are listed plainly underneath
-    when blocked (hard requirement #4's second half)."""
+    here (reinforced page-wide by `_render_blocked_banner` above, which
+    is the one real place the specific blocking-reason sentences are
+    stated -- hard requirement #4 -- not repeated a third time in this
+    card on top of the per-check tiles/rows already showing them)."""
     verdict_class = "verdict-ready" if gate.verdict == "READY" else "verdict-blocked"
     highlight_names = ("kite_connection", "ai_provider", "option_tick_capture")
     highlight_labels = {"kite_connection": "Kite", "ai_provider": "AI Provider", "option_tick_capture": "Tick Capture"}
@@ -812,17 +813,18 @@ def _render_health_section(gate: Any) -> str:
     )
     remaining_checks = [c for c in gate.checks if c.name not in highlight_names]
     checks_html = "".join(_check_row(c) for c in remaining_checks)
-    blocking_html = ""
-    if gate.verdict != "READY":
-        reasons = "".join(f"<li>{_esc(reason)}</li>" for reason in gate.blocking_reasons)
-        blocking_html = f'<div class="blocking-reasons"><p class="label">Blocking reasons</p><ul>{reasons}</ul></div>'
+    # Real bug found by the adversarial visual-review workflow: the same
+    # real blocking-reason sentences were printed a THIRD time here,
+    # verbatim, on top of the page-level blocked banner above and the
+    # per-check tiles/rows just above this line -- real redundancy, not
+    # restraint. The top banner (hard requirement #4) already states
+    # every real reason plainly; dropped here rather than duplicated.
     command_class = " health-command-blocked" if gate.verdict != "READY" else ""
     return f"""
 <section class="card card-wide health-command{command_class}" id="health">
-<h2>System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
+<h2>{_NAV_ICONS['health']}System Health <span class="verdict {verdict_class}">{gate.verdict}</span></h2>
 <div class="health-highlights">{highlights_html}</div>
 <div class="checks-grid">{checks_html}</div>
-{blocking_html}
 </section>
 """
 
@@ -841,48 +843,63 @@ def _render_market_section(view: dict[str, Any]) -> str:
     )
     return f"""
 <section class="card card-wide chart-card" id="market">
-<h2>NIFTY Price</h2>
+<h2>{_NAV_ICONS['market']}NIFTY Price</h2>
 <p class="label">{source_note} &mdash; real, already-archived minute bars, not a live intraday tick feed. Refreshed from disk on every poll.</p>
-<div id="chart-container" style="height:480px;"></div>
+<div id="chart-container" style="height:560px;"></div>
 </section>
 """
 
 
 def _render_intelligence_section(view: dict[str, Any]) -> str:
-    """Item 9: a genuine connected-node pipeline visualization -- 5 real
-    stages as nodes joined by connector lines, each independently real
-    (done/not-run), never a fake "Analyzing..."/"Thinking..." animation
-    implying activity no real event actually reports. The detail list
-    beneath keeps every real timestamp/conclusion this section already
-    had -- the node row is a new, additional at-a-glance summary, not a
-    replacement for the real detail."""
+    """Item 9/10: a genuine connected-node pipeline visualization -- 5
+    real stages as nodes joined by connector lines, never a fake
+    "Analyzing..."/"Thinking..." animation implying activity no real
+    event actually reports. Each node also carries an explicit real
+    state label -- COMPLETED, REJECTED (Supervisor only, when the real
+    event is RISK_REJECTED rather than RISK_APPROVED -- a genuinely
+    different real outcome, never shown identically to an approval), or
+    NOT RUN. Deliberately does NOT fabricate a RUNNING/FAILED/NO DATA
+    state: this system has no real signal for "currently executing"
+    (every stage here is a discrete completed-or-not event, not a
+    live-polled process), so inventing one would be exactly the kind of
+    fake activity this project's own honesty rules forbid. The detail
+    list beneath keeps every real timestamp/conclusion this section
+    already had -- the node row is an additional at-a-glance summary,
+    not a replacement for the real detail."""
     pipeline = view["pipeline"]
     ev = view["ev_estimate"]
+    risk_approved = pipeline.get("RISK_APPROVED")
+    risk_rejected = pipeline.get("RISK_REJECTED")
     stages = [
         ("Research", "Research", pipeline.get("MARKET_RESEARCH_COMPLETE")),
         ("Signal", "Signal", pipeline.get("SIGNAL_CREATED")),
         ("Adversarial", "Adversarial (validation)", pipeline.get("TRADE_VALIDATED")),
-        ("Supervisor", "Supervisor (risk)", pipeline.get("RISK_APPROVED") or pipeline.get("RISK_REJECTED")),
+        ("Supervisor", "Supervisor (risk)", risk_approved or risk_rejected),
     ]
     ev_done = ev is not None
 
-    def _node(label: str, done: bool) -> str:
-        state_class = "node-done" if done else "node-pending"
-        return f'<div class="node {state_class}"><span class="node-dot"></span><span class="node-label">{label}</span></div>'
+    def _node(label: str, done: bool, rejected: bool = False, not_run_label: str = "NOT RUN", extra_class: str = "") -> str:
+        state_class = "node-rejected" if rejected else "node-done" if done else "node-pending"
+        state_label = "REJECTED" if rejected else "COMPLETED" if done else not_run_label
+        return (
+            f'<div class="node {state_class} {extra_class}"><span class="node-dot"></span>'
+            f'<span class="node-label">{label}</span><span class="node-state">{state_label}</span></div>'
+        )
 
     def _connector(left_done: bool) -> str:
         return f'<div class="node-connector{" node-connector-done" if left_done else ""}"></div>'
 
+    supervisor_rejected = risk_rejected is not None and risk_approved is None
     node_flow = (
         _node(stages[0][0], stages[0][2] is not None)
         + _connector(stages[0][2] is not None)
         + _node(stages[1][0], stages[1][2] is not None)
         + _connector(stages[1][2] is not None)
-        + _node("EV", ev_done)
+        + _node("EV", ev_done, not_run_label="NO REAL DATA YET", extra_class="node-measurement" if not ev_done else "")
         + _connector(ev_done)
         + _node(stages[2][0], stages[2][2] is not None)
         + _connector(stages[2][2] is not None)
-        + _node(stages[3][0], stages[3][2] is not None)
+        + _node(stages[3][0], stages[3][2] is not None, rejected=supervisor_rejected)
     )
 
     def _detail_row(label: str, event: Any) -> str:
@@ -901,8 +918,9 @@ def _render_intelligence_section(view: dict[str, Any]) -> str:
     detail_rows += [ev_detail, _detail_row(stages[2][1], stages[2][2]), _detail_row(stages[3][1], stages[3][2])]
 
     return f"""
-<section class="card card-wide" id="intelligence">
-<h2>AI Pipeline</h2>
+<section class="card card-wide pipeline-card" id="intelligence">
+<div class="pipeline-mesh" aria-hidden="true"></div>
+<h2>{_NAV_ICONS['intelligence']}AI Pipeline</h2>
 <div class="node-flow">{node_flow}</div>
 <div class="pipeline">{''.join(detail_rows)}</div>
 </section>
@@ -912,9 +930,9 @@ def _render_intelligence_section(view: dict[str, Any]) -> str:
 def _render_candidate_section(view: dict[str, Any]) -> str:
     signal = view["latest_signal"]
     if signal is None:
-        return """
+        return f"""
 <section class="card" id="candidate">
-<h2>Current Candidate</h2>
+<h2>{_NAV_ICONS['candidate']}Current Candidate</h2>
 <p class="not-yet">No candidate evaluated yet today.</p>
 </section>
 """
@@ -942,7 +960,7 @@ def _render_candidate_section(view: dict[str, Any]) -> str:
             )
     return f"""
 <section class="card" id="candidate">
-<h2>Current Candidate &mdash; {_esc(signal.get('setup_type', 'unknown'))} ({_esc(signal.get('direction', '?'))})</h2>
+<h2>{_NAV_ICONS['candidate']}Current Candidate &mdash; {_esc(signal.get('setup_type', 'unknown'))} ({_esc(signal.get('direction', '?'))})</h2>
 <p class="label">regime {_esc(signal.get('regime', 'unknown'))} &middot; {_esc(signal.get('timestamp', ''))}</p>
 <div class="stat-row">
 <div class="stat"><p class="kpi-label">Confidence</p><p class="kpi-value">{confidence_html}</p></div>
@@ -1020,8 +1038,68 @@ def _render_position_section(view: dict[str, Any]) -> str:
 
     return f"""
 <section class="card" id="position">
-<h2>Position</h2>
+<h2>{_NAV_ICONS['position']}Position Detail</h2>
 {position_html}
+</section>
+"""
+
+
+def _render_kpi_row(view: dict[str, Any]) -> str:
+    """This round's brief, Section 8: P&L / Position / Risk as the
+    strongest KPI cards on the page, placed immediately after System
+    Health -- above the chart, above everything else. Every number here
+    is the exact same real value the fuller Paper Trading / Position
+    cards further down already compute (`realized_pnl_today`,
+    `unrealized_pnl_today`, `max_daily_loss`) -- zero new computation,
+    reused verbatim, sharing the same `data-live` markers so the
+    existing `/api/live-state` poll patches both places for free. This
+    is a deliberate, real Bloomberg-style ribbon-plus-detail duplication
+    (see _render_topbar's own docstring for why that judgment call
+    changed this round), not an accidental one."""
+    realized = view["realized_pnl_today"]
+    unrealized = view["unrealized_pnl_today"]
+    total_pnl = realized + unrealized
+    total_class = "profit" if total_pnl >= 0 else "loss"
+    realized_class = "profit" if realized >= 0 else "loss"
+
+    position = view["position"]
+    if position.get("open"):
+        unrealized_class = "profit" if unrealized >= 0 else "loss"
+        unrealized_html = f'<span class="{unrealized_class}" data-live="unrealized-pnl">{unrealized:+.2f}</span>'
+        symbol = _esc(position.get("symbol", ""))
+        direction = _esc(position.get("direction", ""))
+        position_status_html = '<span class="profit" data-live="position-badge">OPEN POSITION</span>'
+        position_detail = f"{symbol} ({direction})" if symbol else "real open position"
+    else:
+        unrealized_html = '<span class="no-data" data-live="unrealized-pnl">NO OPEN POSITION</span>'
+        position_status_html = '<span class="no-data" data-live="position-badge">NO OPEN POSITION</span>'
+        position_detail = "no real open position"
+
+    loss_cap = view["max_daily_loss"]
+    loss_used = max(0.0, -realized)
+    risk_pct = min(100.0, (loss_used / loss_cap * 100.0)) if loss_cap else 0.0
+    risk_pct_html = f"{risk_pct:.0f}%" if loss_cap else "NO REAL DATA YET"
+    remaining_html = f"Rs{max(0.0, loss_cap - loss_used):.0f}" if loss_cap else "NO REAL DATA YET"
+    limit_html = f"Rs{loss_cap:.0f}" if loss_cap else "NO REAL DATA YET"
+
+    return f"""
+<section class="card card-kpi" id="kpi-pnl">
+<h2>{_NAV_ICONS['market']}P&amp;L</h2>
+<p class="big-number mono {total_class}" data-live="total-pnl-compact">{total_pnl:+.2f}</p>
+<div class="attr-row"><span>Realized</span><span class="mono {realized_class}" data-live="realized-pnl">{realized:+.2f}</span></div>
+<div class="attr-row"><span>Unrealized</span>{unrealized_html}</div>
+</section>
+<section class="card card-kpi" id="kpi-position">
+<h2>{_NAV_ICONS['position']}Position</h2>
+<p class="big-number mono">{position_status_html}</p>
+<p class="command-sub">{_esc(position_detail)}</p>
+</section>
+<section class="card card-kpi" id="kpi-risk">
+<h2>{_NAV_ICONS['risk']}Risk</h2>
+<p class="big-number mono" data-live="risk-pct-compact">{risk_pct_html}</p>
+<div class="risk-track"><div class="risk-fill" style="width:{risk_pct:.1f}%"></div></div>
+<div class="attr-row"><span>Daily limit</span><span class="mono">{limit_html}</span></div>
+<div class="attr-row"><span>Remaining</span><span class="mono">{remaining_html}</span></div>
 </section>
 """
 
@@ -1090,28 +1168,24 @@ def _render_capture_metrics(capture: Any) -> str:
     ) + "</div>"
 
 
-def _render_capture_section(view: dict[str, Any]) -> str:
-    """Item 9: Data Foundation -- real option tick capture status
-    (broken into its own real segment/tick/gap counts, parsed from the
-    real, already-computed check detail string -- see
-    `_CAPTURE_DETAIL_PATTERN`'s own docstring), real instrument archive
-    validity (both real gate checks, never recomputed), plus two
-    static, honest, permanent facts about this project's own real
-    current limitations: raw-tick immutability (a real architectural
-    guarantee, permanent since Brief 20) and the real absence of
-    historical option P&L reconstruction / trade calibration data --
-    stated plainly, not hidden behind a polished UI, per this card's
-    own explicit purpose."""
-    capture = view["capture_status"]
+def _render_data_foundation_section(view: dict[str, Any]) -> str:
+    """This round's brief, Section 12: Data Foundation split out into
+    its own visually distinct card -- real instrument archive validity
+    (a real gate check, never recomputed), the real RAW->NORMALIZED->
+    VALIDATED->RESEARCH layering (a permanent architectural guarantee,
+    Brief 20), plus two static, honest facts about this project's own
+    current real limitations. Was combined with Option Capture in one
+    card in a prior round; split here so each has its own real
+    hierarchy per the brief's own "distinct but related cards"
+    instruction -- same two real gate checks, same real facts, no new
+    data, no new computation."""
     archive = _gate_check(view["gate"], "instrument_archive")
     _static_node = '<div class="node node-static"><span class="node-dot"></span><span class="node-label">{}</span></div>'
     _static_connector = '<div class="node-connector node-connector-static"></div>'
     raw_flow = _static_connector.join(_static_node.format(label) for label in ("RAW", "NORMALIZED", "VALIDATED", "RESEARCH"))
     return f"""
-<section class="card card-wide" id="capture">
-<h2>Data Foundation</h2>
-{_check_row(capture)}
-{_render_capture_metrics(capture)}
+<section class="card" id="data-foundation">
+<h2>{_NAV_ICONS['data-foundation']}Data Foundation</h2>
 {_check_row(archive)}
 <p class="label" style="margin-top: var(--sp-4);">Raw data integrity &mdash; a permanent architectural guarantee, not a live check: real Kite ticks are never modified in place.</p>
 <div class="node-flow node-flow-compact">{raw_flow}</div>
@@ -1121,11 +1195,28 @@ def _render_capture_section(view: dict[str, Any]) -> str:
 """
 
 
+def _render_capture_section(view: dict[str, Any]) -> str:
+    """This round's brief, Section 12: Option Capture as its own card --
+    real segment/tick/gap counts (parsed from the real, already-computed
+    check detail string, see `_CAPTURE_DETAIL_PATTERN`'s own docstring)
+    and the real capture status check. Data Foundation (archive/RAW
+    flow) now lives in its own separate card -- see
+    `_render_data_foundation_section`."""
+    capture = view["capture_status"]
+    return f"""
+<section class="card" id="capture">
+<h2>{_NAV_ICONS['capture']}Option Capture</h2>
+{_check_row(capture)}
+{_render_capture_metrics(capture)}
+</section>
+"""
+
+
 def _render_notifications_section(view: dict[str, Any]) -> str:
     check = view["notifications_status"]
     return f"""
 <section class="card" id="notifications">
-<h2>Notifications</h2>
+<h2>{_NAV_ICONS['notifications']}Notifications</h2>
 {_check_row(check)}
 </section>
 """
@@ -1164,7 +1255,7 @@ def _render_events_section(view: dict[str, Any]) -> str:
         rows = "".join(_render_event_row(e) for e in events[:100])
     return f"""
 <section class="card card-wide" id="events">
-<h2>Recent Decisions &amp; Live Event Timeline</h2>
+<h2>{_NAV_ICONS['events']}Recent Decisions &amp; Live Event Timeline</h2>
 <p class="label">Every real recorded event -- NO_TRADE/RISK_REJECTED entries are always labeled distinctly from real fills, never shown as completed trades.</p>
 <div class="timeline" id="live-event-list" data-live="event-list">{rows}</div>
 </section>
@@ -1174,7 +1265,15 @@ def _render_events_section(view: dict[str, Any]) -> str:
 _SIDEBAR_GROUPS = (
     ("Command", (("overview", "Overview"), ("market", "Market"), ("intelligence", "Intelligence"))),
     ("Trading", (("candidate", "Candidate"), ("position", "Position"), ("events", "Events"))),
-    ("Operations", (("health", "System Health"), ("capture", "Data Capture"), ("notifications", "Notifications"))),
+    (
+        "Operations",
+        (
+            ("health", "System Health"),
+            ("data-foundation", "Data Foundation"),
+            ("capture", "Option Capture"),
+            ("notifications", "Notifications"),
+        ),
+    ),
 )
 
 # Simple, single-color (currentColor) 16x16 stroke icons -- inline SVG,
@@ -1190,6 +1289,9 @@ _NAV_ICONS = {
     "capture": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><ellipse cx="8" cy="3.3" rx="5.4" ry="1.7"/><path d="M2.6 3.3v9.4c0 .95 2.4 1.7 5.4 1.7s5.4-.75 5.4-1.7V3.3"/><path d="M2.6 8c0 .95 2.4 1.7 5.4 1.7s5.4-.75 5.4-1.7"/></svg>',
     "notifications": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 6.5a4 4 0 0 1 8 0c0 3 1.2 4 1.2 4H2.8s1.2-1 1.2-4Z"/><path d="M6.3 12.5a1.8 1.8 0 0 0 3.4 0"/></svg>',
     "events": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h8"/></svg>',
+    "risk": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.8 13 3.6v4.1c0 3.4-2.2 5.9-5 6.6-2.8-.7-5-3.2-5-6.6V3.6L8 1.8Z"/></svg>',
+    "data-foundation": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.8 14 5 8 8.2 2 5Z"/><path d="M2 8.4 8 11.6l6-3.2"/><path d="M2 11.6 8 14.8l6-3.2"/></svg>',
+    "connection": '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-4 4 4 4 0 0 1-4-4V5Z"/><path d="M8 11.5V14"/></svg>',
 }
 
 
@@ -1292,17 +1394,18 @@ def _render_hero(view: dict[str, Any], settings: Settings | None, now: datetime)
 
 
 def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetime) -> str:
-    """Item 5: a real, STICKY top command bar -- genuinely position:
-    sticky at the very top of the viewport (unlike the command-bar
-    cards above, which scroll away with the rest of Overview), showing
-    the handful of real facts worth never losing sight of while
-    scrolling: system verdict, market session, Kite/AI connectivity,
-    and a real IST/UTC clock. Deliberately does NOT duplicate the
-    fuller P&L/Position/Risk detail already show once each, in their
-    own dedicated cards further down -- showing the same real number
-    twice in two different places was exactly the kind of redundant
-    "admin panel" clutter the prior redesign round removed (the old
-    small Market Status card)."""
+    """Item 7 (this round's brief): the real STICKY command bar -- now
+    explicitly asked to surface the top KPIs themselves (NIFTY LTP,
+    P&L total, risk utilization), not just connectivity/verdict. A
+    prior round deliberately kept this bar connectivity-only to avoid
+    duplicating P&L/position numbers already shown once below; this
+    round's brief explicitly asks for the fuller Bloomberg-style ribbon
+    instead, so that judgment call is superseded here -- real trading
+    terminals routinely repeat their most-glanced-at numbers in a top
+    ribbon AND in a fuller detail panel. Every field here is the exact
+    same real value already computed once in `view`/`build_dashboard_
+    view` -- zero new computation, just an additional real place the
+    same real number is displayed."""
     gate = view["gate"]
     kite = view["kite_status"]
     ai = _gate_check(gate, "ai_provider")
@@ -1312,13 +1415,30 @@ def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetim
     session_label = _market_session_label(settings, now)
     session_dot = "dot-ok dot-live" if session_label == "MARKET OPEN" else "dot-unknown"
     utc_now = now.astimezone(_dt_timezone.utc)
+
+    ltp = view["nifty_ltp"]
+    ltp_html = f'{ltp["ltp"]:.2f}' if ltp.get("ltp") is not None else "NO REAL DATA YET"
+
+    realized = view["realized_pnl_today"]
+    unrealized = view["unrealized_pnl_today"]
+    total_pnl = realized + unrealized
+    pnl_class = "profit" if total_pnl >= 0 else "loss"
+
+    loss_cap = view["max_daily_loss"]
+    risk_pct = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
+    risk_html = f"{risk_pct:.0f}%" if loss_cap else "NO REAL DATA YET"
+
+    icon = _NAV_ICONS
     return f"""
 <div class="topbar">
 <div class="topbar-brand"><span class="topbar-mark">N</span>NIFTY AI TRADER</div>
-<div class="topbar-item"><span class="dot {verdict_dot}"></span>SYSTEM <span data-live="gate-verdict-compact">{_esc(gate.verdict)}</span></div>
-<div class="topbar-item"><span class="dot {session_dot}"></span>{_esc(session_label)}</div>
-<div class="topbar-item"><span class="dot {kite_dot}"></span>KITE</div>
-<div class="topbar-item"><span class="dot {ai_dot}"></span>AI</div>
+<div class="topbar-item">{icon['health']}<span class="dot {verdict_dot}"></span>SYSTEM <span data-live="gate-verdict-compact">{_esc(gate.verdict)}</span></div>
+<div class="topbar-item">{icon['market']}<span class="dot {session_dot}"></span>{_esc(session_label)}</div>
+<div class="topbar-item">NIFTY <span class="mono" data-live="nifty-ltp-compact">{ltp_html}</span></div>
+<div class="topbar-item">P&amp;L <span class="mono {pnl_class}" data-live="total-pnl-compact">{total_pnl:+.2f}</span></div>
+<div class="topbar-item">{icon['risk']}RISK <span class="mono" data-live="risk-pct-compact">{risk_html}</span></div>
+<div class="topbar-item">{icon['connection']}<span class="dot {kite_dot}"></span>KITE</div>
+<div class="topbar-item">{icon['intelligence']}<span class="dot {ai_dot}"></span>AI</div>
 <span id="stale-badge" class="badge badge-stale" hidden>STALE</span>
 <div class="topbar-spacer"></div>
 <div class="topbar-clock">IST {now.strftime('%I:%M:%S %p')} &middot; UTC {utc_now.strftime('%H:%M:%S')}</div>
@@ -1378,14 +1498,25 @@ def render_dashboard(
     # separate, intentional organizational grouping and is unaffected
     # by this real page-order choice -- anchors work identically
     # regardless of DOM order.
+    # This round's brief, Section 6: SYSTEM STATUS -> P&L/POSITION/RISK
+    # -> NIFTY PRICE -> AI PIPELINE -> CANDIDATE -> DATA FOUNDATION ->
+    # OPTION CAPTURE -> EVENT TIMELINE, in that literal top-to-bottom
+    # order. Position/Paper Trading's own fuller detail cards (entry/
+    # stop/target/trades-used, real data the condensed KPI row doesn't
+    # repeat) stay grouped immediately after the KPI row rather than
+    # deleted -- the brief's hierarchy is a Level-1 summary order, not
+    # an instruction to remove real detail sections or their existing,
+    # tested anchors.
     grid_html = "".join(
         [
             _render_health_section(gate),
+            _render_kpi_row(view),
+            _render_position_section(view),
+            _render_paper_trading_section(view),
             _render_market_section(view),
             _render_intelligence_section(view),
             _render_candidate_section(view),
-            _render_position_section(view),
-            _render_paper_trading_section(view),
+            _render_data_foundation_section(view),
             _render_capture_section(view),
             _render_notifications_section(view),
             _render_events_section(view),
@@ -1413,12 +1544,17 @@ def render_dashboard(
 @font-face {{ font-family: "JetBrains Mono"; font-weight: 600; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-600.woff2") format("woff2"); font-display: swap; }}
 @font-face {{ font-family: "JetBrains Mono"; font-weight: 700; src: url("{STATIC_FONTS_PREFIX}jetbrains-mono-700.woff2") format("woff2"); font-display: swap; }}
 :root {{
-  --bg: #0a0c11; --card: #12151d; --card-alt: #171b25; --border: #232838; --border-soft: #1b2029;
-  --text: #e9ebf1; --text-dim: #b6bccb; --muted: #7c8598;
-  --ok: #1ecb8c; --fail: #f0454f; --amber: #f2a838; --accent: #5b8cff; --purple: #9c7bff;
+  /* Command Center v4: the brief's own exact hex color system --
+     replaces the prior round's blue/purple palette with cyan (system/
+     live/information) + violet (AI pipeline specifically), token-only
+     so every existing var()-based rule repaints automatically. */
+  --bg: #07090D; --card: #0C1017; --card-alt: #111823; --border: rgba(255,255,255,0.10); --border-soft: rgba(255,255,255,0.06);
+  --text: #E6EDF3; --text-dim: #8B95A7; --muted: #5A6474;
+  --ok: #10B981; --fail: #EF4444; --amber: #F59E0B; --accent: #22D3EE; --purple: #8B5CF6;
+  --glass-bg: rgba(17,24,35,0.55); --glass-border: rgba(255,255,255,0.06); --glass-blur: blur(14px) saturate(140%);
   --font-ui: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --radius: 12px; --radius-sm: 8px; --sidebar-w: 252px; --topbar-h: 40px;
+  --radius: 14px; --radius-sm: 10px; --sidebar-w: 252px; --topbar-h: 40px;
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
   --fs-xs: 0.72rem; --fs-sm: 0.82rem; --fs-base: 0.92rem; --fs-md: 1rem; --fs-lg: 1.2rem; --fs-xl: 1.55rem; --fs-2xl: 2.5rem; --fs-hero: 4.2rem;
 }}
@@ -1450,6 +1586,7 @@ h2 {{
   display: inline-flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700;
 }}
 .topbar-item {{ display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }}
+.topbar-item svg {{ opacity: 0.65; flex-shrink: 0; }}
 .topbar-spacer {{ flex: 1; }}
 .topbar-clock {{ color: var(--muted); flex-shrink: 0; }}
 @media (max-width: 560px) {{
@@ -1469,7 +1606,7 @@ h2 {{
 .brand-name {{ font-weight: 650; font-size: var(--fs-base); }}
 .brand-sub {{ color: var(--muted); font-size: var(--fs-xs); }}
 .mode-pill {{
-  background: rgba(79,140,255,0.15); color: var(--accent); font-weight: 700; font-size: var(--fs-xs);
+  background: rgba(34,211,238,0.15); color: var(--accent); font-weight: 700; font-size: var(--fs-xs);
   letter-spacing: 0.05em; text-align: center; padding: var(--sp-2); border-radius: var(--radius-sm);
 }}
 .side-nav {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; flex: 1; }}
@@ -1500,51 +1637,77 @@ h2 {{
 .hero-section {{ margin-bottom: var(--sp-6); scroll-margin-top: var(--sp-5); }}
 .command-bar {{
   display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 0;
-  background: linear-gradient(135deg, rgba(91,140,255,0.1), rgba(156,123,255,0.04) 45%, var(--card) 85%);
+  background: linear-gradient(135deg, rgba(34,211,238,0.1), rgba(139,92,246,0.04) 45%, var(--card) 85%);
   border: 1px solid var(--border); border-radius: var(--radius);
   margin-bottom: var(--sp-4); overflow: hidden;
 }}
 .command-cell {{ padding: var(--sp-6); border-left: 1px solid var(--border-soft); }}
 .command-cell:first-child {{ border-left: none; }}
 .hero-eyebrow {{ color: var(--muted); font-size: var(--fs-sm); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 var(--sp-3) 0; }}
-.hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-hero); font-weight: 700; letter-spacing: -0.02em; line-height: 1; }}
+.hero-ltp {{ font-family: var(--font-mono); font-size: var(--fs-hero); font-weight: 700; letter-spacing: -0.02em; line-height: 1; font-variant-numeric: tabular-nums; }}
 .hero-change {{ color: var(--muted); font-size: var(--fs-base); margin: var(--sp-3) 0 0 0; }}
-.command-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xl); font-weight: 650; font-family: var(--font-mono); }}
+.command-status {{ display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xl); font-weight: 650; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }}
 .command-sub {{ color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-2) 0 0 0; }}
 .stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--sp-4); margin: var(--sp-4) 0; }}
 .stat {{ background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: var(--sp-4); min-width: 0; }}
-.risk-track {{ background: var(--card-alt); border-radius: 20px; height: 6px; overflow: hidden; margin-top: var(--sp-2); }}
-.risk-fill {{ background: linear-gradient(90deg, var(--ok), var(--amber)); height: 100%; border-radius: 20px; transition: width 0.3s ease; }}
+/* Real bug found by the adversarial visual-review workflow: at 0%
+   utilization (the common real case) the fill was fully invisible and
+   the track itself was nearly indistinguishable from a plain divider
+   -- a real gauge, not a decoration, needs to read as a gauge even
+   empty. A real border + slightly lighter track + a thin always-visible
+   end-cap fixes both. */
+.risk-track {{ background: rgba(255,255,255,0.08); border: 1px solid var(--border); border-radius: 20px; height: 8px; overflow: hidden; margin-top: var(--sp-2); position: relative; }}
+.risk-fill {{ background: linear-gradient(90deg, var(--ok), var(--amber)); height: 100%; min-width: 3px; border-radius: 20px; transition: width 0.3s ease; }}
 .kpi-label {{ color: var(--muted); font-size: var(--fs-xs); margin: 0 0 var(--sp-2) 0; letter-spacing: 0.03em; text-transform: uppercase; }}
 .kpi-value {{ font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 650; margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: break-word; word-break: break-word; }}
 .no-data {{ color: var(--amber); font-style: italic; font-weight: 600; font-size: var(--fs-sm); letter-spacing: 0.01em; }}
 .ev-tag {{
-  background: rgba(79,140,255,0.15); color: var(--accent); font-size: var(--fs-xs); font-weight: 700;
+  background: rgba(34,211,238,0.15); color: var(--accent); font-size: var(--fs-xs); font-weight: 700;
   padding: 1px 6px; border-radius: 4px; letter-spacing: 0.03em; vertical-align: middle;
 }}
 .grid {{
+  /* Real bug found by the adversarial visual-review workflow:
+     align-items: start let short cards (e.g. Current Candidate/Option
+     Capture) end far above a tall neighbor (Data Foundation) in the
+     same row, leaving a large ragged band of bare page background
+     before the next section. Stretching keeps each row's cards equal
+     height -- any leftover space stays contained inside a card's own
+     border instead of spilling out as unbordered empty background. */
   display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-  gap: var(--sp-5) var(--sp-5); align-items: start;
+  gap: var(--sp-5) var(--sp-5); align-items: stretch;
 }}
 .card {{
-  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  /* Section 5: restrained glassmorphism -- a translucent surface over
+     the flat dark base, not a permanently-glowing gaming-dashboard
+     card. No large transforms, no neon border, no constant glow. */
+  background: var(--glass-bg); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border); border-radius: var(--radius);
   padding: var(--sp-5); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
-  scroll-margin-top: var(--sp-5); transition: border-color 0.15s ease, transform 0.15s ease;
+  scroll-margin-top: var(--sp-5); transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }}
-.card:hover {{ border-color: var(--border-soft); transform: translateY(-1px); }}
-@keyframes live-pulse {{ 0%, 100% {{ box-shadow: 0 0 0 0 rgba(30,203,140,0.4); }} 50% {{ box-shadow: 0 0 0 5px rgba(30,203,140,0); }} }}
+.card:hover {{ border-color: rgba(255,255,255,0.12); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 10px 26px -12px rgba(0,0,0,0.6); }}
+@keyframes live-pulse {{ 0%, 100% {{ box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }} 50% {{ box-shadow: 0 0 0 5px rgba(16,185,129,0); }} }}
 .dot-live {{ animation: live-pulse 2s ease-in-out infinite; }}
 .card-wide {{ grid-column: 1 / -1; }}
+.card-kpi h2 {{ display: flex; align-items: center; gap: var(--sp-2); }}
+.card-kpi .big-number {{ font-size: 2.1rem; margin: var(--sp-2) 0 var(--sp-3) 0; }}
+.card-kpi .no-data {{ font-size: 1.1rem; }}
+/* Real bug found by the adversarial visual-review workflow: inside the
+   narrow ~140px Paper Trading stat tile, "NO OPEN POSITION" in the
+   inherited mono/italic/0.82rem .no-data style wrapped awkwardly onto
+   two lines. Smaller, upright, single-line in this one narrow context
+   only -- the shared .no-data rule elsewhere is untouched. */
+.stat .no-data {{ font-size: var(--fs-xs); font-style: normal; font-family: var(--font-ui); letter-spacing: 0; white-space: nowrap; }}
 .mono {{ font-family: var(--font-mono); font-variant-numeric: tabular-nums; }}
 .label {{ color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-3) 0; letter-spacing: 0.01em; }}
-.big-number {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; }}
+.big-number {{ font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }}
 .not-yet {{ color: var(--muted); font-style: italic; font-size: var(--fs-sm); }}
 .verdict {{ font-size: var(--fs-sm); padding: 4px 14px; border-radius: 20px; font-weight: 700; letter-spacing: 0.06em; }}
-.verdict-ready {{ background: rgba(30,203,140,0.15); color: var(--ok); }}
-.verdict-blocked {{ background: rgba(240,69,79,0.15); color: var(--fail); }}
+.verdict-ready {{ background: rgba(16,185,129,0.15); color: var(--ok); }}
+.verdict-blocked {{ background: rgba(239,68,68,0.15); color: var(--fail); }}
 .health-command {{ border-width: 1.5px; }}
 .health-command h2 {{ font-size: var(--fs-lg); }}
-.health-command-blocked {{ border-color: rgba(240,69,79,0.5); background: linear-gradient(180deg, rgba(240,69,79,0.06), var(--card) 40%); }}
+.health-command-blocked {{ border-color: rgba(239,68,68,0.5); background: linear-gradient(180deg, rgba(239,68,68,0.06), var(--card) 40%); }}
 .health-highlights {{
   display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-4);
   margin-bottom: var(--sp-5);
@@ -1563,17 +1726,40 @@ h2 {{
 .check-body {{ display: flex; flex-direction: column; gap: 3px; min-width: 0; }}
 .check-detail {{ color: var(--muted); font-size: var(--fs-xs); }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
-.dot-ok {{ background: var(--ok); box-shadow: 0 0 0 3px rgba(30,203,140,0.15); }}
-.dot-fail {{ background: var(--fail); box-shadow: 0 0 0 3px rgba(240,69,79,0.15); }}
+.dot-ok {{ background: var(--ok); box-shadow: 0 0 0 3px rgba(16,185,129,0.15); }}
+.dot-fail {{ background: var(--fail); box-shadow: 0 0 0 3px rgba(239,68,68,0.15); }}
 .dot-unknown {{ background: var(--muted); }}
 .node-flow {{ display: flex; align-items: center; margin-bottom: var(--sp-5); overflow-x: auto; padding: var(--sp-2) 0; }}
 .node {{ display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); flex-shrink: 0; min-width: 64px; }}
 .node-dot {{ width: 14px; height: 14px; border-radius: 50%; background: var(--card-alt); border: 2px solid var(--border-soft); }}
-.node-done .node-dot {{ background: var(--purple); border-color: var(--purple); box-shadow: 0 0 0 4px rgba(156,123,255,0.15); }}
+.node-done .node-dot {{ background: var(--purple); border-color: var(--purple); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); }}
 .node-label {{ font-size: var(--fs-xs); color: var(--text-dim); font-weight: 600; letter-spacing: 0.02em; text-align: center; }}
 .node-done .node-label {{ color: var(--text); }}
+.node-state {{ font-size: 0.62rem; color: var(--muted); font-weight: 700; letter-spacing: 0.06em; text-align: center; }}
+.node-done .node-state {{ color: var(--purple); }}
+/* EV's own honest "no measurement yet" wording (not a plain NOT RUN
+   discrete-event stage) gets the same amber treatment .no-data uses
+   elsewhere -- keeps the stepper and the detail row beneath it visually
+   consistent, not just textually. */
+.node-measurement .node-state {{ color: var(--amber); }}
+.node-rejected .node-dot {{ background: var(--fail); border-color: var(--fail); box-shadow: 0 0 0 4px rgba(239,68,68,0.15); }}
+.node-rejected .node-label {{ color: var(--text); }}
+.node-rejected .node-state {{ color: var(--fail); }}
 .node-connector {{ flex: 1; height: 2px; background: var(--border-soft); min-width: var(--sp-5); margin: 0 -2px 22px -2px; }}
 .node-connector-done {{ background: var(--purple); opacity: 0.5; }}
+.pipeline-card {{ position: relative; overflow: hidden; }}
+.pipeline-card > *:not(.pipeline-mesh) {{ position: relative; z-index: 1; }}
+/* Section 17: the ONE permitted subtle depth flourish -- a slow,
+   low-opacity animated gradient mesh behind the AI Pipeline card only.
+   opacity capped at 0.25, ~20s cycle, no particles/starfields/3D. */
+.pipeline-mesh {{
+  position: absolute; inset: -20%; z-index: 0; opacity: 0.22; pointer-events: none;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(139,92,246,0.5), transparent 45%),
+    radial-gradient(circle at 80% 70%, rgba(34,211,238,0.4), transparent 45%);
+  animation: mesh-drift 22s ease-in-out infinite alternate;
+}}
+@keyframes mesh-drift {{ from {{ transform: translate(0, 0) scale(1); }} to {{ transform: translate(-3%, 3%) scale(1.06); }} }}
 .pipeline {{ position: relative; padding-left: var(--sp-5); }}
 .pipeline::before {{ content: ""; position: absolute; left: 3px; top: 6px; bottom: 6px; width: 1px; background: var(--border-soft); }}
 .stage {{ position: relative; display: flex; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-sm); }}
@@ -1597,13 +1783,13 @@ h2 {{
 }}
 .position-card .attr-row, .position-card .label {{ margin-bottom: 0; }}
 .demo-tag {{
-  background: rgba(242,168,56,0.18); color: var(--amber); font-size: var(--fs-xs); font-weight: 700;
+  background: rgba(245,158,11,0.18); color: var(--amber); font-size: var(--fs-xs); font-weight: 700;
   padding: 1px 6px; border-radius: 4px; letter-spacing: 0.04em; vertical-align: middle;
 }}
 .kite-link {{ color: var(--accent); text-decoration: none; font-size: var(--fs-sm); font-weight: 600; }}
 .kite-link:hover {{ text-decoration: underline; }}
 .multi-position-warning {{
-  background: rgba(242,168,56,0.1); border: 1px solid rgba(242,168,56,0.35); color: var(--amber);
+  background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.35); color: var(--amber);
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); font-size: var(--fs-sm);
   margin-bottom: var(--sp-4); line-height: 1.5;
 }}
@@ -1611,9 +1797,18 @@ h2 {{
 .capture-metric {{ background: var(--card-alt); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4); }}
 .foundation-fact {{ display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0; font-size: var(--fs-sm); color: var(--text-dim); border-bottom: 1px solid var(--border-soft); }}
 .foundation-fact:last-child {{ border-bottom: none; padding-bottom: 0; }}
-.node-flow-compact {{ margin-bottom: var(--sp-4); }}
-.node-flow-compact .node {{ min-width: 88px; }}
-.node-static .node-dot {{ background: var(--ok); border-color: var(--ok); box-shadow: 0 0 0 4px rgba(30,203,140,0.15); }}
+/* Real bug found by the adversarial visual-review workflow: at the
+   1440px breakpoint the auto-fit grid packs 3 narrower columns (~316px
+   usable card width), which is LESS room than the 2-column 1280px
+   layout -- the 4-node RAW/NORMALIZED/VALIDATED/RESEARCH stepper's old
+   88px-per-node floor (392px+) overflowed and silently scrolled the
+   last node off-screen. Shrunk to fit the narrowest real card width,
+   plus a wrap fallback so any future overflow is visible, not hidden. */
+.node-flow-compact {{ margin-bottom: var(--sp-4); flex-wrap: wrap; row-gap: var(--sp-3); }}
+.node-flow-compact .node {{ min-width: 56px; }}
+.node-flow-compact .node-label {{ font-size: 0.62rem; }}
+.node-flow-compact .node-connector {{ min-width: 8px; }}
+.node-static .node-dot {{ background: var(--ok); border-color: var(--ok); box-shadow: 0 0 0 4px rgba(16,185,129,0.15); }}
 .node-static .node-label {{ color: var(--text); }}
 .node-connector-static {{ background: var(--ok); opacity: 0.4; }}
 .timeline {{ max-height: 420px; overflow-y: auto; margin-top: var(--sp-1); }}
@@ -1628,17 +1823,28 @@ h2 {{
 .event-row:last-child {{ border-bottom: none; }}
 .event-type {{ font-weight: 500; }}
 .badge {{ font-size: var(--fs-xs); font-weight: 700; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.03em; white-space: nowrap; }}
-.badge-fill {{ background: rgba(30,203,140,0.18); color: var(--ok); }}
-.badge-no-trade {{ background: rgba(242,168,56,0.18); color: var(--amber); }}
+.badge-fill {{ background: rgba(16,185,129,0.18); color: var(--ok); }}
+.badge-no-trade {{ background: rgba(245,158,11,0.18); color: var(--amber); }}
 .badge-system {{ background: rgba(124,133,152,0.18); color: var(--muted); }}
-.badge-stale {{ background: rgba(242,168,56,0.18); color: var(--amber); }}
+.badge-stale {{ background: rgba(245,158,11,0.18); color: var(--amber); }}
 [data-live] {{ transition: opacity 0.2s ease; }}
 [data-live].is-stale {{ opacity: 0.6; }}
 [data-live].flash {{ animation: live-flash 0.4s ease; }}
-@keyframes live-flash {{ 0% {{ background: rgba(91,140,255,0.25); }} 100% {{ background: transparent; }} }}
+[data-live].flash-up {{ animation: live-flash-up 0.4s ease; }}
+[data-live].flash-down {{ animation: live-flash-down 0.4s ease; }}
+@keyframes live-flash {{ 0% {{ background: rgba(34,211,238,0.25); }} 100% {{ background: transparent; }} }}
+@keyframes live-flash-up {{ 0% {{ background: rgba(16,185,129,0.28); }} 100% {{ background: transparent; }} }}
+@keyframes live-flash-down {{ 0% {{ background: rgba(239,68,68,0.28); }} 100% {{ background: transparent; }} }}
 .event-row-live {{ animation: event-slide-in 0.18s ease-out; }}
 @keyframes event-slide-in {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
 .reduced-motion * {{ animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }}
+/* Section 22: a real, native CSS fallback -- the .reduced-motion class
+   above is JS-applied (so it can also gate the live-poll's JS-driven
+   flash/slide-in triggers), but a user with this real OS setting gets
+   instant animations even if JS is slow, blocked, or hasn't run yet. */
+@media (prefers-reduced-motion: reduce) {{
+  * {{ animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }}
+}}
 .event-time {{ color: var(--muted); }}
 .event-agent {{ color: var(--muted); }}
 .footer {{ margin-top: var(--sp-6); color: var(--muted); font-size: var(--fs-sm); padding-top: var(--sp-4); border-top: 1px solid var(--border); }}
@@ -1681,22 +1887,29 @@ h2 {{
 (function() {{
   var container = document.getElementById('chart-container');
   if (!container || typeof LightweightCharts === 'undefined') return;
+  // Command Center v4, Section 9: the brief's own exact literal chart
+  // hex values -- background #07090D, grid #1A2130, positive #10B981,
+  // negative #EF4444, crosshair #22D3EE.
   var chart = LightweightCharts.createChart(container, {{
-    layout: {{ background: {{ color: '#12151d' }}, textColor: '#7c8598', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }},
-    grid: {{ vertLines: {{ color: '#1b2029' }}, horzLines: {{ color: '#1b2029' }} }},
+    layout: {{ background: {{ color: '#07090D' }}, textColor: '#8B95A7', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }},
+    grid: {{ vertLines: {{ color: '#1A2130' }}, horzLines: {{ color: '#1A2130' }} }},
     crosshair: {{
       mode: LightweightCharts.CrosshairMode.Normal,
-      vertLine: {{ color: '#5b8cff', width: 1, style: 2, labelBackgroundColor: '#5b8cff' }},
-      horzLine: {{ color: '#5b8cff', width: 1, style: 2, labelBackgroundColor: '#5b8cff' }}
+      vertLine: {{ color: '#22D3EE', width: 1, style: 2, labelBackgroundColor: '#22D3EE' }},
+      horzLine: {{ color: '#22D3EE', width: 1, style: 2, labelBackgroundColor: '#22D3EE' }}
     }},
-    rightPriceScale: {{ borderColor: '#232838' }},
-    timeScale: {{ borderColor: '#232838', timeVisible: true }},
+    rightPriceScale: {{ borderColor: '#1A2130' }},
+    // Real bug found by the adversarial visual-review workflow: with no
+    // rightOffset, the last real candle sits flush against the plot's
+    // right edge, clipping both the last-price pill and the last x-axis
+    // time label. A few bars of empty space fixes both.
+    timeScale: {{ borderColor: '#1A2130', timeVisible: true, rightOffset: 5 }},
     width: container.clientWidth,
-    height: 480,
+    height: 560,
   }});
   var series = chart.addCandlestickSeries({{
-    upColor: '#1ecb8c', downColor: '#f0454f', borderVisible: false,
-    wickUpColor: '#1ecb8c', wickDownColor: '#f0454f',
+    upColor: '#10B981', downColor: '#EF4444', borderVisible: false,
+    wickUpColor: '#10B981', wickDownColor: '#EF4444',
     priceFormat: {{ type: 'price', precision: 2, minMove: 0.05 }}
   }});
   var initial = {candles_json};
@@ -1738,20 +1951,30 @@ h2 {{
     }});
   }}
 
-  function flash(el) {{
-    el.classList.remove('flash');
+  // Section 15: a real numeric increase/decrease gets a brief, direction-
+  // aware accent (green up, red down) instead of one generic neutral
+  // flash -- triggers ONLY when the underlying real value actually
+  // changed (patchText already short-circuits on equal text).
+  function flash(el, direction) {{
+    el.classList.remove('flash', 'flash-up', 'flash-down');
     void el.offsetWidth;
-    el.classList.add('flash');
+    el.classList.add(direction === 'up' ? 'flash-up' : direction === 'down' ? 'flash-down' : 'flash');
   }}
 
-  function patchText(el, text, colorClass) {{
+  function patchText(el, text, colorClass, direction) {{
     if (el.textContent === text) return;
     el.textContent = text;
     if (colorClass) {{
       el.classList.remove('profit', 'loss', 'no-data');
       el.classList.add(colorClass);
     }}
-    flash(el);
+    flash(el, direction);
+  }}
+
+  function numericDirection(oldText, newValue) {{
+    var oldValue = parseFloat(oldText);
+    if (isNaN(oldValue) || isNaN(newValue) || oldValue === newValue) return null;
+    return newValue > oldValue ? 'up' : 'down';
   }}
 
   // Only the "health" tier (gate verdict, NIFTY LTP) rides the real
@@ -1759,13 +1982,26 @@ h2 {{
   // see build_live_state_payload's own docstring. The "fast" tier
   // (P&L, position, events) is rebuilt fresh on every real poll, so it
   // is never dimmed by the health tier's real cache age.
-  var HEALTH_TIER_SELECTOR = '[data-live="nifty-ltp"], [data-live="gate-verdict"], [data-live="gate-verdict-compact"]';
+  var HEALTH_TIER_SELECTOR = '[data-live="nifty-ltp"], [data-live="nifty-ltp-compact"], [data-live="gate-verdict"], [data-live="gate-verdict-compact"]';
+  var lastHealthComputedAt = null;
 
-  function applyHealthStale(stale) {{
+  function applyHealthStale(stale, ageSeconds) {{
     document.querySelectorAll(HEALTH_TIER_SELECTOR).forEach(function(el) {{ el.classList.toggle('is-stale', stale); }});
     var badge = document.getElementById('stale-badge');
-    if (badge) badge.hidden = !stale;
+    if (!badge) return;
+    badge.hidden = !stale;
+    if (stale) badge.textContent = 'STALE · ' + Math.floor(ageSeconds) + 's';
   }}
+
+  // Section 16: the STALE badge's own age must keep ticking between
+  // polls (real elapsed time), not just at the moment a poll happens to
+  // land -- a real 1s local tick against the last real health_computed_at,
+  // never a fabricated countdown.
+  setInterval(function() {{
+    if (lastHealthComputedAt === null) return;
+    var ageSeconds = (Date.now() - lastHealthComputedAt) / 1000;
+    applyHealthStale(ageSeconds > {STALE_AFTER_SECONDS}, ageSeconds);
+  }}, 1000);
 
   function prependEvents(events) {{
     var list = document.getElementById('live-event-list');
@@ -1788,27 +2024,49 @@ h2 {{
     }});
   }}
 
+  // A real, static config value baked in at render time (never
+  // recomputed client-side) -- the same real settings.max_daily_loss
+  // Paper Trading's own risk-utilization bar already uses, so the
+  // topbar's compact RISK figure can never silently drift from it.
+  var MAX_DAILY_LOSS = {json.dumps(view["max_daily_loss"])};
+
+  function signedText(value) {{ return (value >= 0 ? '+' : '') + value.toFixed(2); }}
+
   function poll() {{
     fetch('{LIVE_STATE_API_PATH}').then(function(r) {{ return r.json(); }}).then(function(state) {{
       if (!state || !state.health_computed_at) return;
-      var healthAgeSeconds = (Date.now() - new Date(state.health_computed_at).getTime()) / 1000;
-      applyHealthStale(healthAgeSeconds > {STALE_AFTER_SECONDS});
+      lastHealthComputedAt = new Date(state.health_computed_at).getTime();
+      var healthAgeSeconds = (Date.now() - lastHealthComputedAt) / 1000;
+      applyHealthStale(healthAgeSeconds > {STALE_AFTER_SECONDS}, healthAgeSeconds);
       // state.fast_computed_at is always ~now (no cache on this tier) --
       // real, but not currently surfaced as a separate visible badge,
       // since a fast-tier value is never stale enough to warn about.
 
       if (state.nifty_ltp !== null && state.nifty_ltp !== undefined) {{
-        document.querySelectorAll('[data-live="nifty-ltp"]').forEach(function(el) {{ patchText(el, state.nifty_ltp.toFixed(2), null); }});
+        document.querySelectorAll('[data-live="nifty-ltp"], [data-live="nifty-ltp-compact"]').forEach(function(el) {{
+          patchText(el, state.nifty_ltp.toFixed(2), null, numericDirection(el.textContent, state.nifty_ltp));
+        }});
       }}
       document.querySelectorAll('[data-live="gate-verdict"], [data-live="gate-verdict-compact"]').forEach(function(el) {{
-        patchText(el, state.gate_verdict, null);
+        patchText(el, state.gate_verdict, null, null);
       }});
       document.querySelectorAll('[data-live="realized-pnl"]').forEach(function(el) {{
-        patchText(el, (state.realized_pnl_today >= 0 ? '+' : '') + state.realized_pnl_today.toFixed(2), state.realized_pnl_today >= 0 ? 'profit' : 'loss');
+        patchText(el, signedText(state.realized_pnl_today), state.realized_pnl_today >= 0 ? 'profit' : 'loss',
+          numericDirection(el.textContent, state.realized_pnl_today));
       }});
       document.querySelectorAll('[data-live="unrealized-pnl"]').forEach(function(el) {{
-        if (!state.position_open) {{ patchText(el, 'NO OPEN POSITION', 'no-data'); return; }}
-        patchText(el, (state.unrealized_pnl_today >= 0 ? '+' : '') + state.unrealized_pnl_today.toFixed(2), state.unrealized_pnl_today >= 0 ? 'profit' : 'loss');
+        if (!state.position_open) {{ patchText(el, 'NO OPEN POSITION', 'no-data', null); return; }}
+        patchText(el, signedText(state.unrealized_pnl_today), state.unrealized_pnl_today >= 0 ? 'profit' : 'loss',
+          numericDirection(el.textContent, state.unrealized_pnl_today));
+      }});
+      document.querySelectorAll('[data-live="total-pnl-compact"]').forEach(function(el) {{
+        patchText(el, signedText(state.total_pnl_today), state.total_pnl_today >= 0 ? 'profit' : 'loss',
+          numericDirection(el.textContent, state.total_pnl_today));
+      }});
+      document.querySelectorAll('[data-live="risk-pct-compact"]').forEach(function(el) {{
+        if (!MAX_DAILY_LOSS) {{ patchText(el, 'NO REAL DATA YET', null, null); return; }}
+        var pct = Math.min(100, Math.max(0, (-state.realized_pnl_today / MAX_DAILY_LOSS) * 100));
+        patchText(el, Math.round(pct) + '%', null, numericDirection(el.textContent, pct));
       }});
       prependEvents(state.events || []);
     }}).catch(function() {{}});
