@@ -662,6 +662,7 @@ def main() -> int:
         "live-status",
         "demo-live-link",
         "demo-trade",
+        "clear-demo-position",
     ):
         sub.add_parser(name)
     args = parser.parse_args()
@@ -869,6 +870,26 @@ def main() -> int:
         # (demo/demo_trade.py::_demo_settings) -- never touches the real
         # `settings` object built above, or anything it points at.
         run_demo_trade()
+        return 0
+    if args.command == "clear-demo-position":
+        # Real bug report: `demo-live-link` (above) documents that its
+        # DEMO state "stays in the database until [Ctrl+C], or until a
+        # real trade opens" -- if that terminal is instead force-closed,
+        # neither ever happens and the row is stuck. This command is the
+        # explicit manual escape hatch: touches ONLY the real, structurally
+        # isolated `demo_live_position` table (Database.clear_demo_position,
+        # storage/database.py) -- the exact same table `demo-live-link`
+        # writes to and no real position-supervision code path ever reads
+        # from. Never touches `open_positions` or any real trade data.
+        # Safe to run at any time, including mid-live-session.
+        database = Database(settings.database_path)
+        database.initialize()
+        existing = database.demo_position()
+        database.clear_demo_position()
+        if existing is None:
+            print("Nothing to clear -- no demo position row was present.")
+        else:
+            print(f"Cleared demo position (DEMO DATA, not a real trade): {existing.get('symbol', 'unknown symbol')}")
         return 0
     if args.command == "instruments":
         # Brief 13 Part 2: real, daily-scheduled NFO instrument archiving
