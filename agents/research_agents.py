@@ -61,7 +61,15 @@ class GlobalResearchAgent(BaseAgent):
             )
         score = sum(float(getattr(value, "value", 0) or 0) for value in available) / len(available)
         global_direction = "BULLISH" if score > 0 else "BEARISH" if score < 0 else "NEUTRAL"
-        confidence = min(80, abs(score))
+        # Real bug, confirmed mechanically: `score` is a raw fractional
+        # average of real % changes (e.g. 0.001 = 0.1%), never scaled up
+        # before this clamp -- the same real bug class NewsAgent.analyze()
+        # already avoids with its own `abs(sentiment_score) * 100`. Without
+        # the *100 here, confidence collapsed to a near-constant ~0.001-
+        # ish value regardless of how much global markets actually moved,
+        # making this input's real (weight 0.05 in SignalEngine) 1.0-9.0
+        # point range effectively fixed at ~5.0 every time.
+        confidence = min(80, abs(score) * 100)
 
         ai_commentary = self._synthesize(available)
 
