@@ -1696,6 +1696,27 @@ h2 {{
   display: flex; align-items: baseline; gap: var(--sp-2); padding-bottom: var(--sp-3);
   border-bottom: 1px solid var(--border-soft); letter-spacing: -0.005em; scroll-margin-top: var(--sp-5);
 }}
+/* Real bug found via a real Playwright investigation (window.getSelection()
+   confirmed `type: "Caret"` after a plain click on real chrome text, e.g.
+   "MARKET CLOSED") -- not a contenteditable/input/tabindex bug (none exist
+   anywhere in the real DOM; document.activeElement stayed on <body>).
+   This is the browser's own native text-selection caret, which appears on
+   any click inside genuinely selectable text -- real, standard behavior,
+   just wrong for dense UI chrome (labels/badges/nav/status pills) that
+   isn't meant to be selected. Scoped, not blanket: chrome containers and
+   specific label/badge classes go non-selectable; real values a person
+   might actually want to copy (prices, P&L, timestamps, detail text)
+   explicitly opt back in below, since user-select inherits. */
+.sidebar, .topbar, h2, .label, .command-status, .verdict, .badge, .mode-pill,
+.hero-eyebrow, .command-sub, .not-yet, .stage-label, .kpi-label, .nav-group-label,
+.footer, .build-marker, .side-build, .check-body strong, .popover-title,
+.node-label, .node-state {{
+  user-select: none;
+}}
+.mono, .kpi-value, .big-number, .hero-ltp, .stage-value, .popover-detail,
+.check-detail, .event-time, .event-type, .event-agent {{
+  user-select: text;
+}}
 .topbar {{
   position: sticky; top: 0; z-index: 20; height: var(--topbar-h);
   display: flex; align-items: center; gap: var(--sp-5);
@@ -2227,6 +2248,22 @@ h2 {{
     document.documentElement.classList.add('reduced-motion');
   }}
   setInterval(poll, {LIVE_POLL_SECONDS * 1000});
+}})();
+
+(function() {{
+  // Real, minimal click-outside-to-close for the notifications
+  // popover -- native <details> only closes on a second click on its
+  // own <summary>, which isn't the usual dropdown UX. A click INSIDE
+  // the <details> element (including its own summary) is left alone,
+  // so the native open/close toggle on the icon itself keeps working
+  // unchanged; only a click genuinely outside it closes it early.
+  var popover = document.getElementById('notifications');
+  if (!popover) return;
+  document.addEventListener('click', function(e) {{
+    if (popover.open && !popover.contains(e.target)) {{
+      popover.open = false;
+    }}
+  }});
 }})();
 </script>
 </body>
