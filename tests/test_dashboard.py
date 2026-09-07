@@ -170,6 +170,40 @@ def _open_real_position(
     return opened_at
 
 
+def test_position_card_merge_loses_nothing_real_from_either_old_card(tmp_path):
+    """Consolidation pass: the old separate compact "Position" KPI badge
+    and the old separate "Position Detail" card were merged into one
+    real card (id="position") since the badge showed nothing the detail
+    card didn't already cover. This pins down that every real value
+    either of the two old cards showed -- open/no-open state, symbol,
+    quantity, entry/current LTP, stop/target, unrealized P&L, Kite
+    chart link -- is present, once, in the merged card, and that no
+    separate id="kpi-position" section exists anymore."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    database = Database(settings.database_path)
+    database.initialize()
+    opened_at = _open_real_position(database, "order-1", "NIFTY26SEP24000CE", instrument_token=17512194)
+
+    view = build_dashboard_view(settings, database, gate=_ready_gate(), today=opened_at.date())
+    html = render_dashboard(view)
+
+    assert 'id="kpi-position"' not in html  # the old standalone badge card is gone
+    assert html.count('id="position"') == 1  # exactly one real Position card now
+
+    section_start = html.index('id="position"')
+    section_html = html[section_start : section_start + 2000]
+    assert "OPEN POSITION" in section_html  # the old KPI badge's own state text
+    assert "NIFTY26SEP24000CE" in section_html
+    assert "65" in section_html  # real quantity -- newly shown here, same real pos["quantity"] field
+    assert "100.00" in section_html  # real entry
+    assert "108.00" in section_html  # real current LTP
+    assert "102.50" in section_html  # real (trailed) stop, after the fixture's own observe() call
+    assert "(trailed)" in section_html
+    assert "115.00" in section_html  # real target
+    assert kite_chart_url("NFO", "NIFTY26SEP24000CE", 17512194) in section_html
+    assert 'class="kite-link"' in section_html
+
+
 # --- Part 2: real Kite chart link on the dashboard's own position card --
 
 
@@ -933,10 +967,13 @@ def test_command_bar_shows_price_market_and_system_status_as_three_real_columns(
     assert "blocking condition(s)" in html
 
 
-def test_paper_trading_section_is_its_own_dedicated_card(tmp_path):
-    """Item 11: Paper Trading is its own card (id="paper-trading"), not
-    folded into a generic stat row -- real realized/unrealized P&L,
-    real trades-used count, real daily risk utilization."""
+def test_pnl_card_shows_realized_unrealized_trades_used_and_risk_utilization(tmp_path):
+    """Consolidation pass: the old separate "Paper Trading" card was
+    merged into the P&L card (id="pnl") since it was a real duplicate --
+    same real realized/unrealized P&L already shown there. This pins
+    down that every real value the old dedicated card showed (real
+    realized/unrealized P&L, real trades-used count, real daily risk
+    utilization) is still present, just consolidated into one card."""
     settings = Settings(database_path=tmp_path / "paper.db")
     database = Database(settings.database_path)
     database.initialize()
@@ -947,12 +984,15 @@ def test_paper_trading_section_is_its_own_dedicated_card(tmp_path):
     view = build_dashboard_view(settings, database, gate=_ready_gate(), today=now.date())
     html = render_dashboard(view)
 
-    assert 'id="paper-trading"' in html
-    section_start = html.index('id="paper-trading"')
-    section_html = html[section_start : section_start + 1200]
-    assert "Realized P&amp;L" in section_html
+    assert 'id="pnl"' in html
+    assert 'id="paper-trading"' not in html  # the old standalone card is gone, not just renamed
+    section_start = html.index('id="pnl"')
+    section_html = html[section_start : section_start + 1500]
+    assert "Realized" in section_html
     assert "+450.00" in section_html
     assert "NO OPEN POSITION" in section_html
+    assert "Trades used today" in section_html
+    assert "Daily risk utilization" in section_html
     assert 'class="risk-track"' in section_html
 
 

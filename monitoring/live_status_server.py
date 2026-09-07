@@ -1080,6 +1080,7 @@ def _render_position_card(pos: dict[str, Any], index: int | None = None) -> str:
 <div class="position-card">
 <p class="label">{label}{demo_tag}</p>
 <div class="attr-row"><span>Symbol</span><span class="mono">{_esc(pos.get('symbol', ''))} ({_esc(pos.get('direction', ''))})</span></div>
+<div class="attr-row"><span>Quantity</span><span class="mono">{pos.get('quantity', '')}</span></div>
 <div class="attr-row"><span>Entry / current LTP</span><span class="mono">{pos['entry']:.2f} / {pos['current_ltp']:.2f}</span></div>
 <div class="attr-row"><span>Stop{trailed_note} / target</span><span class="mono">{pos['current_stop']:.2f} / {pos['target']:.2f}</span></div>
 <div class="attr-row"><span>Unrealized P&amp;L</span><span class="mono {pnl_class}">{pnl:+.2f}</span></div>
@@ -1089,14 +1090,23 @@ def _render_position_card(pos: dict[str, Any], index: int | None = None) -> str:
 
 
 def _render_position_section(view: dict[str, Any]) -> str:
-    """Item 6: the real position card on its own -- entry/LTP/stop/
-    target/P&L when open, the same literal "No position currently
-    open." honest empty state as before (kept verbatim; changing this
-    exact string would break the existing, still-correct regression
-    checks for it), real Kite chart link when a real instrument token
-    exists. Aggregate P&L/risk numbers now live in the KPI row
-    (`_render_kpi_row`) under Overview instead of duplicating them
-    here."""
+    """The one, real, consolidated Position card -- merges what were
+    previously two separate cards (the KPI row's compact OPEN/NO OPEN
+    badge and this section's own fuller entry/LTP/stop/target/P&L/Kite-
+    chart detail) into a single card, since the KPI badge was showing
+    nothing the detail card didn't already cover. Zero new data: the
+    same real `view["position"]`/`view["open_positions"]` fields
+    `build_dashboard_view` already computes; the same literal "No
+    position currently open." honest empty state as before (kept
+    verbatim; changing this exact string would break the existing,
+    still-correct regression checks for it), real Kite chart link when
+    a real instrument token exists."""
+    position = view["position"]
+    if position.get("open"):
+        status_html = '<span class="profit" data-live="position-badge">OPEN POSITION</span>'
+    else:
+        status_html = '<span class="no-data" data-live="position-badge">NO OPEN POSITION</span>'
+
     open_positions = view["open_positions"]
     if not open_positions:
         position_html = '<p class="not-yet">No position currently open.</p>'
@@ -1122,24 +1132,25 @@ def _render_position_section(view: dict[str, Any]) -> str:
 
     return f"""
 <section class="card" id="position">
-<h2>{_NAV_ICONS['position']}Position Detail</h2>
+<h2>{_NAV_ICONS['position']}Position</h2>
+<p class="big-number mono">{status_html}</p>
 {position_html}
 </section>
 """
 
 
 def _render_kpi_row(view: dict[str, Any]) -> str:
-    """This round's brief, Section 8: P&L / Position / Risk as the
-    strongest KPI cards on the page, placed immediately after System
-    Health -- above the chart, above everything else. Every number here
-    is the exact same real value the fuller Paper Trading / Position
-    cards further down already compute (`realized_pnl_today`,
-    `unrealized_pnl_today`, `max_daily_loss`) -- zero new computation,
-    reused verbatim, sharing the same `data-live` markers so the
-    existing `/api/live-state` poll patches both places for free. This
-    is a deliberate, real Bloomberg-style ribbon-plus-detail duplication
-    (see _render_topbar's own docstring for why that judgment call
-    changed this round), not an accidental one."""
+    """P&L / Risk as the strongest KPI cards on the page, placed
+    immediately after System Health -- above the chart, above
+    everything else. Consolidation pass: the separate compact
+    "Position" KPI badge and the separate "Paper Trading" card were
+    real duplicates of content the fuller Position card (`_render_
+    position_section`) and this same P&L card already show -- both
+    folded in rather than kept as their own cards. Every number here is
+    the exact same real value `build_dashboard_view` already computes
+    (`realized_pnl_today`, `unrealized_pnl_today`, `trades_today_count`,
+    `max_daily_loss`) -- zero new computation, same `data-live` markers
+    so the existing `/api/live-state` poll keeps patching them."""
     realized = view["realized_pnl_today"]
     unrealized = view["unrealized_pnl_today"]
     total_pnl = realized + unrealized
@@ -1150,14 +1161,12 @@ def _render_kpi_row(view: dict[str, Any]) -> str:
     if position.get("open"):
         unrealized_class = "profit" if unrealized >= 0 else "loss"
         unrealized_html = f'<span class="{unrealized_class}" data-live="unrealized-pnl">{unrealized:+.2f}</span>'
-        symbol = _esc(position.get("symbol", ""))
-        direction = _esc(position.get("direction", ""))
-        position_status_html = '<span class="profit" data-live="position-badge">OPEN POSITION</span>'
-        position_detail = f"{symbol} ({direction})" if symbol else "real open position"
     else:
         unrealized_html = '<span class="no-data" data-live="unrealized-pnl">NO OPEN POSITION</span>'
-        position_status_html = '<span class="no-data" data-live="position-badge">NO OPEN POSITION</span>'
-        position_detail = "no real open position"
+
+    trades_used = view["trades_today_count"]
+    trades_cap = view["max_trades_per_day"]
+    realized_sub = f"{trades_used} real trade(s) today" if trades_used else "0 REAL TRADES today"
 
     loss_cap = view["max_daily_loss"]
     loss_used = max(0.0, -realized)
@@ -1165,18 +1174,16 @@ def _render_kpi_row(view: dict[str, Any]) -> str:
     risk_pct_html = f"{risk_pct:.0f}%" if loss_cap else "NO REAL DATA YET"
     remaining_html = f"Rs{max(0.0, loss_cap - loss_used):.0f}" if loss_cap else "NO REAL DATA YET"
     limit_html = f"Rs{loss_cap:.0f}" if loss_cap else "NO REAL DATA YET"
+    utilization_html = f"{risk_pct:.1f}% of Rs{loss_cap:.0f}" if loss_cap else "NO REAL DATA YET"
 
     return f"""
-<section class="card card-kpi" id="kpi-pnl">
+<section class="card card-kpi" id="pnl">
 <h2>{_NAV_ICONS['market']}P&amp;L</h2>
 <p class="big-number mono {total_class}" data-live="total-pnl-compact">{total_pnl:+.2f}</p>
 <div class="attr-row"><span>Realized</span><span class="mono {realized_class}" data-live="realized-pnl">{realized:+.2f}</span></div>
 <div class="attr-row"><span>Unrealized</span>{unrealized_html}</div>
-</section>
-<section class="card card-kpi" id="kpi-position">
-<h2>{_NAV_ICONS['position']}Position</h2>
-<p class="big-number mono">{position_status_html}</p>
-<p class="command-sub">{_esc(position_detail)}</p>
+<div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap} ({realized_sub})</span></div>
+<div class="attr-row"><span>Daily risk utilization</span><span class="mono">{utilization_html}</span></div>
 </section>
 <section class="card card-kpi" id="kpi-risk">
 <h2>{_NAV_ICONS['risk']}Risk</h2>
@@ -1188,42 +1195,12 @@ def _render_kpi_row(view: dict[str, Any]) -> str:
 """
 
 
-def _render_paper_trading_section(view: dict[str, Any]) -> str:
-    """Item 11: a dedicated Paper Trading card -- real realized P&L,
-    real unrealized P&L (or the honest "NO OPEN POSITION" state, never
-    conflated with a real position that happens to show 0.00), real
-    trades-used-today count, real daily risk utilization against the
-    real configured cap. A real zero is only ever shown when the real
-    underlying system genuinely reports zero (zero real trades today is
-    a true, valid measurement, not an absence) -- paired with an
-    explicit "0 REAL TRADES" note so a real zero P&L is never
-    mistakable for "no data was measured"."""
-    realized = view["realized_pnl_today"]
-    unrealized = view["unrealized_pnl_today"]
-    realized_class = "profit" if realized >= 0 else "loss"
-    trades_used = view["trades_today_count"]
-    trades_cap = view["max_trades_per_day"]
-    loss_cap = view["max_daily_loss"]
-    loss_utilization = min(100.0, max(0.0, (-realized / loss_cap * 100.0))) if loss_cap else 0.0
-    position = view["position"]
-    if position.get("open"):
-        unrealized_class = "profit" if unrealized >= 0 else "loss"
-        unrealized_html = f'<span class="{unrealized_class}" data-live="unrealized-pnl">{unrealized:+.2f}</span>'
-    else:
-        unrealized_html = '<span class="no-data" data-live="unrealized-pnl">NO OPEN POSITION</span>'
-    realized_sub = f"{trades_used} real trade(s) today" if trades_used else "0 REAL TRADES today"
-    return f"""
-<section class="card" id="paper-trading">
-<h2>Paper Trading</h2>
-<div class="stat-row">
-<div class="stat"><p class="kpi-label">Realized P&amp;L</p><p class="kpi-value {realized_class}" data-live="realized-pnl">{realized:+.2f}</p><p class="command-sub">{realized_sub}</p></div>
-<div class="stat"><p class="kpi-label">Unrealized P&amp;L</p><p class="kpi-value">{unrealized_html}</p></div>
-</div>
-<div class="attr-row"><span>Trades used today</span><span class="mono">{trades_used} / {trades_cap}</span></div>
-<div class="attr-row"><span>Daily risk utilization</span><span class="mono">{loss_utilization:.1f}% of Rs{loss_cap:.0f}</span></div>
-<div class="risk-track"><div class="risk-fill" style="width:{loss_utilization:.1f}%"></div></div>
-</section>
-"""
+# _render_paper_trading_section (the old, separate "Paper Trading" card)
+# has been removed -- real consolidation pass, not a deletion of real
+# content. Every real value it showed (realized/unrealized P&L,
+# trades-used count, daily risk utilization) now lives in the merged
+# P&L card above (`_render_kpi_row`'s id="pnl" section), which already
+# computed the exact same real fields.
 
 
 # The real, already-computed detail string check_option_tick_capture
@@ -1596,7 +1573,6 @@ def render_dashboard(
             _render_health_section(gate),
             _render_kpi_row(view),
             _render_position_section(view),
-            _render_paper_trading_section(view),
             _render_market_section(view),
             _render_intelligence_section(view),
             _render_candidate_section(view),
