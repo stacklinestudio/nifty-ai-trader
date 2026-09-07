@@ -1702,15 +1702,23 @@ h2 {{
    anywhere in the real DOM; document.activeElement stayed on <body>).
    This is the browser's own native text-selection caret, which appears on
    any click inside genuinely selectable text -- real, standard behavior,
-   just wrong for dense UI chrome (labels/badges/nav/status pills) that
-   isn't meant to be selected. Scoped, not blanket: chrome containers and
-   specific label/badge classes go non-selectable; real values a person
-   might actually want to copy (prices, P&L, timestamps, detail text)
-   explicitly opt back in below, since user-select inherits. */
-.sidebar, .topbar, h2, .label, .command-status, .verdict, .badge, .mode-pill,
-.hero-eyebrow, .command-sub, .not-yet, .stage-label, .kpi-label, .nav-group-label,
-.footer, .build-marker, .side-build, .check-body strong, .popover-title,
-.node-label, .node-state {{
+   just wrong for dense UI chrome that isn't meant to be selected.
+   A first pass used a deny-list of chrome classes (sidebar/topbar/labels/
+   badges/...) and a follow-up real Playwright sweep of every visible,
+   direct-text-bearing element on the page proved that list incomplete --
+   e.g. .blocked-banner's real <strong>/<li> text, .health-tile-label/
+   -status/-detail, .hero-change, and several bare, class-less label
+   <span>s (Realized/Unrealized/Trades used today/...) all still resolved
+   to the CSS default (user-select: auto) because no deny-list entry
+   happened to match their real selector. A deny-list only prevents carets
+   on elements someone remembered to add.
+   Inverted to an allow-list instead: user-select: none is now the default
+   for the whole page, and only the specific classes holding real values a
+   person might want to copy (prices, P&L, timestamps, detail text) opt
+   back into user-select: text below. Anything added later is
+   non-selectable by default unless deliberately opted in -- no gap to
+   leave open. */
+body {{
   user-select: none;
 }}
 .mono, .kpi-value, .big-number, .hero-ltp, .stage-value, .popover-detail,

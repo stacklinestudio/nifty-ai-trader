@@ -117,3 +117,49 @@ def test_real_values_stay_selectable_after_the_caret_fix(page):
     selectable, since a person may want to copy it."""
     computed_user_select = page.eval_on_selector(".hero-ltp", "el => getComputedStyle(el).userSelect")
     assert computed_user_select == "text"
+
+
+# A first pass at this fix used a deny-list of chrome classes and missed
+# real elements a follow-up Playwright sweep found still selectable
+# (.blocked-banner's <strong>/<li> text, .health-tile-label/-status/
+# -detail, .hero-change, bare label <span>s like "Realized"/"Unrealized").
+# The fix was inverted to an allow-list (user-select: none on <body> by
+# default, specific value classes opt back into user-select: text) --
+# this samples one real element from each of the sections the user
+# flagged as still broken and proves none of them produce a caret,
+# while a real value elsewhere on the same page still does.
+_CARET_FREE_LOCATIONS = {
+    "sidebar nav-group-label": ".nav-group-label",
+    "topbar brand": ".topbar-brand",
+    "System Health tile label": ".health-tile-label",
+    "P&L card bare label": "text=Realized",
+    "Data Foundation stage-label": ".stage-label",
+    "AI Pipeline node-label": ".node-label",
+    "event timeline empty-state text": ".not-yet",
+}
+
+
+@pytest.mark.parametrize("location_name,selector", list(_CARET_FREE_LOCATIONS.items()))
+def test_no_caret_appears_across_real_sections(page, location_name, selector):
+    target = page.locator(selector).first
+    target.scroll_into_view_if_needed()
+    box = target.bounding_box()
+    assert box is not None, f"{location_name} ({selector}) not found/visible on the real page"
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    selection_type = page.evaluate("window.getSelection().type")
+    assert selection_type != "Caret", f"{location_name} ({selector}) still produces a text-selection caret"
+
+
+def test_a_real_value_still_shows_a_real_selection_when_clicked(page):
+    """Proves the allow-list works both ways on the same page as the
+    zero-caret sweep above: the hero NIFTY price area is a real value
+    slot (user-select: text) and clicking it must still place a real
+    browser selection -- confirming the fix didn't over-correct into a
+    blanket suppression."""
+    hero = page.locator(".hero-ltp").first
+    box = hero.bounding_box()
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    selection_type = page.evaluate("window.getSelection().type")
+    assert selection_type in ("Caret", "Range")
