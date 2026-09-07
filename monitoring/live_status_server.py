@@ -1277,7 +1277,7 @@ def _render_data_foundation_section(view: dict[str, Any]) -> str:
     )
 
     return f"""
-<section class="card" id="data-foundation">
+<section class="card card-wide" id="data-foundation">
 <h2>{_NAV_ICONS['data-foundation']}Data Foundation</h2>
 <div class="node-flow node-flow-compact">{raw_flow}</div>
 <div class="pipeline">{archive_stage}{integrity_stage}{pnl_stage}{calib_stage}</div>
@@ -1528,8 +1528,20 @@ def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetim
     notif_detail_text = _esc(notif.detail) if notif else "not run"
 
     icon = _NAV_ICONS
+    # Real bug found from an actual screenshot: the notifications
+    # popover was getting clipped by .topbar's own height because it
+    # was a descendant of the SAME element whose horizontal scroll
+    # (overflow-x: auto) implicitly computes overflow-y to auto too
+    # (a real, well-known CSS interaction -- overflow-x set to anything
+    # but visible forces overflow-y to auto if it isn't explicitly
+    # visible either), clipping the popover vertically along with it.
+    # Real fix: the horizontally-scrollable items now live in their own
+    # inner .topbar-scroll wrapper; the popover (and the clock) sit in
+    # the OUTER .topbar, which is never overflow-clipped, so its real
+    # dropdown can render below the bar without being cut off.
     return f"""
 <div class="topbar">
+<div class="topbar-scroll">
 <div class="topbar-brand"><span class="topbar-mark">N</span>NIFTY AI TRADER</div>
 <div class="topbar-item">{icon['health']}<span class="dot {verdict_dot}"></span>SYSTEM <span data-live="gate-verdict-compact">{_esc(gate.verdict)}</span></div>
 <div class="topbar-item">{icon['market']}<span class="dot {session_dot}"></span>{_esc(session_label)}</div>
@@ -1539,6 +1551,7 @@ def _render_topbar(view: dict[str, Any], settings: Settings | None, now: datetim
 <div class="topbar-item">{icon['connection']}<span class="dot {kite_dot}"></span>KITE</div>
 <div class="topbar-item">{icon['intelligence']}<span class="dot {ai_dot}"></span>AI</div>
 <span id="stale-badge" class="badge badge-stale" hidden>STALE</span>
+</div>
 <div class="topbar-spacer"></div>
 <details class="topbar-item topbar-popover" id="notifications">
 <summary>{icon['notifications']}<span class="dot {notif_dot}"></span></summary>
@@ -1688,7 +1701,16 @@ h2 {{
   display: flex; align-items: center; gap: var(--sp-5);
   background: var(--card); border-bottom: 1px solid var(--border);
   padding: 0 var(--sp-4); font-size: var(--fs-xs); color: var(--text-dim);
-  font-family: var(--font-mono); white-space: nowrap; overflow-x: auto;
+  font-family: var(--font-mono); white-space: nowrap;
+  /* Deliberately no overflow rule here (stays the real default,
+     visible/visible) -- see _render_topbar's own docstring: putting
+     overflow-x: auto directly on this outer element also clips
+     vertically (a real CSS interaction, not a guess), cutting off the
+     real notifications popover below. The scrollable items live in
+     .topbar-scroll instead, so this element never clips anything. */
+}}
+.topbar-scroll {{
+  display: flex; align-items: center; gap: var(--sp-5); overflow-x: auto; min-width: 0; height: 100%;
 }}
 .topbar-brand {{ display: flex; align-items: center; gap: var(--sp-2); font-family: var(--font-ui); font-weight: 700; color: var(--text); flex-shrink: 0; }}
 .topbar-mark {{
@@ -1709,10 +1731,10 @@ h2 {{
 .topbar-popover summary::-webkit-details-marker {{ display: none; }}
 .topbar-popover summary::marker {{ content: ""; }}
 .topbar-popover .popover-content {{
-  display: none; position: absolute; top: calc(100% + var(--sp-2)); right: 0; z-index: 30;
-  min-width: 240px; max-width: 320px; background: var(--card-alt); border: 1px solid var(--glass-border);
+  display: none; position: absolute; top: calc(100% + var(--sp-2)); right: 0; z-index: 40;
+  min-width: 280px; max-width: 380px; width: max-content; background: var(--card-alt); border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4);
-  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 20px -12px rgba(0,0,0,0.5);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 12px 32px -8px rgba(0,0,0,0.6);
   font-family: var(--font-ui); white-space: normal; text-align: left;
 }}
 .topbar-popover:hover .popover-content, .topbar-popover[open] .popover-content {{ display: block; }}
