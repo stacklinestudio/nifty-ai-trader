@@ -52,6 +52,7 @@ from monitoring.live_status_server import (
 )
 from monitoring.logger import configure_logger
 from monitoring.system_health_gate import run_system_health_gate
+from reports.day_session_report import generate_and_notify_day_report
 from risk.risk_manager import RiskManager
 from storage.database import Database
 
@@ -504,6 +505,7 @@ def start_day(
     capture_starter=None,
     scheduler_runner=None,
     dashboard_starter=None,
+    report_generator=None,
     calendar: NseCalendar | None = None,
     today: datetime.date | None = None,
 ) -> dict:
@@ -511,7 +513,14 @@ def start_day(
     dashboard, (1) System Health Gate, (2) instrument archiving, (3)
     start real option tick capture in the background, (4) start the
     real main trading scheduler in the foreground (blocking, same as
-    `python main.py run`).
+    `python main.py run`), (5) once the real background capture thread
+    itself returns (`option_tick_capture_complete`, the real signal the
+    session is genuinely done), automatically generate and save the
+    real end-of-day session report and send one real Discord/Telegram
+    notification -- see `reports.day_session_report.generate_and_
+    notify_day_report`'s own docstring for its absolute fail-closed
+    guarantee (a report-generation failure can never affect anything
+    above, which has already completed by the time step 5 runs).
 
     Real bug report, confirmed by direct inspection: the dashboard used
     to only start inside step 4 (`run_scheduled_day`) -- meaning a real
@@ -556,22 +565,26 @@ def start_day(
     Steps 2-4 are independent: a real failure in one is caught, reported
     clearly in the returned result (and printed), and does not prevent
     the remaining steps from being attempted. `gate`/`archive_runner`/
-    `capture_starter`/`scheduler_runner`/`dashboard_starter` are
-    injectable (default to the real functions) purely so this can be
-    tested deterministically without live network calls -- production
-    callers never pass them.
+    `capture_starter`/`scheduler_runner`/`dashboard_starter`/
+    `report_generator` are injectable (default to the real functions)
+    purely so this can be tested deterministically without live network
+    calls -- production callers never pass them.
     """
     archive_runner = archive_runner or run_daily_archive
     capture_starter = capture_starter or _start_option_tick_capture_in_background
     scheduler_runner = scheduler_runner or run_scheduled_day
     dashboard_starter = dashboard_starter or _start_live_status_server_in_background_safely
+    report_generator = report_generator or generate_and_notify_day_report
     calendar = calendar or NseCalendar()
     today = today or datetime.datetime.now(IST).date()
 
     # Step 0, first, unconditionally -- see the docstring above.
     dashboard_starter(settings)
 
-    result: dict = {"gate": None, "stopped_after_gate": False, "archive": None, "capture": None, "scheduler": None}
+    result: dict = {
+        "gate": None, "stopped_after_gate": False, "archive": None, "capture": None,
+        "scheduler": None, "report": None,
+    }
 
     if gate is None:
         database = Database(settings.database_path)
@@ -624,6 +637,25 @@ def start_day(
         # killed by this function returning first -- see the docstring's
         # real finding above.
         capture_thread.join()
+
+        # Step 5: the automated end-of-day report -- called right here,
+        # right after option_tick_capture_complete fires (capture_
+        # thread.join() only returns once run_capture_session itself has
+        # logged that and returned), the same real signal that already
+        # marks the session as genuinely done. Only reached on a real
+        # trading day where capture genuinely started and completed --
+        # never fabricates a report for a day with no real completion
+        # signal. The real report_generator (generate_and_notify_day_
+        # report) already fails closed internally (see its own
+        # docstring) -- wrapped in try/except here too anyway, matching
+        # every other step above (archive/capture/scheduler), so even an
+        # injected report_generator that misbehaves can never take this
+        # function's own already-real, already-final result down with it.
+        try:
+            result["report"] = report_generator(settings, today=today)
+        except Exception as exc:  # noqa: BLE001 - a report-generation failure must never affect a real trading day that already completed.
+            result["report"] = {"status": "FAILED", "detail": f"{type(exc).__name__}: {exc}"}
+        print(f"day session report: {result['report']['status']} -- {result['report']['detail']}")
 
     return result
 

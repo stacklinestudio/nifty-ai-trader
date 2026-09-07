@@ -424,6 +424,145 @@ def test_the_real_start_day_cli_process_stays_up_after_a_real_kite_failure(tmp_p
         pass
 
 
+class _ReportTracker:
+    """Like _CallTracker, but accepts the real (settings, today=...)
+    signature generate_and_notify_day_report and its real call site use."""
+
+    def __init__(self, return_value=None, raises: Exception | None = None):
+        self.calls: list = []
+        self.return_value = return_value
+        self.raises = raises
+
+    def __call__(self, settings, today=None):
+        self.calls.append((settings, today))
+        if self.raises is not None:
+            raise self.raises
+        return self.return_value
+
+
+def test_the_real_report_generator_runs_after_the_real_capture_thread_joins(tmp_path, monkeypatch):
+    """The exact real trigger under test: the report step must run only
+    after the real background capture thread's own join() returns --
+    i.e. only once option_tick_capture_complete has genuinely fired."""
+    _patch_notifiers(monkeypatch)
+    settings = Settings(database_path=tmp_path / "paper.db")
+    gate = _gate("READY")
+    archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
+    scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
+
+    order: list[str] = []
+
+    class _FakeThread:
+        def join(self):
+            order.append("capture_joined")
+
+    capture_starter = _CallTracker(return_value=_FakeThread())
+
+    def report_generator(settings, today=None):
+        order.append("report_generated")
+        return {"status": "OK", "detail": "reports/generated/day_2026-09-08_live_session_report.md"}
+
+    result = main.start_day(
+        settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
+        report_generator=report_generator, today=_A_REAL_TRADING_DAY,
+    )
+
+    assert order == ["capture_joined", "report_generated"]
+    assert result["report"]["status"] == "OK"
+
+
+def test_the_real_report_generator_is_never_called_on_a_real_non_trading_day(tmp_path, monkeypatch):
+    """No real option_tick_capture_complete signal ever fires on a real
+    non-trading day (capture is never even started) -- the report step
+    must not run either, matching the literal real trigger it's tied to."""
+    _patch_notifiers(monkeypatch)
+    settings = Settings(database_path=tmp_path / "paper.db")
+    gate = _gate("READY")
+    archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
+    capture_starter = _CallTracker(return_value=None)
+    scheduler_runner = _CallTracker(return_value={"day_ran": False, "day_reason": "not_a_trading_day"})
+    dashboard_starter = _CallTracker(return_value=None)
+    report_generator = _ReportTracker(return_value={"status": "OK", "detail": "n/a"})
+
+    result = main.start_day(
+        settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
+        report_generator=report_generator, today=_A_REAL_NON_TRADING_DAY,
+    )
+
+    assert report_generator.calls == []
+    assert result["report"] is None
+
+
+def test_a_real_report_generation_failure_does_not_affect_the_rest_of_start_day(tmp_path, monkeypatch):
+    """The explicit requirement under test: a report-generation failure
+    must never affect the real trading day's own already-completed
+    result, and must never propagate out of start_day."""
+    _patch_notifiers(monkeypatch)
+    settings = Settings(database_path=tmp_path / "paper.db")
+    gate = _gate("READY")
+    archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
+
+    class _FakeThread:
+        def join(self):
+            pass
+
+    capture_starter = _CallTracker(return_value=_FakeThread())
+    scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
+    # Simulates even the real report_generator's own internal fail-closed
+    # wrapper somehow not catching something -- start_day's own call site
+    # must still never let this take the rest of the day down with it.
+    report_generator = _ReportTracker(raises=RuntimeError("simulated real report-generation failure"))
+
+    result = main.start_day(
+        settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
+        report_generator=report_generator, today=_A_REAL_TRADING_DAY,
+    )
+
+    assert result["report"]["status"] == "FAILED"
+    assert "simulated real report-generation failure" in result["report"]["detail"]
+    # Nothing else about the real day's completion was affected.
+    assert result["archive"]["status"] == "OK"
+    assert result["capture"]["status"] == "STARTED"
+    assert result["scheduler"]["status"] == "OK"
+
+
+def test_a_real_report_is_actually_generated_when_no_report_generator_is_injected(tmp_path, monkeypatch):
+    """Production callers never pass report_generator -- confirms the
+    real default (generate_and_notify_day_report) actually runs and
+    actually writes a real file, not just that some callable resolves."""
+    from reports import day_session_report
+
+    monkeypatch.setattr(day_session_report, "REPORTS_DIR", tmp_path / "reports" / "generated")
+    _patch_notifiers(monkeypatch)
+    settings = Settings(database_path=tmp_path / "paper.db")
+    gate = _gate("READY")
+    archive_runner = _CallTracker(return_value=tmp_path / "archive.json")
+
+    class _FakeThread:
+        def join(self):
+            pass
+
+    capture_starter = _CallTracker(return_value=_FakeThread())
+    scheduler_runner = _CallTracker(return_value={"day_ran": True})
+    dashboard_starter = _CallTracker(return_value=None)
+
+    result = main.start_day(
+        settings, gate=gate, archive_runner=archive_runner, capture_starter=capture_starter,
+        scheduler_runner=scheduler_runner, dashboard_starter=dashboard_starter,
+        today=_A_REAL_TRADING_DAY,  # report_generator NOT injected -- the real default runs
+    )
+
+    assert result["report"]["status"] == "OK"
+    expected_path = tmp_path / "reports" / "generated" / f"day_{_A_REAL_TRADING_DAY.isoformat()}_live_session_report.md"
+    assert expected_path.exists()
+    assert "Live Session Report" in expected_path.read_text(encoding="utf-8")
+
+
 def test_start_option_tick_capture_in_background_uses_a_real_nsecalendar_by_default():
     """Sanity check that the real NseCalendar this brief relies on
     behaves as expected for the two real dates used throughout these
