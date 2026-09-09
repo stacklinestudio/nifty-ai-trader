@@ -81,6 +81,15 @@ class CycleResult:
     # dashboard's own current-position card build the identical real
     # kite_chart_url() for an open position, not just the notification.
     instrument_token: int | None = None
+    # Phase 1 (Decision Ledger + Market State Snapshot): the real
+    # candidate_id assigned this cycle (see run_cycle's own decision-ledger
+    # block), when a real evaluated cycle produced one. Exposed here the
+    # same way score_attribution/instrument_token already are -- callers
+    # that want to cross-reference a cycle's decision-ledger row don't
+    # need a separate DB read/join. None whenever decision_ledger_
+    # components was absent or persistence failed (see the same fail-
+    # closed try/except pattern as score_attribution above).
+    decision_ledger_candidate_id: str | None = None
 
 
 def _selected_option_instrument_token(context: dict[str, Any]) -> int | None:
@@ -292,6 +301,50 @@ class Orchestrator:
                 )
             except Exception as exc:  # noqa: BLE001 - a persistence bug must never break the trading loop.
                 logger.warning("score_attribution_persist_failed error=%s", exc)
+
+        # Phase 1 (Decision Ledger + Market State Snapshot): same real
+        # shape as score_attribution just above -- execution/live_context.py
+        # ::_add_candidate sets decision_ledger_components unconditionally
+        # (before its own early-return), this is the one real place that
+        # both sees it and already owns a Database connection, and a
+        # missing/failed persist here can never break the trading loop.
+        # The real candidate_id is generated HERE, not in live_context.py,
+        # specifically so live_context.py's I/O-free contract holds: id
+        # generation needs a DB-backed sequence number (see Database.
+        # next_decision_ledger_sequence's own docstring for why that's
+        # DB-backed and not an in-memory counter), which is real I/O.
+        decision_ledger_candidate_id = None
+        components = state.context.get("decision_ledger_components")
+        if components is not None:
+            try:
+                from execution.decision_ledger import (
+                    build_market_state_snapshot,
+                    generate_candidate_id,
+                )
+
+                now = components["now"]
+                seq = self.database.next_decision_ledger_sequence(now.strftime("%Y%m%d"))
+                snapshot = build_market_state_snapshot(
+                    candidate_id=generate_candidate_id(now, seq),
+                    now=now,
+                    spot=components["spot"],
+                    features=components["features"],
+                    regime=components["regime"],
+                    trend_direction=components["trend_direction"],
+                    gap_pct=components["gap_pct"],
+                    option_quotes=components["option_quotes"],
+                    previous_option_quotes=components["previous_option_quotes"],
+                    global_context=components["global_context"],
+                    news_items=components["news_items"],
+                    setups_evaluated=components["setups_evaluated"],
+                    winning_setup_type=components["winning_setup_type"],
+                    winning_direction=components["winning_direction"],
+                )
+                self.database.save_decision_ledger_entry(snapshot)
+                decision_ledger_candidate_id = snapshot.candidate_id
+            except Exception as exc:  # noqa: BLE001 - a persistence bug must never break the trading loop.
+                logger.warning("decision_ledger_persist_failed error=%s", exc)
+
         self._event(EventType.SYSTEM_STARTED, {"trading_mode": self.settings.trading_mode})
         self._event(EventType.MARKET_PREP_STARTED, {"workflow": "research"})
 
@@ -335,6 +388,7 @@ class Orchestrator:
             state.order,
             attribution,
             _selected_option_instrument_token(state.context),
+            decision_ledger_candidate_id,
         )
 
     def _on_research_complete(self, event: Event) -> None:

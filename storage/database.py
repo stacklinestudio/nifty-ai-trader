@@ -30,6 +30,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS open_positions (order_id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, state_json TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS counterfactual_records (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, setup_type TEXT NOT NULL, direction TEXT NOT NULL, rejection_reason TEXT NOT NULL, exit_reason TEXT NOT NULL, profitable INTEGER NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS demo_live_position (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL, saved_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS decision_ledger (candidate_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, winning_setup_type TEXT, winning_direction TEXT, payload TEXT NOT NULL);
             """)
 
     def save_signal(self, signal: SignalRecord) -> None:
@@ -236,3 +237,64 @@ class Database:
                 "SELECT payload FROM counterfactual_records ORDER BY timestamp"
             ).fetchall()
         return [json.loads(payload) for (payload,) in rows[-limit:]]
+
+    def next_decision_ledger_sequence(self, date_str: str) -> int:
+        """Phase 1 (Decision Ledger): the real, DB-backed sequence source
+        for generate_candidate_id's <seq> component -- durable across a
+        process restart within the same real calendar day (an in-memory
+        counter, like DailyLimits, would silently reset to 0 on restart;
+        this counts real already-persisted rows instead). `date_str` is the
+        YYYYMMDD portion of the candidate_id being built, matched via a
+        real prefix scan against candidate_id itself (the table's own
+        primary key), not a separate date column read."""
+        with sqlite3.connect(self.path) as conn:
+            (count,) = conn.execute(
+                "SELECT COUNT(*) FROM decision_ledger WHERE candidate_id LIKE ?",
+                (f"CAND-{date_str}-%",),
+            ).fetchone()
+        return count + 1
+
+    def save_decision_ledger_entry(self, snapshot) -> None:
+        """Phase 1 (Decision Ledger + Market State Snapshot): one real,
+        immutable row per real evaluated cycle -- `candidate_id` is the
+        table's own PRIMARY KEY, so a genuine duplicate (should never
+        happen: next_decision_ledger_sequence is DB-backed) raises
+        sqlite3.IntegrityError rather than silently overwriting a real
+        prior snapshot; the caller (agents/orchestrator.py) wraps this in
+        the same fail-closed try/except already used for save_signal, so a
+        persistence bug here can never break the trading loop.
+
+        `snapshot` deliberately untyped here (duck-typed on
+        .candidate_id/.timestamp/.winning_setup_type/.winning_direction/
+        .to_dict()) -- execution.decision_ledger imports
+        execution.live_context, which transitively imports
+        agents.orchestrator; a top-level import of MarketStateSnapshot here
+        would be circular, the same real constraint save_counterfactual's
+        own docstring above already documents for CounterfactualRecord.
+        """
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO decision_ledger(candidate_id,timestamp,winning_setup_type,winning_direction,payload)"
+                " VALUES(?,?,?,?,?)",
+                (
+                    snapshot.candidate_id,
+                    snapshot.timestamp,
+                    snapshot.winning_setup_type,
+                    snapshot.winning_direction,
+                    json.dumps(snapshot.to_dict(), default=str),
+                ),
+            )
+
+    def recent_decision_ledger_entries(self, limit: int = 10000) -> list[dict]:
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM decision_ledger ORDER BY timestamp"
+            ).fetchall()
+        return [json.loads(payload) for (payload,) in rows[-limit:]]
+
+    def decision_ledger_entry(self, candidate_id: str) -> dict | None:
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT payload FROM decision_ledger WHERE candidate_id = ?", (candidate_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None

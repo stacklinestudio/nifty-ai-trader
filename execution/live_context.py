@@ -766,6 +766,43 @@ def _add_candidate(
     session_open = todays.index[0].to_pydatetime()
 
     setup = _select_setup(candles, todays, features, today, now, session_open, regime, trend_direction)
+
+    # Phase 1 (Decision Ledger + Market State Snapshot): a real, immutable
+    # trace of EVERY setup detector evaluated this cycle -- not just the
+    # one _select_setup above already, independently, chose -- captured
+    # unconditionally, before the early-return below, so a "no eligible
+    # setup" cycle gets a real snapshot too, not just a log line. This
+    # function's own I/O-free contract (see its docstring) is preserved:
+    # evaluate_all_setups is a pure function, no Database/candidate_id/
+    # persistence happens here -- that's deferred to agents/orchestrator.py,
+    # exactly where score_attribution below is also actually persisted,
+    # not here. Deferred (call-time, not module-level) import: execution.
+    # decision_ledger imports several of THIS module's own private
+    # detector functions to avoid reimplementing them, so this module
+    # cannot import decision_ledger back at module load time -- the same
+    # real constraint already documented on storage.database.Database.
+    # save_counterfactual for research.counterfactual.
+    from execution.decision_ledger import evaluate_all_setups
+
+    winning_setup_type = setup[0] if setup is not None else None
+    context["decision_ledger_components"] = {
+        "now": now,
+        "spot": context.get("spot", features["close"]),
+        "features": features,
+        "regime": regime,
+        "trend_direction": trend_direction,
+        "gap_pct": context.get("gap_pct", 0.0),
+        "option_quotes": option_quotes,
+        "previous_option_quotes": previous_option_quotes,
+        "global_context": context.get("global_context", []),
+        "news_items": context.get("news_items", []),
+        "setups_evaluated": evaluate_all_setups(
+            candles, todays, features, today, now, session_open, regime, trend_direction, winning_setup_type
+        ),
+        "winning_setup_type": winning_setup_type,
+        "winning_direction": setup[1] if setup is not None else None,
+    }
+
     if setup is None:
         # Either a HIGH_VOLATILITY/LOW_VOLATILITY regime (no setup family
         # is tried in either), or every setup that WAS eligible for this
