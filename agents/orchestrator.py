@@ -37,6 +37,16 @@ from execution.paper_broker import PaperBroker
 from execution.position_persistence import position_state_from_dict, position_state_to_dict
 from execution.position_supervisor import PositionState, TickResult
 from execution.position_supervisor import tick as supervise_tick
+from execution.session_state import (
+    RestartDiagnosis,
+    SessionState,
+    build_fail_closed_state,
+    diagnose_restart,
+    fresh_session_state,
+    load_session_state,
+    parse_session_state,
+    save_session_state,
+)
 from integrations.discord import DiscordNotifier, webhooks_by_category_from_settings
 from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
@@ -136,6 +146,7 @@ class Orchestrator:
         paper_broker: PaperBroker | None = None,
         ai_router: AIRouter | None = None,
         dry_run: bool = False,
+        now: datetime | None = None,
     ) -> None:
         """dry_run (Brief 10): the safe, explicit replacement for manually
         zeroing every Settings notification/vault field one at a time in a
@@ -149,6 +160,13 @@ class Orchestrator:
         selection (a separate, already-explicit mechanism via
         settings.ai_provider) -- a script that wants real AI output but no
         real notifications is exactly Brief 10 Part A's use case.
+
+        now (Phase 2 Piece 6): the real "what day is it" this construction
+        uses to load/reset today's session_state (DailyLimits.trades/
+        realized_pnl, _stopped_out_today) -- defaults to a fresh real
+        wall-clock read, injectable so a restart scenario can be tested
+        deterministically against a real, fixed date rather than
+        whatever the real calendar happens to be when tests run.
         """
         self.settings = settings
         self.database = database or Database(settings.database_path)
@@ -218,12 +236,52 @@ class Orchestrator:
             self.obsidian = ObsidianExporter(settings.obsidian_vault_path)
         self._state: _CycleState | None = None
         # (direction, setup_type, entry_regime) of every stop-out closed
-        # today, for the re-entry re-validation gate below. Cleared only by
-        # constructing a new Orchestrator (i.e. a new day, per the
-        # recommended cron/systemd-relaunch deployment) -- there is no
-        # separate "new day" reset call, since a process is expected to be
-        # scoped to one trading day.
+        # today, for the re-entry re-validation gate below.
         self._stopped_out_today: list[tuple[str, str, str | None]] = []
+
+        # Phase 2 Piece 6: real, date-keyed recovery of self.limits.trades/
+        # realized_pnl and self._stopped_out_today -- a real, named gap
+        # this project's own audit found (both were plain in-memory state,
+        # silently reset to 0/0.0/[] on every restart, permitting a
+        # mid-day crash-restart to exceed max_trades_per_day/max_daily_
+        # loss and slip a same-day stop-out past the re-entry guard). A
+        # genuinely NEW real trading day (a different real date than
+        # whatever is persisted) still correctly starts fresh -- see
+        # execution/session_state.py's own module docstring for exactly
+        # why that reset is intended, not a bug this closes.
+        real_now = now or datetime.now(IST)
+        today = real_now.date()
+        raw_state = load_session_state(self.database, today)
+        open_position_count = len(self.database.open_positions())
+        self.restart_diagnosis = diagnose_restart(raw_state, open_position_count)
+        if self.restart_diagnosis is RestartDiagnosis.CORRUPTED_STATE:
+            message = (
+                f"Real daily_metrics row for {today.isoformat()} failed validation -- "
+                "today's real trade count/realized P&L cannot be safely determined. "
+                "Failing closed: today's limits are being treated as already exhausted "
+                "rather than silently reset to 0, until a human confirms the real state."
+            )
+            logger.error("session_state_corrupted %s", message)
+            self.telegram.send_message("CRITICAL", message)
+            self.discord.send_message("CRITICAL", message)
+            self.session_state = build_fail_closed_state(today, "v2", real_now)
+        elif raw_state is not None:
+            self.session_state = parse_session_state(raw_state)
+        else:
+            self.session_state = fresh_session_state(today, "v2", real_now)
+        # Mutates the SAME real DailyLimits instance already constructed
+        # above and already handed by reference to self.risk_agent
+        # (RiskAgent(settings, self.limits)) -- rebinding self.limits to a
+        # brand-new object here would leave RiskAgent silently enforcing
+        # stale, non-recovered trade/loss numbers, a real bug caught while
+        # writing this piece's own tests.
+        self.limits.trades = self.session_state.trades
+        self.limits.realized_pnl = self.session_state.realized_pnl
+        self._stopped_out_today = list(self.session_state.stopped_out_today)
+        try:
+            save_session_state(self.database, self.session_state)
+        except Exception as exc:  # noqa: BLE001 - a persistence bug must never block startup.
+            logger.warning("session_state_initial_persist_failed error=%s", exc)
 
         self.bus.subscribe(EventType.MARKET_RESEARCH_COMPLETE, self._on_research_complete)
         self.bus.subscribe(EventType.SIGNAL_CREATED, self._on_signal_created)
@@ -493,6 +551,7 @@ class Orchestrator:
         state.order = order
         if order:
             self.limits.register_open()
+            self._persist_session_state(datetime.now(IST))
             self._event(
                 EventType.PAPER_ORDER_SENT, {"order_id": order["order_id"]}, 100, execution.agent
             )
@@ -612,6 +671,42 @@ class Orchestrator:
                 )
         return recovered
 
+    def _persist_session_state(self, now: datetime) -> None:
+        """Phase 2 Piece 6: re-saves today's real daily_metrics row from
+        the CURRENT real self.limits.trades/realized_pnl/
+        self._stopped_out_today -- called right after each real mutation
+        (register_open, register_close, a real stop-out) so a restart
+        moments later recovers the real up-to-date count, not whatever
+        was true at process start. A persistence bug here must never
+        block the trading loop (same fail-closed-but-non-fatal pattern
+        every other real persistence call in this class already uses),
+        but is escalated at CRITICAL severity -- unlike an AI-commentary
+        enrichment failure, losing this write is a real safety-relevant
+        gap for the NEXT restart, not just missing narrative text.
+        """
+        self.session_state = SessionState(
+            session_date=self.session_state.session_date,
+            trades=self.limits.trades,
+            realized_pnl=self.limits.realized_pnl,
+            stopped_out_today=tuple(self._stopped_out_today),
+            strategy_version=self.session_state.strategy_version,
+            last_processed_timestamp=now.isoformat(),
+            updated_at=now.isoformat(),
+        )
+        try:
+            save_session_state(self.database, self.session_state)
+        except Exception as exc:  # noqa: BLE001 - a persistence bug must never break the trading loop.
+            message = (
+                f"Failed to persist today's real session state (trades={self.limits.trades}, "
+                f"realized_pnl={self.limits.realized_pnl}) after a real mutation: "
+                f"{type(exc).__name__}: {exc}. A restart before the next successful save would "
+                "recover a STALE, undercounted trade/loss total -- check the real daily_metrics "
+                f"row for {self.session_state.session_date} by hand."
+            )
+            logger.error("session_state_persist_failed %s", message)
+            self.telegram.send_message("CRITICAL", message)
+            self.discord.send_message("CRITICAL", message)
+
     @staticmethod
     def _agent_directions(results: dict[str, AgentResult]) -> dict[str, str]:
         """Which research agents agreed/disagreed on direction at entry —
@@ -714,6 +809,11 @@ class Orchestrator:
             self._stopped_out_today.append(
                 (candidate.direction, candidate.setup_type, state.entry_regime)
             )
+        # Phase 2 Piece 6: one real persist covering both real mutations
+        # just above (realized_pnl and, on a stop-out, _stopped_out_today)
+        # -- a restart moments after this real close recovers both,
+        # not just whichever one a caller happened to persist first.
+        self._persist_session_state(now)
         hold_seconds = (now - state.opened_at).total_seconds()
         self._event(
             _EXIT_REASON_TO_EVENT.get(result.reason, EventType.FORCED_EXIT),

@@ -298,3 +298,27 @@ class Database:
                 "SELECT payload FROM decision_ledger WHERE candidate_id = ?", (candidate_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def session_state(self, date_str: str) -> dict | None:
+        """Phase 2 Piece 6: reuses the `daily_metrics` table, which
+        existed in the schema with no real writer/reader anywhere in this
+        codebase until this (confirmed by repo-wide grep -- the only other
+        reference is tests/test_demo_trade.py's own DB-isolation proof,
+        using it as a generic example row, not for its own semantics) --
+        not a new table for the same "per-real-day state" concept.
+        `date_str` is the real ISO date (YYYY-MM-DD) this state belongs
+        to; None (never a fabricated fresh state) when no row exists yet
+        for that real date."""
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT payload FROM daily_metrics WHERE date = ?", (date_str,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_session_state(self, date_str: str, payload: dict) -> None:
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO daily_metrics(date, payload) VALUES(?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET payload = excluded.payload",
+                (date_str, json.dumps(payload, default=str)),
+            )
