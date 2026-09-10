@@ -71,6 +71,15 @@ class TradeOutcomeRecord:
     score_attribution: dict[str, Any] | None
     market_state_snapshot: dict[str, Any] | None  # the real Phase 1 decision-ledger entry, when available
     ai_hypothesis_reference: str | None = field(default=None)  # set after an AI hypothesis, if any, is proposed for this trade
+    # Phase 2 Piece 7: real, tick-level reconstructed price/P&L/MFE-MAE
+    # evidence (data/option_price_reconstruction.py, learning/option_pnl.py)
+    # -- SUPPLEMENTARY only. realized_pnl/mfe/mae above remain the live-
+    # authoritative figures from execution/paper_broker.py's own real
+    # fill; this field is a separate, clearly-labeled cross-check, never
+    # a second source of truth -- see learning/option_pnl.py's own
+    # module docstring. None (never fabricated) whenever no real raw
+    # capture data was available/attached for this trade.
+    option_price_evidence: dict[str, Any] | None = field(default=None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +115,7 @@ class TradeOutcomeRecord:
             "score_attribution": self.score_attribution,
             "market_state_snapshot": self.market_state_snapshot,
             "ai_hypothesis_reference": self.ai_hypothesis_reference,
+            "option_price_evidence": self.option_price_evidence,
         }
 
 
