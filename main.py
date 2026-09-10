@@ -12,8 +12,10 @@ load_dotenv(".env.local")  # real local credentials take precedence...
 load_dotenv(".env")  # ...falling back to the non-secret template/defaults
 
 import argparse
+import dataclasses
 import datetime
 import json
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -21,6 +23,8 @@ from pathlib import Path
 import pandas as pd
 
 from agents.orchestrator import Orchestrator
+from backtest.daily_backtest import run_daily_backtest
+from backtest.daily_backtest_report import write_daily_backtest_report
 from backtest.engine import BacktestEngine
 from backtest.report import write_backtest_report
 from backtest.simulator import Simulator
@@ -679,6 +683,16 @@ def main() -> int:
         command = sub.add_parser(name)
         command.add_argument("--data", required=True)
         command.add_argument("--output", default="reports/generated/backtest.json")
+    # Phase 2 Piece 4: the real agent/orchestrator-based daily replay
+    # (backtest/daily_backtest.py) had no CLI entry point at all before
+    # this -- confirmed by Phase 1's own audit. `--data` expects the same
+    # real CSV shape the 42-day/248-day datasets already use (a "date"
+    # column, not "timestamp" -- deliberately NOT reusing this file's own
+    # `load()` helper above, which is for the older engine's own CSV
+    # convention).
+    daily_backtest_command = sub.add_parser("daily-backtest")
+    daily_backtest_command.add_argument("--data", required=True)
+    daily_backtest_command.add_argument("--output", default="reports/generated/daily_backtest.json")
     for name in (
         "health",
         "health-gate",
@@ -708,6 +722,36 @@ def main() -> int:
         except ValueError:
             walk = None
         print(write_backtest_report(result, Path(args.output), walk))
+        return 0
+    if args.command == "daily-backtest":
+        candles = pd.read_csv(args.data, parse_dates=["date"]).set_index("date")
+        if candles.index.tz is None:
+            candles.index = candles.index.tz_localize("Asia/Kolkata")
+        # run_daily_backtest constructs a real Orchestrator/Database per
+        # simulated day and genuinely persists to whatever
+        # settings.database_path resolves to -- a real incident this
+        # session found the hard way, this must NEVER be the live
+        # settings.database_path (nifty_ai_trader.db by default). Isolated,
+        # deleted-after-run scratch DB, regardless of what real settings
+        # this process otherwise has -- structural, not caller discipline.
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            backtest_settings = dataclasses.replace(
+                settings, database_path=Path(scratch_dir) / "daily_backtest_scratch.db"
+            )
+            report = run_daily_backtest(
+                backtest_settings, candles[["open", "high", "low", "close", "volume"]].astype(float)
+            )
+        print(write_daily_backtest_report(report, Path(args.output)))
+        print(
+            json.dumps(
+                {
+                    "trading_days_evaluated": report.trading_days_evaluated,
+                    "candidates_formed": report.candidates_formed,
+                    "trades_filled": report.trades_filled,
+                },
+                indent=2,
+            )
+        )
         return 0
     if args.command == "health":
         database = Database(settings.database_path)
