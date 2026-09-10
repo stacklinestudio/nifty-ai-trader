@@ -115,3 +115,35 @@ POST_TRADE_LESSON = (
     "specific lesson (e.g. the sample size is too small to mean "
     "anything), say that plainly rather than inventing one."
 )
+
+# Phase 2 Piece 5, Requirement 6: the first bounded AI-learning context
+# interface. `aggregated_statistics` and `recent_learning_events` in the
+# supplied facts are already real, deterministically computed
+# (learning/learning_aggregation.py -- grouped win_rate/expectancy/
+# success_rate/calibration stats over real closed trades) and bounded
+# (learning/ai_learning_context.py caps recent_learning_events at a fixed
+# real count, never the full unbounded history) -- this prompt asks only
+# for a narrative synthesis of numbers that are already true and already
+# graded. The AI is never asked to compute, restate, or re-judge any
+# success/failure verdict -- every evaluation_result in the supplied
+# facts was already decided by deterministic code before this call.
+AI_LEARNING_CONTEXT_ANALYSIS = (
+    "The supplied facts are real, deterministically-computed learning "
+    "evidence from this project's own closed paper trades: "
+    '"aggregated_statistics" (per real setup_type+regime combination -- '
+    "sample_size, win_rate, expectancy, success_rate, average confidence-"
+    'calibration gap, average MFE/MAE) and "recent_learning_events" (a '
+    "bounded, real sample of the most recent individual closed trades, "
+    "each already carrying its own deterministic prediction-evaluation "
+    "verdict). Every number and every success/failure verdict here was "
+    "already computed by deterministic code -- you are NOT being asked "
+    "to grade, re-score, or second-guess any of it. Propose up to 3 "
+    "real, falsifiable lessons or patterns a person could investigate "
+    "further, each grounded in specific real numbers from the supplied "
+    "facts (cite the real setup_type/regime/sample_size you're drawing "
+    "from). This is advisory research only: it can never change any "
+    "live trading parameter, and nothing reads your output back into "
+    "the trading pipeline. If the real sample sizes are too small "
+    "across the board to support any real pattern, say that plainly "
+    "instead of inventing one."
+)

@@ -224,6 +224,50 @@ def test_full_cycle_supervise_exit_review_trade_path_end_to_end(tmp_path):
     assert payload["mae"] == 0.0
 
 
+def test_full_cycle_produces_a_real_learning_event_end_to_end(tmp_path):
+    """Phase 2 Piece 5: the same real run_cycle -> open_position ->
+    supervise_once -> close flow as the test immediately above, this
+    time proving the NEW canonical "learning_event" record actually gets
+    produced through the real orchestrator wiring (not just via a
+    directly-called PostTradeAgent.analyze() in isolation) -- entry/exit
+    timestamps genuinely threaded through from the real PositionState/
+    real close time, not fabricated."""
+    settings = Settings(database_path=tmp_path / "paper.db")
+    orchestrator = Orchestrator(settings)
+    cycle = orchestrator.run_cycle(filled_cycle_context())
+    assert cycle.order and cycle.order["status"] == "FILLED"
+
+    state = orchestrator.open_position(cycle)
+    open_time = opened_at(hour=10)
+    state.opened_at = open_time
+    state.last_quote_at = open_time
+    orchestrator.supervise_once(state, state.thesis.entry + 0.5, open_time)
+    close_time = open_time + timedelta(seconds=5)
+    result = orchestrator.supervise_once(state, state.thesis.target, close_time)
+    assert result.should_exit and result.reason == "TAKE_PROFIT"
+
+    events = orchestrator.memory.recent(memory_type="learning_event", limit=5)
+    assert events, "expected a real learning_event record"
+    event = events[0]["payload"]
+    outcome_record = event["outcome_record"]
+    assert outcome_record["outcome"] == "WIN"
+    assert outcome_record["entry_timestamp"] == open_time.isoformat()
+    assert outcome_record["exit_timestamp"] == close_time.isoformat()
+    assert outcome_record["realized_pnl"] == payload_pnl_from(orchestrator, event)
+    assert event["prediction_evaluation"]["evaluation_result"] is True
+    assert event["prediction_evaluation"]["success_condition"] == "realized_outcome == WIN"
+
+
+def payload_pnl_from(orchestrator: Orchestrator, event: dict) -> float:
+    """The real trade record's own pnl, read back from the same real
+    MemoryStore -- confirms the learning_event's realized_pnl matches
+    the same real fill/cost-adjusted number the existing "trade" record
+    carries, not a second, independently (and possibly differently)
+    computed figure."""
+    trades = orchestrator.memory.recent(memory_type="trade", limit=5)
+    return trades[0]["payload"]["pnl"]
+
+
 def test_supervise_once_closes_real_position_on_stop_loss(tmp_path):
     settings = Settings(database_path=tmp_path / "paper.db")
     orchestrator = Orchestrator(settings)

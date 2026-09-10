@@ -742,7 +742,7 @@ class Orchestrator:
         trade_review_context = None
         try:
             trade_review_context = build_trade_review_context(
-                self.database, self.memory, state, order, pnl, result.reason, hold_seconds
+                self.database, self.memory, state, order, pnl, result.reason, hold_seconds, now
             ).to_facts()
         except Exception as exc:  # noqa: BLE001 - enrichment only; must never block the real close.
             logger.warning("trade_review_context_build_failed error=%s", exc)

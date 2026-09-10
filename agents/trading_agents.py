@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 from typing import Any
 
@@ -14,9 +15,11 @@ from data.option_chain import OptionQuote
 from intelligence.oi_buildup import detect_buildup
 from learning.experiment_manager import Experiment, create_experiment
 from learning.hypothesis import HypothesisCondition, evaluate_hypothesis, parse_hypothesis_condition
+from learning.learning_event import build_learning_event, record_learning_event
 from learning.memory import MemoryStore
 from learning.prediction_review import compute_prediction_error, record_prediction_review
 from learning.trade_memory import record_trade
+from learning.trade_outcome import build_trade_outcome_record
 from monitoring.logger import configure_logger
 from risk.confidence_scaling import scale_quantity
 from risk.risk_manager import RiskManager
@@ -323,25 +326,42 @@ class PostTradeAgent(BaseAgent):
         entry_regime = context.get("entry_regime")
         hold_seconds = context.get("hold_seconds")
         hypothesis = f"{setup_type} exiting via {exit_reason} produced {outcome} (pnl={pnl})."
-        record_trade(
-            self.memory,
-            {
-                "outcome": outcome,
-                "pnl": pnl,
-                "setup_type": setup_type,
-                "exit_reason": exit_reason,
-                "mae": mae,
-                "mfe": mfe,
-                "entry_regime": entry_regime,
-                "entry_volatility_regime": context.get("entry_volatility_regime"),
-                "entry_consensus": context.get("entry_consensus"),
-                "agent_agreement": context.get("agent_agreement"),
-                "confidence": context.get("confidence"),
-                "stop_was_trailed": context.get("stop_was_trailed"),
-                "hold_seconds": hold_seconds,
-            },
-            datetime.now(IST),
-        )
+        review_context_facts = context.get("trade_review_context")
+
+        # Phase 2 Piece 5, Requirement 2: when the real decision-ledger/
+        # candidate/execution context is available, record_trade is called
+        # with the canonical TradeOutcomeRecord -- a strict superset of the
+        # older inline dict (learning/trade_outcome.py::TradeOutcomeRecord.
+        # to_dict() keeps the exact "pnl"/"setup_type"/"entry_regime" keys
+        # learning/pattern_memory.py::stats_for already depends on) --
+        # instead of the thinner ad hoc dict. Falls back to that original
+        # minimal dict, completely unchanged, when no real context is
+        # available (every existing test's hand-built outcome_facts) --
+        # fully backward compatible.
+        outcome_record = None
+        if review_context_facts is not None:
+            outcome_record = build_trade_outcome_record(review_context_facts)
+            record_trade(self.memory, outcome_record.to_dict(), datetime.now(IST))
+        else:
+            record_trade(
+                self.memory,
+                {
+                    "outcome": outcome,
+                    "pnl": pnl,
+                    "setup_type": setup_type,
+                    "exit_reason": exit_reason,
+                    "mae": mae,
+                    "mfe": mfe,
+                    "entry_regime": entry_regime,
+                    "entry_volatility_regime": context.get("entry_volatility_regime"),
+                    "entry_consensus": context.get("entry_consensus"),
+                    "agent_agreement": context.get("agent_agreement"),
+                    "confidence": context.get("confidence"),
+                    "stop_was_trailed": context.get("stop_was_trailed"),
+                    "hold_seconds": hold_seconds,
+                },
+                datetime.now(IST),
+            )
         create_experiment(
             self.memory,
             Experiment(hypothesis, {"setup_type": setup_type, "entry_regime": entry_regime}, "v2"),
@@ -349,23 +369,24 @@ class PostTradeAgent(BaseAgent):
         )
         ai_explanation = self._explain(outcome, pnl, setup_type, exit_reason, mae, mfe, hold_seconds)
 
-        # Phase 2 Pieces 2-3: real historical context -> AI hypothesis ->
-        # deterministic evaluation, and prediction-error -> AI lesson.
-        # Purely additive to the deterministic recording above (already
-        # run, unchanged): absent (None-valued, never fabricated) whenever
-        # context["trade_review_context"] wasn't supplied -- e.g. every
-        # existing test's minimal hand-built outcome_facts, which keeps
-        # this feature fully backward compatible.
+        # Phase 2 Pieces 2-3, extended by Piece 5: real historical context
+        # -> AI hypothesis -> deterministic evaluation, prediction-error ->
+        # AI lesson, and (Piece 5, Requirement 4) the canonical learning
+        # event -- generated unconditionally for both winning and losing
+        # trades, no branch on outcome sign anywhere below. Purely
+        # additive to the deterministic recording above (already run,
+        # unchanged): absent (None-valued, never fabricated) whenever
+        # context["trade_review_context"] wasn't supplied.
         ai_hypothesis_condition: HypothesisCondition | None = None
         ai_hypothesis_evaluation_dict: dict[str, Any] | None = None
         ai_lesson: str | None = None
-        review_context_facts = context.get("trade_review_context")
         if review_context_facts is not None:
             ai_hypothesis_condition = self._propose_hypothesis(review_context_facts)
+            ai_hypothesis_experiment_id: str | None = None
             if ai_hypothesis_condition is not None:
                 evaluation = evaluate_hypothesis(ai_hypothesis_condition, self.memory, datetime.now(IST))
                 ai_hypothesis_evaluation_dict = evaluation.to_dict()
-                create_experiment(
+                ai_hypothesis_experiment_id = create_experiment(
                     self.memory,
                     Experiment(
                         f"AI hypothesis: {ai_hypothesis_condition.metric} on "
@@ -375,14 +396,31 @@ class PostTradeAgent(BaseAgent):
                             "source": "ai_proposed",
                             "hypothesis_condition": ai_hypothesis_condition.to_dict(),
                             "evaluated_at_creation": ai_hypothesis_evaluation_dict,
+                            "outcome_id": outcome_record.outcome_id if outcome_record else None,
                         },
                         "v2",
                     ),
                     datetime.now(IST),
                 )
+                # Requirement 2's "original AI prediction/hypothesis
+                # reference": the already-persisted "trade" record can't
+                # be retroactively updated (MemoryStore is deliberately
+                # append-only, no UPDATE method exists at all -- see its
+                # own docstring), so the reference is carried on the
+                # richer, synthesized learning-event snapshot below
+                # instead, built moments later in this same real flow.
+                if outcome_record is not None:
+                    outcome_record = dataclasses.replace(
+                        outcome_record, ai_hypothesis_reference=ai_hypothesis_experiment_id
+                    )
+
             prediction_error = compute_prediction_error(review_context_facts)
             ai_lesson = self._generate_lesson(prediction_error)
             record_prediction_review(self.memory, prediction_error, ai_lesson, datetime.now(IST))
+
+            if outcome_record is not None:
+                learning_event = build_learning_event(outcome_record, prediction_error, datetime.now(IST))
+                record_learning_event(self.memory, learning_event, datetime.now(IST))
 
         return result(
             self.name,
@@ -393,6 +431,7 @@ class PostTradeAgent(BaseAgent):
             ai_hypothesis_condition=ai_hypothesis_condition.to_dict() if ai_hypothesis_condition else None,
             ai_hypothesis_evaluation=ai_hypothesis_evaluation_dict,
             ai_lesson=ai_lesson,
+            outcome_id=outcome_record.outcome_id if outcome_record else None,
         )
 
     def _explain(

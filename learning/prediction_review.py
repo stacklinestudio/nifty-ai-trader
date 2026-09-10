@@ -1,4 +1,4 @@
-"""Phase 2 Piece 3: Prediction vs Outcome.
+"""Phase 2 Piece 3 (extended in Piece 5): Prediction vs Outcome.
 
 compute_prediction_error is a pure, deterministic function -- the real
 "error" between what the deterministic pipeline's own signal predicted
@@ -9,6 +9,21 @@ closes). This is computed in code, never by the AI, and handed to the AI
 only as an already-true fact for it to write a "lesson" narrative about
 -- the AI never gets to invent its own version of what was predicted or
 what happened.
+
+Phase 2 Piece 5, Requirement 3: the returned dict must explicitly carry
+a measurable success/failure condition and its evaluation result, not
+just the raw calibration-gap number -- both computed here, deterministically,
+never by the AI. The real, per-trade condition is the simplest one the
+deterministic pipeline's own signal actually implies: this candidate was
+taken because the deterministic pipeline expected it to be profitable,
+so "the real outcome is a WIN" is the real, literal, already-defined
+success condition for that expectation -- not a new invented rule. This
+is a real, DIFFERENT evaluation than learning/hypothesis.py's (which
+grades an aggregate setup+regime hypothesis across many trades, keyed on
+a real accumulated win_rate/expectancy sample) -- this one grades a
+single trade's own prediction the moment it closes. Both are
+deterministic and neither lets the AI grade itself; they answer
+different real questions and do not duplicate each other.
 
 record_prediction_review persists both the real error facts and the
 AI's real lesson text to MemoryStore under a new, additive memory_type
@@ -46,15 +61,27 @@ def compute_prediction_error(review_context_facts: dict[str, Any]) -> dict[str, 
     # values mean the real confidence and the real outcome diverged more.
     confidence_calibration_gap = abs((predicted_confidence / 100.0) - realized_value)
 
+    # Requirement 3's explicit measurable success/failure condition and
+    # evaluation result -- deterministic, stated as a real string (not
+    # just implied by other fields), so a reader (human or AI) sees
+    # exactly what rule was applied, not just the verdict.
+    success_condition = "realized_outcome == WIN"
+    evaluation_result = realized_outcome == "WIN"
+
     return {
         "candidate_id": candidate.get("candidate_id"),
         "setup_type": candidate["setup_type"],
         "regime": outcome.get("entry_regime"),
+        "prediction": {"direction": predicted_direction, "confidence": predicted_confidence},
         "predicted_direction": predicted_direction,
         "predicted_confidence": predicted_confidence,
+        "actual_outcome": {"outcome": realized_outcome, "pnl": outcome["pnl"]},
         "realized_outcome": realized_outcome,
         "pnl": outcome["pnl"],
+        "prediction_error": confidence_calibration_gap,
         "confidence_calibration_gap": confidence_calibration_gap,
+        "success_condition": success_condition,
+        "evaluation_result": evaluation_result,
         "prior_win_rate_for_setup_regime": prior["win_rate"],
         "prior_sample_size_for_setup_regime": prior["sample_size"],
         "prior_low_confidence": prior["low_confidence"],

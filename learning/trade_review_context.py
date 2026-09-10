@@ -18,6 +18,7 @@ persistence disabled/failed that cycle) -- never a guessed placeholder.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from execution.position_supervisor import PositionState
@@ -33,6 +34,16 @@ class TradeReviewContext:
     execution: dict[str, Any]
     outcome: dict[str, Any]
     prior_pattern_stats: dict[str, Any]
+    # Phase 2 Piece 5: the real, entry-time score_attribution dict (the 7-
+    # component breakdown -- see execution/live_context.py::_add_candidate)
+    # this exact trade's candidate was selected under -- the same real
+    # dict agents/orchestrator.py::open_position already carries on
+    # PositionState.entry_score_attribution for the Obsidian trade
+    # journal, surfaced here too so the canonical trade-outcome record
+    # (learning/trade_outcome.py) doesn't need a second lookup. None
+    # whenever the entry cycle never went through the live-context
+    # pipeline (e.g. hand-built test contexts), never fabricated.
+    score_attribution: dict[str, Any] | None = None
 
     def to_facts(self) -> dict[str, Any]:
         """Flat, JSON-safe dict -- what's actually threaded into
@@ -44,6 +55,7 @@ class TradeReviewContext:
             "execution": self.execution,
             "outcome": self.outcome,
             "prior_pattern_stats": self.prior_pattern_stats,
+            "score_attribution": self.score_attribution,
         }
 
 
@@ -55,7 +67,14 @@ def build_trade_review_context(
     pnl: float,
     exit_reason: str | None,
     hold_seconds: float,
+    exit_timestamp: datetime,
 ) -> TradeReviewContext:
+    """`exit_timestamp` is the real `now` agents/orchestrator.py::
+    _close_position already has at the moment this trade closed -- not a
+    fresh wall-clock read here, which would silently diverge from the
+    real close time (the same real-timestamp discipline execution/
+    live_context.py::_add_candidate already documents for its own `now`
+    parameter)."""
     candidate = state.thesis.candidate
 
     decision_ledger_entry = None
@@ -74,6 +93,7 @@ def build_trade_review_context(
         decision_ledger_entry=decision_ledger_entry,
         candidate={
             "candidate_id": candidate.candidate_id,
+            "decision_ledger_candidate_id": state.entry_decision_ledger_candidate_id,
             "direction": candidate.direction,
             "setup_type": candidate.setup_type,
             "confidence": candidate.confidence,
@@ -85,7 +105,9 @@ def build_trade_review_context(
         },
         execution={
             "order_id": order.get("order_id"),
+            "entry_timestamp": state.opened_at.isoformat(),
             "entry_price": state.thesis.entry,
+            "exit_timestamp": exit_timestamp.isoformat(),
             "exit_price": order.get("fill_price"),
             "quantity": state.thesis.quantity,
             "estimated_costs": order.get("estimated_costs"),
@@ -112,4 +134,5 @@ def build_trade_review_context(
             "expectancy": stats.expectancy,
             "low_confidence": stats.low_confidence,
         },
+        score_attribution=state.entry_score_attribution,
     )
