@@ -7,13 +7,15 @@ from typing import Any
 
 from agents.base import BaseAgent
 from agents.contracts import AgentResult, Decision, TradeCandidate, TradeThesis, Validation
-from ai.prompts import POST_TRADE_EXPLANATION
+from ai.prompts import POST_TRADE_EXPLANATION, POST_TRADE_HYPOTHESIS, POST_TRADE_LESSON
 from ai.router import AIRouter
 from config import IST, Settings
 from data.option_chain import OptionQuote
 from intelligence.oi_buildup import detect_buildup
 from learning.experiment_manager import Experiment, create_experiment
+from learning.hypothesis import HypothesisCondition, evaluate_hypothesis, parse_hypothesis_condition
 from learning.memory import MemoryStore
+from learning.prediction_review import compute_prediction_error, record_prediction_review
 from learning.trade_memory import record_trade
 from monitoring.logger import configure_logger
 from risk.confidence_scaling import scale_quantity
@@ -346,12 +348,51 @@ class PostTradeAgent(BaseAgent):
             datetime.now(IST),
         )
         ai_explanation = self._explain(outcome, pnl, setup_type, exit_reason, mae, mfe, hold_seconds)
+
+        # Phase 2 Pieces 2-3: real historical context -> AI hypothesis ->
+        # deterministic evaluation, and prediction-error -> AI lesson.
+        # Purely additive to the deterministic recording above (already
+        # run, unchanged): absent (None-valued, never fabricated) whenever
+        # context["trade_review_context"] wasn't supplied -- e.g. every
+        # existing test's minimal hand-built outcome_facts, which keeps
+        # this feature fully backward compatible.
+        ai_hypothesis_condition: HypothesisCondition | None = None
+        ai_hypothesis_evaluation_dict: dict[str, Any] | None = None
+        ai_lesson: str | None = None
+        review_context_facts = context.get("trade_review_context")
+        if review_context_facts is not None:
+            ai_hypothesis_condition = self._propose_hypothesis(review_context_facts)
+            if ai_hypothesis_condition is not None:
+                evaluation = evaluate_hypothesis(ai_hypothesis_condition, self.memory, datetime.now(IST))
+                ai_hypothesis_evaluation_dict = evaluation.to_dict()
+                create_experiment(
+                    self.memory,
+                    Experiment(
+                        f"AI hypothesis: {ai_hypothesis_condition.metric} on "
+                        f"{ai_hypothesis_condition.setup_type}/{ai_hypothesis_condition.regime} "
+                        f"{ai_hypothesis_condition.operator} {ai_hypothesis_condition.threshold}",
+                        {
+                            "source": "ai_proposed",
+                            "hypothesis_condition": ai_hypothesis_condition.to_dict(),
+                            "evaluated_at_creation": ai_hypothesis_evaluation_dict,
+                        },
+                        "v2",
+                    ),
+                    datetime.now(IST),
+                )
+            prediction_error = compute_prediction_error(review_context_facts)
+            ai_lesson = self._generate_lesson(prediction_error)
+            record_prediction_review(self.memory, prediction_error, ai_lesson, datetime.now(IST))
+
         return result(
             self.name,
             60,
             ("Closed-trade facts recorded; hypothesis is a candidate only, not a promotion.",),
             review={"outcome": outcome, "pnl": pnl, "mae": mae, "mfe": mfe, "learning_hypothesis": hypothesis},
             ai_explanation=ai_explanation,
+            ai_hypothesis_condition=ai_hypothesis_condition.to_dict() if ai_hypothesis_condition else None,
+            ai_hypothesis_evaluation=ai_hypothesis_evaluation_dict,
+            ai_lesson=ai_lesson,
         )
 
     def _explain(
@@ -386,4 +427,36 @@ class PostTradeAgent(BaseAgent):
             return analysis.summary or None
         except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; failure must not affect the already-recorded real trade facts.
             logger.warning("post_trade_ai_explanation_failed error=%s", exc)
+            return None
+
+    def _propose_hypothesis(self, review_context_facts: dict[str, Any]) -> HypothesisCondition | None:
+        """Phase 2 Piece 2: asks the real AI provider for exactly one
+        falsifiable hypothesis, given the real trade + real prior pattern
+        stats already assembled by learning/trade_review_context.py.
+        Strictly parsed/validated by learning.hypothesis::
+        parse_hypothesis_condition -- a malformed or empty AI response
+        becomes None here, never a guessed condition. Any failure (no
+        provider configured, network, parsing) is caught locally, same
+        reasoning as _explain above: must never escape and discard the
+        already-recorded deterministic trade facts."""
+        try:
+            analysis = self.ai_router.analyze(POST_TRADE_HYPOTHESIS, review_context_facts)
+            structured = analysis.source_facts.get("structured")
+            return parse_hypothesis_condition(structured)
+        except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; failure must not affect the already-recorded real trade facts.
+            logger.warning("post_trade_ai_hypothesis_failed error=%s", exc)
+            return None
+
+    def _generate_lesson(self, prediction_error: dict[str, Any]) -> str | None:
+        """Phase 2 Piece 3: asks the real AI provider to narrate a lesson
+        from the already-computed, real prediction_error facts (learning.
+        prediction_review::compute_prediction_error) -- the AI never
+        computes the error itself, only interprets numbers already true.
+        Same local-failure-never-escapes reasoning as _explain/
+        _propose_hypothesis above."""
+        try:
+            analysis = self.ai_router.analyze(POST_TRADE_LESSON, {"prediction_error": prediction_error})
+            return analysis.summary or None
+        except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; failure must not affect the already-recorded real trade facts.
+            logger.warning("post_trade_ai_lesson_failed error=%s", exc)
             return None

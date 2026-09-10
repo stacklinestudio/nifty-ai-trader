@@ -41,6 +41,7 @@ from integrations.discord import DiscordNotifier, webhooks_by_category_from_sett
 from integrations.obsidian import ObsidianExporter, render_decision_note
 from integrations.telegram import TelegramNotifier
 from learning.memory import MemoryStore
+from learning.trade_review_context import build_trade_review_context
 from monitoring.live_status_server import dashboard_url, kite_chart_url, live_status_url
 from monitoring.logger import configure_logger
 from risk.risk_manager import RiskManager
@@ -577,6 +578,7 @@ class Orchestrator:
             cycle.score_attribution,
             cycle.validation.reasons,
             cycle.instrument_token,
+            cycle.decision_ledger_candidate_id,
         )
         self.database.save_open_position(
             state.entry_order_id, state.opened_at.isoformat(), position_state_to_dict(state)
@@ -728,6 +730,23 @@ class Orchestrator:
             100,
             "execution",
         )
+        # Phase 2 Piece 1: real historical context for PostTradeAgent --
+        # the actual decision ledger, market state, candidate, execution,
+        # and prior-pattern-stats context for this exact trade. Additive
+        # only: every key review_trade's outcome_facts dict already
+        # carried above is unchanged; this is one more key, absent
+        # (None-valued via build_trade_review_context's own fail-closed
+        # reads) rather than fabricated whenever the underlying real data
+        # isn't available. A failure here must never prevent the
+        # deterministic facts above from still reaching review_trade.
+        trade_review_context = None
+        try:
+            trade_review_context = build_trade_review_context(
+                self.database, self.memory, state, order, pnl, result.reason, hold_seconds
+            ).to_facts()
+        except Exception as exc:  # noqa: BLE001 - enrichment only; must never block the real close.
+            logger.warning("trade_review_context_build_failed error=%s", exc)
+
         self.review_trade(
             {
                 "outcome": "WIN" if pnl > 0 else "LOSS",
@@ -743,6 +762,7 @@ class Orchestrator:
                 "agent_agreement": state.entry_agent_directions,
                 "confidence": state.thesis.confidence,
                 "stop_was_trailed": state.current_stop != state.thesis.stop,
+                "trade_review_context": trade_review_context,
             }
         )
         # Real per-trade journal entry, written as the day happens -- was

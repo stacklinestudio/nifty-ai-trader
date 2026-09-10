@@ -62,6 +62,17 @@ class PositionState:
     # real reporting, same as entry_score_attribution above. None
     # whenever no real option was ever selected (e.g. no candidate).
     entry_instrument_token: int | None = None
+    # Phase 2 Piece 1 (Decision Ledger -> PostTradeAgent real historical
+    # context): the real decision_ledger candidate_id (Phase 1) for the
+    # exact cycle that produced this trade -- carried through the same
+    # way entry_score_attribution/entry_instrument_token already are, so
+    # _close_position can later look up the full real market-state
+    # snapshot for review_trade without a fuzzy timestamp join. None when
+    # decision-ledger persistence was absent/failed that cycle (see
+    # agents/orchestrator.py::run_cycle's own fail-closed handling) -- not
+    # used by any decision logic, purely for later real reporting/review,
+    # same as the two fields above.
+    entry_decision_ledger_candidate_id: str | None = None
 
     @classmethod
     def opening(
@@ -76,11 +87,13 @@ class PositionState:
         entry_score_attribution: dict[str, Any] | None = None,
         entry_validation_reasons: tuple[str, ...] = (),
         entry_instrument_token: int | None = None,
+        entry_decision_ledger_candidate_id: str | None = None,
     ) -> PositionState:
         return cls(
             thesis, opened_at, thesis.stop, thesis.entry, opened_at, 0.0, 0.0,
             entry_regime, entry_volatility_regime, entry_consensus, entry_agent_directions,
             entry_order_id, entry_score_attribution, entry_validation_reasons, entry_instrument_token,
+            entry_decision_ledger_candidate_id,
         )
 
     def observe(self, ltp: float, now: datetime, trail_pct: float) -> None:

@@ -64,3 +64,54 @@ POST_TRADE_EXPLANATION = (
     "trade has already closed; it can suggest a research question, never "
     "a parameter change, and it never affects any trade, open or future."
 )
+
+# Phase 2 Piece 2: AI hypothesis -> Experiment Lab. Reuses the existing
+# AIAnalysis "structured" field (already parsed/stored by ai/provider.py
+# unchanged) -- no new schema, no new provider call shape, just a new
+# prompt asking that same field to hold a specific, real shape.
+POST_TRADE_HYPOTHESIS = (
+    "The supplied facts describe one real, already-closed paper trade, "
+    "together with prior_pattern_stats -- the real, deterministic win "
+    "rate/expectancy already measured across this project's own real "
+    "trade history for this exact setup_type+regime combination (not "
+    "fabricated; a real read, though the sample may still be small). "
+    "Propose exactly ONE falsifiable hypothesis this trade suggests "
+    "about a specific setup_type+regime combination's future "
+    "performance. Put it in \"structured\" as: {\"metric\": \"win_rate\" "
+    'or "expectancy", "setup_type": "<the exact setup_type string from '
+    'the supplied facts>", "regime": "<the exact regime string from the '
+    'supplied facts>", "operator": one of ">=", "<=", ">", "<", '
+    '"threshold": <a real number>, "min_samples": <a real integer -- the '
+    "minimum sample size you believe is needed before this can be fairly "
+    'judged, e.g. 20 or more>, "rationale": "<why this one trade '
+    'suggests this, 1-2 sentences>"}. You are proposing a TEST, not '
+    "grading it -- never claim the hypothesis is already confirmed or "
+    "refuted; a separate deterministic system evaluates it later against "
+    "real accumulated trade data, using only real numbers, never your "
+    'own judgment. If the real facts genuinely do not support a '
+    'meaningful hypothesis yet, set "structured" to {} and say so '
+    'plainly in "summary" rather than inventing one.'
+)
+
+# Phase 2 Piece 3: Prediction vs Outcome. `prediction_error` in the
+# supplied facts is already a real, deterministically-computed
+# comparison (learning/prediction_review.py::compute_prediction_error) --
+# this prompt only asks for a narrative interpretation of numbers that
+# are already true, never for the AI to compute or restate its own
+# version of the error.
+POST_TRADE_LESSON = (
+    "The supplied facts are a real, deterministically-computed "
+    "comparison between what this project's own deterministic trading "
+    "signal predicted for one real, already-closed paper trade "
+    "(direction, confidence) and what actually happened (the real "
+    "outcome, P&L, and how this compares to the real prior win rate for "
+    "this exact setup_type+regime combination). Write one real, concrete "
+    "lesson a person reviewing this trade could act on -- specific to "
+    "these real numbers, not a generic trading maxim. Treat a losing "
+    "trade with the same seriousness and detail as a winning one -- a "
+    "loss that matched the real prior base rate is a different lesson "
+    "than a loss that badly missed it, and both are more useful than no "
+    "lesson at all. If the real facts genuinely do not support a "
+    "specific lesson (e.g. the sample size is too small to mean "
+    "anything), say that plainly rather than inventing one."
+)
