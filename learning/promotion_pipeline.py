@@ -49,14 +49,30 @@ MIN_REAL_CANDIDATES_FOR_STRUCTURAL_EVIDENCE = 3
 
 
 def _matching_candidate_count(report: DailyBacktestReport, condition: HypothesisCondition) -> int:
+    """Deliberately keyed on day.candidate_formed + score_attribution
+    (always present on every real cycle that formed a candidate -- see
+    execution/live_context.py::_add_candidate, set unconditionally before
+    the option/thesis-building stage even runs), NOT on day.cycle.thesis.
+
+    A real bug found and fixed while writing this module's own tests:
+    the real 42-day/248-day historical datasets (and any real historical
+    replay run without a full option-chain archive -- confirmed absent
+    for both by Phase 1's own audit) never populate option_quotes_by_day,
+    so OptionsAgent never selects a contract and cycle.thesis stays None
+    on every real day, regardless of how many real candidates actually
+    formed. Requiring thesis is not None here would have made
+    has_historical permanently False against the exact real data this
+    function exists to evaluate -- an orthogonal concern (real option
+    data availability) this structural-candidate-formation gate must not
+    depend on.
+    """
     return sum(
         1
         for day in report.days
         if day.candidate_formed
         and day.cycle is not None
-        and day.cycle.thesis is not None
-        and day.cycle.thesis.candidate.setup_type == condition.setup_type
         and day.cycle.score_attribution is not None
+        and day.cycle.score_attribution.get("setup_type") == condition.setup_type
         and day.cycle.score_attribution.get("regime") == condition.regime
     )
 

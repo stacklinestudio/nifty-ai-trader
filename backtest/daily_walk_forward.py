@@ -19,7 +19,10 @@ see), then partitions the real per-day results by date range.
 
 from __future__ import annotations
 
+import dataclasses
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
 
@@ -49,7 +52,19 @@ def run_daily_backtest_walk_forward(
     validation_dates = set(dates[first:second])
     out_of_sample_dates = set(dates[second:])
 
-    full_report = run_daily_backtest(settings, all_candles)
+    # run_daily_backtest constructs a real Orchestrator/Database per
+    # simulated day and genuinely persists to whatever settings.
+    # database_path resolves to -- a real incident this session found the
+    # hard way (see backtest/daily_backtest.py's own dry_run=True fix and
+    # main.py's isolated-scratch-database fix for the CLI command). Safe
+    # by construction here too, regardless of what settings.database_path
+    # a caller happens to pass (e.g. the live default) -- every other
+    # real field on `settings` is preserved via dataclasses.replace.
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        backtest_settings = dataclasses.replace(
+            settings, database_path=Path(scratch_dir) / "daily_walk_forward_scratch.db"
+        )
+        full_report = run_daily_backtest(backtest_settings, all_candles)
 
     def part(dates_set: set) -> DailyBacktestReport:
         return DailyBacktestReport([d for d in full_report.days if d.trading_day in dates_set])
