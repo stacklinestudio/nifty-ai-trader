@@ -110,6 +110,20 @@ def run_daily_backtest(
     accumulate across the whole backtest, which is what the regime/setup
     win-rate breakdown afterward needs.
 
+    Constructed with dry_run=True -- the exact real incident Orchestrator.
+    __init__'s own docstring documents ("an unpatched Orchestrator(Settings())
+    picked up this session's real Discord/Telegram credentials from
+    .env.local and sent a synthetic test cycle as real notifications") was
+    found for real in THIS function specifically: this module had no CLI
+    entry point until Phase 2 gave it one, and running it through main.py
+    (which loads .env.local) for the first time sent real Discord/Telegram
+    messages for a fake historical replay before this fix. A historical
+    replay of real market data is not a real trading day and must never
+    produce a real outbound notification, regardless of what real
+    credentials `settings` carries -- see
+    tests/test_daily_backtest.py::test_daily_backtest_never_sends_a_real_
+    notification_even_with_real_credentials_configured.
+
     global_context_by_day (Brief 8 Part D): real historical global-market
     data for each real trading day, e.g. from
     data/global_market.py::fetch_global_history -- a genuinely real
@@ -177,7 +191,7 @@ def run_daily_backtest(
         )
         candidate_formed = "candidate_direction" in context
 
-        orchestrator = Orchestrator(settings)
+        orchestrator = Orchestrator(settings, dry_run=True)
         cycle = orchestrator.run_cycle(context)
 
         if cycle.order:

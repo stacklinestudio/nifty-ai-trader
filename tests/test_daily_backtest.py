@@ -199,3 +199,91 @@ def test_global_context_by_day_threads_the_real_per_day_value_with_no_carry_forw
     day2_call, day3_call = calls[0], calls[1]
     assert day2_call[0][7] == day2_context
     assert day3_call[0][7] == []
+
+
+def test_daily_backtest_never_sends_a_real_notification_even_with_real_credentials_configured(
+    tmp_path, monkeypatch
+):
+    """The single most important test in this module.
+
+    A real incident this session: backtest/daily_backtest.py had no CLI
+    entry point until Phase 2 gave it one, and running it for the first
+    time through main.py (which loads .env.local) sent real Discord/
+    Telegram messages for a fake historical replay -- run_daily_backtest
+    constructed each day's Orchestrator without dry_run=True, so it picked
+    up whatever real-looking notification credentials `settings` carried,
+    exactly the failure mode agents/orchestrator.py::Orchestrator's own
+    docstring already documents from a prior real incident (see
+    tests/test_orchestrator_dry_run.py). Fixed by adding dry_run=True to
+    run_daily_backtest's own Orchestrator construction.
+
+    Verified here by call-tracking at the real network-transport level
+    (requests.post -- integrations/discord.py::DiscordNotifier and
+    integrations/telegram.py::TelegramNotifier both default `self.
+    transport` to the real `requests.post` at construction time, only
+    reached if send_message/send_embed's own `if not self.token/
+    webhook_url: return False` guard doesn't short-circuit first), not by
+    mocking send_event/send_message themselves or having the mock raise.
+    Two real, hand-confirmed reasons neither of those simpler approaches
+    works here:
+      - send_event/send_message are ALWAYS reached regardless of dry_run
+        (dry_run only empties token/chat_id/webhook_url so THEY decide
+        not to call transport) -- mocking send_event directly would
+        report "called" whether or not a real send would have happened,
+        proven by hand: it still failed even with the real fix applied.
+      - Orchestrator._event() wraps both calls in `except Exception` (by
+        design -- "a notification bug must never break the trading
+        loop"), which silently swallows a raised AssertionError -- a
+        raising mock passed even against the UNFIXED code, proven by
+        hand before this version was written.
+    Patching real requests.post itself sidesteps both: it's the actual
+    real send, never raises (just tracks + returns a real-shaped fake
+    response), and dry_run's empty token/webhook_url genuinely prevents
+    it from ever being reached, which is the real property under test.
+    """
+    import requests
+
+    calls: list[tuple[str, tuple, dict]] = []
+
+    class _FakeResponse:
+        ok = True
+
+    def tracking_transport(url, *args, **kwargs):
+        calls.append((url, args, kwargs))
+        return _FakeResponse()
+
+    monkeypatch.setattr(requests, "post", tracking_transport)
+
+    day1 = date(2026, 8, 3)
+    day2 = date(2026, 8, 4)
+    day3 = date(2026, 8, 5)
+    rows = (
+        minute_bars(day1, 375, 24000.0, 0.0)
+        + minute_bars(day2, 375, 24000.0, 3.0)
+        + minute_bars(day3, 375, 24080.0, -3.0)
+    )
+    frame = pd.DataFrame(rows).set_index("date")
+    # Deliberately non-empty, real-shaped credentials -- exactly what a
+    # Settings() built after main.py's load_dotenv(".env.local") carries
+    # in a real deployment with real notification channels wired up (the
+    # same real _settings_with_real_looking_credentials shape
+    # tests/test_orchestrator_dry_run.py already uses).
+    settings = Settings(
+        database_path=tmp_path / "backtest.db",
+        telegram_bot_token="real-looking-token",
+        telegram_chat_id="real-looking-chat-id",
+        discord_webhook_url="https://discord.com/api/webhooks/real/looking",
+    )
+
+    report = run_daily_backtest(settings, frame)
+
+    # Real proof the backtest actually ran real cycles (days 2 and 3 both
+    # reach a real Orchestrator.run_cycle -- see day2/day3's own .cycle),
+    # not that it silently did nothing and trivially passed.
+    assert report.trading_days_evaluated == 3
+    assert report.days[1].cycle is not None
+    assert report.days[2].cycle is not None
+
+    # The real assertion: zero real notification-transport calls across
+    # the whole real backtest, despite real-looking credentials.
+    assert calls == []
