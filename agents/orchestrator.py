@@ -33,6 +33,11 @@ from ai.router import AIRouter
 from config import IST, Settings
 from events.bus import EventBus
 from events.contracts import Event, EventType
+from evidence.agent_output_artifact import (
+    build_agent_output_artifacts,
+    record_agent_output_artifacts,
+)
+from evidence.decision_artifact import build_decision_artifact, record_decision_artifact
 from execution.paper_broker import PaperBroker
 from execution.position_persistence import position_state_from_dict, position_state_to_dict
 from execution.position_supervisor import PositionState, TickResult
@@ -314,6 +319,49 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 - a notification bug must never break the trading loop.
             logger.warning("telegram_event_dispatch_failed event_type=%s error=%s", kind, exc)
 
+    def _record_decision_artifact(
+        self, state: _CycleState, decision_ledger_candidate_id: str | None
+    ) -> None:
+        """Phase 2 Piece 8: builds and persists this cycle's real,
+        immutable evidence -- one evidence/agent_output_artifact.py
+        record per real AgentResult that ran this cycle, plus one
+        canonical evidence/decision_artifact.py DecisionArtifact
+        referencing them (never a second copy of decision_ledger's
+        market-state snapshot, score_attribution, or any agent's own
+        `data` -- see that module's own docstring). Fail-closed and
+        non-fatal, the same pattern as the score_attribution/decision_
+        ledger persistence above: a bug here must never block the real
+        trading loop. This is pure evidence -- nothing it writes is ever
+        read back by any agent, risk, or execution decision path."""
+        try:
+            candidate = state.context.get("candidate")
+            now = datetime.now(IST)
+            agent_artifacts = build_agent_output_artifacts(
+                state.results, decision_ledger_candidate_id, self.session_state.strategy_version
+            )
+            artifact_ids = record_agent_output_artifacts(self.memory, agent_artifacts, now)
+            risk_result = state.results.get("risk")
+            artifact = build_decision_artifact(
+                now=now,
+                strategy_version=self.session_state.strategy_version,
+                agent_output_artifact_ids=artifact_ids,
+                decision_ledger_id=decision_ledger_candidate_id,
+                candidate_id=candidate.candidate_id if candidate else None,
+                direction=candidate.direction if candidate else None,
+                confidence=candidate.confidence if candidate else None,
+                score_attribution=state.context.get("score_attribution"),
+                consensus=state.consensus,
+                conflicting_evidence=state.conflict,
+                validation_decision=state.validation.decision.value if state.validation else None,
+                validation_reasons=state.validation.reasons if state.validation else (),
+                validation_confidence=state.validation.confidence if state.validation else None,
+                risk_approved=risk_result.data.get("approved") if risk_result else None,
+                risk_reasons=tuple(risk_result.data.get("reasons", [])) if risk_result else (),
+            )
+            record_decision_artifact(self.memory, artifact, now)
+        except Exception as exc:  # noqa: BLE001 - evidence persistence must never block the trading loop.
+            logger.warning("decision_artifact_persist_failed error=%s", exc)
+
     @staticmethod
     def _consensus(results: dict[str, AgentResult]) -> tuple[str, bool]:
         opinions = [
@@ -436,6 +484,7 @@ class Orchestrator:
             EventType.MARKET_RESEARCH_COMPLETE, {"consensus": state.consensus, "conflict": state.conflict}
         )
         assert state.validation is not None  # always set by _on_research_complete's chain
+        self._record_decision_artifact(state, decision_ledger_candidate_id)
         return CycleResult(
             datetime.now(IST),
             state.results,

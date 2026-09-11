@@ -12,6 +12,12 @@ from ai.prompts import POST_TRADE_EXPLANATION, POST_TRADE_HYPOTHESIS, POST_TRADE
 from ai.router import AIRouter
 from config import IST, Settings
 from data.option_chain import OptionQuote
+from evidence.ai_evidence import build_ai_evidence, record_ai_evidence
+from evidence.decision_artifact import (
+    DECISION_ARTIFACT_MEMORY_TYPE,
+    build_decision_artifact_correction,
+    record_decision_artifact_correction,
+)
 from intelligence.oi_buildup import detect_buildup
 from learning.experiment_manager import Experiment, create_experiment
 from learning.hypothesis import HypothesisCondition, evaluate_hypothesis, parse_hypothesis_condition
@@ -381,7 +387,18 @@ class PostTradeAgent(BaseAgent):
         ai_hypothesis_evaluation_dict: dict[str, Any] | None = None
         ai_lesson: str | None = None
         if review_context_facts is not None:
-            ai_hypothesis_condition = self._propose_hypothesis(review_context_facts)
+            # Phase 2 Piece 8: the real Phase 1 decision-ledger candidate id
+            # this closed trade traces back to, when known -- the same
+            # real correlation key evidence/decision_artifact.py's
+            # DecisionArtifact was built with at decision time. Used below
+            # to link the AI hypothesis in via a correction, never to
+            # change what the deterministic recording above already did.
+            decision_ledger_candidate_id = (review_context_facts.get("candidate") or {}).get(
+                "decision_ledger_candidate_id"
+            )
+            ai_hypothesis_condition, ai_evidence_id = self._propose_hypothesis(
+                review_context_facts, decision_ledger_candidate_id
+            )
             ai_hypothesis_experiment_id: str | None = None
             if ai_hypothesis_condition is not None:
                 evaluation = evaluate_hypothesis(ai_hypothesis_condition, self.memory, datetime.now(IST))
@@ -412,6 +429,22 @@ class PostTradeAgent(BaseAgent):
                 if outcome_record is not None:
                     outcome_record = dataclasses.replace(
                         outcome_record, ai_hypothesis_reference=ai_hypothesis_experiment_id
+                    )
+                # Phase 2 Piece 8, Requirement 6: the AI hypothesis is only
+                # ever known AFTER a trade closes -- strictly later than
+                # the DecisionArtifact built at candidate-decision time
+                # (agents/orchestrator.py::_record_decision_artifact). The
+                # original artifact is never rewritten; this appends a
+                # separate, explicit DecisionArtifactCorrection record
+                # instead, linking the real ai_hypothesis_experiment_id/
+                # ai_evidence_id in without touching anything already
+                # persisted. Absent (no correction recorded) whenever no
+                # real decision artifact for this candidate can be found
+                # -- e.g. every test that hand-builds outcome_facts without
+                # ever having gone through a real run_cycle.
+                if decision_ledger_candidate_id:
+                    self._record_decision_artifact_correction(
+                        decision_ledger_candidate_id, ai_hypothesis_experiment_id, ai_evidence_id
                     )
 
             prediction_error = compute_prediction_error(review_context_facts)
@@ -468,7 +501,9 @@ class PostTradeAgent(BaseAgent):
             logger.warning("post_trade_ai_explanation_failed error=%s", exc)
             return None
 
-    def _propose_hypothesis(self, review_context_facts: dict[str, Any]) -> HypothesisCondition | None:
+    def _propose_hypothesis(
+        self, review_context_facts: dict[str, Any], correlation_id: str | None
+    ) -> tuple[HypothesisCondition | None, str | None]:
         """Phase 2 Piece 2: asks the real AI provider for exactly one
         falsifiable hypothesis, given the real trade + real prior pattern
         stats already assembled by learning/trade_review_context.py.
@@ -477,14 +512,73 @@ class PostTradeAgent(BaseAgent):
         becomes None here, never a guessed condition. Any failure (no
         provider configured, network, parsing) is caught locally, same
         reasoning as _explain above: must never escape and discard the
-        already-recorded deterministic trade facts."""
+        already-recorded deterministic trade facts.
+
+        Phase 2 Piece 8, Requirement 4: also records real evidence of the
+        AI call itself (evidence/ai_evidence.py) -- provider, model,
+        timestamp, structured output -- something no AI call site in this
+        codebase captured before this piece (confirmed by its own audit).
+        Returns the real ai_evidence_id alongside the parsed condition so
+        the caller can later link it into a decision-artifact correction;
+        never changes what hypothesis is parsed or how.
+        """
+        analysis, evidence = build_ai_evidence(
+            self.ai_router, POST_TRADE_HYPOTHESIS, review_context_facts, datetime.now(IST), correlation_id
+        )
+        # The real, stable id to hand back to the caller (for a later
+        # decision-artifact correction) is `evidence.ai_evidence_id` --
+        # the id embedded in the record's own payload, which is what
+        # evidence/reconstruction.py matches against. record_ai_evidence's
+        # own return value is MemoryStore's separate internal memory_id,
+        # a different id space -- a real bug caught while writing this
+        # piece's own tests: using the memory_id here would make the
+        # correction's reference unfindable by any reader.
+        ai_evidence_id = evidence.ai_evidence_id
         try:
-            analysis = self.ai_router.analyze(POST_TRADE_HYPOTHESIS, review_context_facts)
+            record_ai_evidence(self.memory, evidence, datetime.now(IST))
+        except Exception as exc:  # noqa: BLE001 - evidence persistence must never affect the already-recorded real trade facts.
+            logger.warning("ai_evidence_persist_failed error=%s", exc)
+            ai_evidence_id = None
+        if analysis is None:
+            return None, ai_evidence_id
+        try:
             structured = analysis.source_facts.get("structured")
-            return parse_hypothesis_condition(structured)
+            return parse_hypothesis_condition(structured), ai_evidence_id
         except Exception as exc:  # noqa: BLE001 - AI enrichment is optional; failure must not affect the already-recorded real trade facts.
             logger.warning("post_trade_ai_hypothesis_failed error=%s", exc)
-            return None
+            return None, ai_evidence_id
+
+    def _record_decision_artifact_correction(
+        self, decision_ledger_candidate_id: str, ai_hypothesis_experiment_id: str | None, ai_evidence_id: str | None
+    ) -> None:
+        """Phase 2 Piece 8, Requirement 6: finds the real DecisionArtifact
+        this closed trade traces back to (by its decision_ledger_id,
+        scanned via MemoryStore -- see evidence/reconstruction.py for the
+        same real scan pattern used to read this back) and appends a
+        correction linking the AI hypothesis in. Silently does nothing
+        (never fabricates a correction against a nonexistent artifact)
+        when no matching artifact is found -- e.g. this trade's original
+        cycle never produced a decision_ledger_components context (most
+        hand-built test facts) or ran before this piece existed. Fail-
+        closed and non-fatal, same as every other evidence-persistence
+        call in this module."""
+        try:
+            original = None
+            for entry in self.memory.recent(memory_type=DECISION_ARTIFACT_MEMORY_TYPE, limit=100_000):
+                if entry["payload"].get("decision_ledger_id") == decision_ledger_candidate_id:
+                    original = entry["payload"]
+                    break
+            if original is None:
+                return
+            correction = build_decision_artifact_correction(
+                original["artifact_id"],
+                "AI hypothesis proposed after trade close",
+                {"ai_hypothesis_reference": ai_hypothesis_experiment_id, "ai_evidence_id": ai_evidence_id},
+                datetime.now(IST),
+            )
+            record_decision_artifact_correction(self.memory, correction, datetime.now(IST))
+        except Exception as exc:  # noqa: BLE001 - evidence persistence must never affect the already-recorded real trade facts.
+            logger.warning("decision_artifact_correction_persist_failed error=%s", exc)
 
     def _generate_lesson(self, prediction_error: dict[str, Any]) -> str | None:
         """Phase 2 Piece 3: asks the real AI provider to narrate a lesson
