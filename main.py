@@ -44,6 +44,7 @@ from execution.scheduler import resume_open_positions, run_trading_day
 from integrations.discord import CATEGORIES, DiscordNotifier, webhooks_by_category_from_settings
 from integrations.obsidian import ObsidianExporter
 from integrations.telegram import TelegramNotifier
+from learning.auto_promotion_pipeline import run_automatic_promotion_cycle
 from learning.memory import MemoryStore
 from monitoring.health import check_health, system_health
 from monitoring.live_status_server import (
@@ -693,6 +694,19 @@ def main() -> int:
     daily_backtest_command = sub.add_parser("daily-backtest")
     daily_backtest_command.add_argument("--data", required=True)
     daily_backtest_command.add_argument("--output", default="reports/generated/daily_backtest.json")
+    # Phase 2 Piece 9: the missing automatic connective wiring from a real,
+    # already-created AI-proposed Experiment (learning/experiment_manager.py
+    # -- already created automatically on every real trade close, see
+    # learning/auto_promotion_pipeline.py's own docstring for the full
+    # audit) through to a real learning.promotion_pipeline.
+    # evaluate_experiment_for_promotion call. Unlike daily-backtest above,
+    # this intentionally reads/writes the REAL settings.database_path --
+    # its whole job is to read real accumulated experiment/trade evidence
+    # and write real promotion_evaluation evidence back to it; only the
+    # backtest replay INSIDE evaluate_experiment_for_promotion uses its own
+    # already-isolated scratch database (Piece 4, unchanged).
+    auto_promote_command = sub.add_parser("auto-promote")
+    auto_promote_command.add_argument("--data", required=True)
     for name in (
         "health",
         "health-gate",
@@ -752,6 +766,19 @@ def main() -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "auto-promote":
+        candles = pd.read_csv(args.data, parse_dates=["date"]).set_index("date")
+        if candles.index.tz is None:
+            candles.index = candles.index.tz_localize("Asia/Kolkata")
+        memory = MemoryStore(settings.database_path)
+        summary = run_automatic_promotion_cycle(
+            settings,
+            candles[["open", "high", "low", "close", "volume"]].astype(float),
+            memory,
+            datetime.datetime.now(IST),
+        )
+        print(json.dumps(summary.to_dict(), indent=2))
         return 0
     if args.command == "health":
         database = Database(settings.database_path)
