@@ -63,8 +63,19 @@ from risk.risk_manager import RiskManager
 from risk.trade_limits import DailyLimits
 from storage.database import Database
 from storage.models import SignalRecord
+from strategy.eligibility import evaluate_registry_eligibility
+from strategy.registry import DEFAULT_REGISTRY as DEFAULT_STRATEGY_REGISTRY
+from strategy.selection import select_strategy
 
 logger = configure_logger(__name__)
+
+# Phase 2 Piece 10: the honest provenance tag for a DecisionArtifact's
+# `regime` field when it was read back off this cycle's own real
+# score_attribution (execution/live_context.py::classify(), which
+# carries no version of its own) -- distinct from execution/
+# regime_detection.py::DETECTOR_VERSION, which tags a regime genuinely
+# produced by that new, standalone, versioned detector instead.
+LIVE_CONTEXT_REGIME_SOURCE = "live_context_inline"
 
 _EXIT_REASON_TO_EVENT = {
     "TAKE_PROFIT": EventType.TAKE_PROFIT,
@@ -332,7 +343,23 @@ class Orchestrator:
         non-fatal, the same pattern as the score_attribution/decision_
         ledger persistence above: a bug here must never block the real
         trading loop. This is pure evidence -- nothing it writes is ever
-        read back by any agent, risk, or execution decision path."""
+        read back by any agent, risk, or execution decision path.
+
+        Phase 2 Piece 10: also records, purely as evidence, the real
+        regime this cycle's own setup selection already used (read back
+        off score_attribution -- never independently recomputed, so it
+        cannot diverge from what the live cycle actually saw) and the
+        real, deterministic strategy-eligibility/selection result for
+        that regime (strategy/eligibility.py, strategy/selection.py --
+        both read-only over Piece 9's real promotion evidence). This
+        NEVER changes which setup_type SignalHunterAgent/live_context.py
+        already chose, and never gates order placement -- it is
+        additional evidence only, exactly like the rest of this method.
+        While no strategy has genuinely cleared the real promotion bar
+        yet (confirmed: zero real closed trades anywhere in this
+        project's history), selection will honestly and correctly read
+        NO STRATEGY SELECTED every real cycle -- the expected, honest
+        result, not a bug."""
         try:
             candidate = state.context.get("candidate")
             now = datetime.now(IST)
@@ -341,6 +368,31 @@ class Orchestrator:
             )
             artifact_ids = record_agent_output_artifacts(self.memory, agent_artifacts, now)
             risk_result = state.results.get("risk")
+
+            regime = None
+            regime_detector_version = None
+            selected_strategy_id = None
+            selected_strategy_version = None
+            strategy_selection_reason = None
+            strategy_eligibility_summary = None
+            score_attribution = state.context.get("score_attribution")
+            regime_value = score_attribution.get("regime") if score_attribution else None
+            if regime_value:
+                regime = regime_value
+                regime_detector_version = LIVE_CONTEXT_REGIME_SOURCE
+                eligibility_results = evaluate_registry_eligibility(
+                    self.memory, DEFAULT_STRATEGY_REGISTRY, regime, now
+                )
+                selection = select_strategy(self.memory, regime, eligibility_results, now)
+                selected_strategy_id = selection.selected_strategy_id
+                selected_strategy_version = selection.selected_strategy_version
+                strategy_selection_reason = selection.reason
+                strategy_eligibility_summary = {
+                    "evaluated_count": selection.evaluated_count,
+                    "eligible_count": selection.eligible_count,
+                    "eligible_strategy_ids": [r.strategy_id for r in eligibility_results if r.eligible],
+                }
+
             artifact = build_decision_artifact(
                 now=now,
                 strategy_version=self.session_state.strategy_version,
@@ -349,7 +401,7 @@ class Orchestrator:
                 candidate_id=candidate.candidate_id if candidate else None,
                 direction=candidate.direction if candidate else None,
                 confidence=candidate.confidence if candidate else None,
-                score_attribution=state.context.get("score_attribution"),
+                score_attribution=score_attribution,
                 consensus=state.consensus,
                 conflicting_evidence=state.conflict,
                 validation_decision=state.validation.decision.value if state.validation else None,
@@ -357,6 +409,12 @@ class Orchestrator:
                 validation_confidence=state.validation.confidence if state.validation else None,
                 risk_approved=risk_result.data.get("approved") if risk_result else None,
                 risk_reasons=tuple(risk_result.data.get("reasons", [])) if risk_result else (),
+                regime=regime,
+                regime_detector_version=regime_detector_version,
+                selected_strategy_id=selected_strategy_id,
+                selected_strategy_version=selected_strategy_version,
+                strategy_selection_reason=strategy_selection_reason,
+                strategy_eligibility_summary=strategy_eligibility_summary,
             )
             record_decision_artifact(self.memory, artifact, now)
         except Exception as exc:  # noqa: BLE001 - evidence persistence must never block the trading loop.

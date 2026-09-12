@@ -57,11 +57,13 @@ import pandas as pd
 from config import Settings
 from learning.hypothesis import HypothesisCondition, evaluate_hypothesis
 from learning.memory import MemoryStore
+from learning.promotion_evidence_types import (
+    PROMOTION_EVALUATION_MEMORY_TYPE,
+    PROMOTION_EVALUATION_SKIPPED_MEMORY_TYPE,
+)
 from learning.promotion_pipeline import evaluate_experiment_for_promotion
 
 EXPERIMENT_MEMORY_TYPE = "experiment"
-PROMOTION_EVALUATION_MEMORY_TYPE = "promotion_evaluation"
-PROMOTION_EVALUATION_SKIPPED_MEMORY_TYPE = "promotion_evaluation_skipped"
 AI_PROPOSED_SOURCE = "ai_proposed"
 
 # Real, explicit, documented bound (Requirement 3): a full evaluation

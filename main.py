@@ -60,6 +60,7 @@ from monitoring.system_health_gate import run_system_health_gate
 from reports.day_session_report import generate_and_notify_day_report
 from risk.risk_manager import RiskManager
 from storage.database import Database
+from strategy.regime_strategy_report import historical_regime_strategy_report
 
 logger = configure_logger(__name__)
 
@@ -707,6 +708,15 @@ def main() -> int:
     # already-isolated scratch database (Piece 4, unchanged).
     auto_promote_command = sub.add_parser("auto-promote")
     auto_promote_command.add_argument("--data", required=True)
+    # Phase 2 Piece 10, Requirement 14: the deterministic historical
+    # regime/strategy report -- one row per real trading day in `--data`,
+    # each showing detected regime -> eligible strategies -> selected
+    # strategy (or NO STRATEGY), via strategy/regime_strategy_report.py.
+    # Read-only against the real settings.database_path (reads Piece 9's
+    # real promotion evidence; writes nothing).
+    regime_report_command = sub.add_parser("regime-report")
+    regime_report_command.add_argument("--data", required=True)
+    regime_report_command.add_argument("--output", default="reports/generated/regime_report.json")
     for name in (
         "health",
         "health-gate",
@@ -766,6 +776,22 @@ def main() -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "regime-report":
+        candles = pd.read_csv(args.data, parse_dates=["date"]).set_index("date")
+        if candles.index.tz is None:
+            candles.index = candles.index.tz_localize("Asia/Kolkata")
+        candles = candles[["open", "high", "low", "close", "volume"]].astype(float)
+        memory = MemoryStore(settings.database_path)
+        # One real, deterministic timestamp per real trading day present
+        # in `--data` -- the day's own last real bar, i.e. "what regime
+        # was determinable using everything known by that day's close."
+        # Never a synthetic/guessed timestamp.
+        day_end_timestamps = [group.index.max() for _, group in candles.groupby(candles.index.date)]
+        rows = historical_regime_strategy_report(candles, day_end_timestamps, memory)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(rows, indent=2, default=str), encoding="utf-8")
+        print(f"wrote {len(rows)} real regime/strategy report rows to {args.output}")
         return 0
     if args.command == "auto-promote":
         candles = pd.read_csv(args.data, parse_dates=["date"]).set_index("date")

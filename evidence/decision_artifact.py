@@ -82,6 +82,36 @@ class DecisionArtifact:
     supervisor_result: dict[str, Any] | None  # always None at build time -- see module docstring
     ai_hypothesis_reference: str | None  # an Experiment id (learning/hypothesis.py), set only via a later correction
     ai_evidence_id: str | None  # an evidence/ai_evidence.py AIEvidence id, set only via a later correction
+    # Phase 2 Piece 10: the real regime this cycle's own setup selection
+    # already used (execution/live_context.py::_add_candidate's own
+    # classify() call, read back off score_attribution["regime"] --
+    # never independently recomputed here, so this can never diverge
+    # from what the live cycle actually saw). None whenever no real
+    # score_attribution was produced this cycle (e.g. supplied_context
+    # never went through the live-context pipeline).
+    regime: str | None = None
+    # The real provenance of `regime` above -- "live_context_inline" when
+    # sourced from the live cycle's own already-computed regime (the
+    # only real path today; execution/live_context.py::classify() itself
+    # carries no version), or execution/regime_detection.py::
+    # DETECTOR_VERSION when a caller genuinely ran the new, standalone,
+    # versioned detector instead. Never fabricated when `regime` is None.
+    regime_detector_version: str | None = None
+    # strategy/registry.py's own strategy_id/version (NOT this artifact's
+    # own `strategy_version` field above, which is the unrelated overall
+    # pipeline/session version, e.g. "v2") -- the specific, individually
+    # versioned strategy `strategy/selection.py::select_strategy` chose
+    # for `regime`, or both None when NO STRATEGY was selected (the
+    # honest, expected result while zero strategies are PROMOTED yet).
+    selected_strategy_id: str | None = None
+    selected_strategy_version: str | None = None
+    strategy_selection_reason: str | None = None
+    # Compact only (Requirement 11: "do not duplicate entire market-state
+    # or agent records") -- counts and the real eligible strategy_ids,
+    # never each strategy's full backtest/promotion evidence a second
+    # time (that lives in, and stays referenced by strategy_id+regime
+    # back to, Piece 9's own real "promotion_evaluation" records).
+    strategy_eligibility_summary: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +135,12 @@ class DecisionArtifact:
             "supervisor_result": self.supervisor_result,
             "ai_hypothesis_reference": self.ai_hypothesis_reference,
             "ai_evidence_id": self.ai_evidence_id,
+            "regime": self.regime,
+            "regime_detector_version": self.regime_detector_version,
+            "selected_strategy_id": self.selected_strategy_id,
+            "selected_strategy_version": self.selected_strategy_version,
+            "strategy_selection_reason": self.strategy_selection_reason,
+            "strategy_eligibility_summary": self.strategy_eligibility_summary,
         }
 
 
@@ -124,6 +160,12 @@ def build_decision_artifact(
     validation_confidence: float | None = None,
     risk_approved: bool | None = None,
     risk_reasons: tuple[str, ...] = (),
+    regime: str | None = None,
+    regime_detector_version: str | None = None,
+    selected_strategy_id: str | None = None,
+    selected_strategy_version: str | None = None,
+    strategy_selection_reason: str | None = None,
+    strategy_eligibility_summary: dict[str, Any] | None = None,
 ) -> DecisionArtifact:
     """Pure assembly -- no I/O, no lookup of anything not explicitly
     passed in by the caller. This is the structural guarantee behind
@@ -152,6 +194,12 @@ def build_decision_artifact(
         supervisor_result=None,
         ai_hypothesis_reference=None,
         ai_evidence_id=None,
+        regime=regime,
+        regime_detector_version=regime_detector_version,
+        selected_strategy_id=selected_strategy_id,
+        selected_strategy_version=selected_strategy_version,
+        strategy_selection_reason=strategy_selection_reason,
+        strategy_eligibility_summary=strategy_eligibility_summary,
     )
 
 
